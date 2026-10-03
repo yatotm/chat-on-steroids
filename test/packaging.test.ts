@@ -393,7 +393,7 @@ describe('cross-platform packaging targets', () => {
     expect(builder.linux.syncDesktopName).toBe(true);
     expect(builder.linux.maintainer).toMatch(/^Chat On Steroids <[^>]+@users\.noreply\.github\.com>$/);
     expect(pkg.desktopName).toBe('com.chatonsteroids.app.desktop');
-    expect(pkg.homepage).toBe('https://github.com/totec448-spec/chat-on-steroids');
+    expect(pkg.homepage).toBe('https://github.com/yatotm/chat-on-steroids');
     expect(iconScript).toContain("build', 'icon.png'), pngFor(1024)");
 
     const packageScript = readFileSync(path.join(root, 'scripts', 'package.mjs'), 'utf8');

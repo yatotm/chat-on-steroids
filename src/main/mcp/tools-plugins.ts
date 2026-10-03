@@ -2,17 +2,31 @@ import type { McpServer } from '@modelcontextprotocol/server';
 import type { PluginToolSchema } from '../../shared/plugin-refresh.js';
 import { pluginManager } from '../plugins/manager.js';
 import { getConfig } from '../config.js';
-import { noteOutcome } from './call-context.js';
+import { currentCall, noteOutcome } from './call-context.js';
 import { inboundRequestId } from './inbound.js';
 import { dispatch, fail, type ToolResult } from './kernel.js';
 import { canAddCodeMode, codeModeDeclaration, codeModeHandler } from './code-mode-tool.js';
 import { toolSchemaJson } from './tool-declarations.js';
 import { codeModeSchema } from './code-mode-runtime.js';
+import { listProjects, sessionProjectBinding } from '../projects.js';
+import { callRemoteProjectTool } from '../remote-workspace.js';
 
 /** Shared by direct and nested plugin calls; the manager remains schema/admission authority. */
 async function runPluginTool(name: string, args: unknown): Promise<ToolResult> {
   if (getConfig().readOnly) return pluginManager.redactResult(fail('TOOL_DISABLED: external plugins are unavailable while CoS read-only mode is on.')) as ToolResult;
   if (!args || typeof args !== 'object' || Array.isArray(args)) return fail('INVALID_ARGUMENTS: plugin arguments must be an object.');
+  const sessionId = currentCall()?.caller.sessionId;
+  try {
+    const project = sessionId ? await sessionProjectBinding(sessionId) : null;
+    if (project?.remote && sessionId)
+      return await callRemoteProjectTool(project, sessionId, name, args as Record<string, unknown>, noteOutcome) as ToolResult;
+    const remoteProjects = (await listProjects()).filter(row => row.remote);
+    if (remoteProjects.length && remoteProjects.some(row => row.remote!.pluginId === pluginManager.toolOwner(name)))
+      return fail('REMOTE_PROJECT_REQUIRED: Select a remote project in CoS and wait for this conversation to be identified before calling its tools. No remote operation was dispatched.');
+  } catch (error) {
+    noteOutcome('tool_rejected');
+    return pluginManager.redactResult(fail(error instanceof Error ? error.message : 'Remote project validation failed.')) as ToolResult;
+  }
   return await pluginManager.call(name, args as Record<string, unknown>, noteOutcome) as ToolResult;
 }
 

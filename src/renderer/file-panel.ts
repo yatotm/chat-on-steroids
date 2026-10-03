@@ -204,6 +204,8 @@ function requestFileConfirmation(options: { title: string; message: string; deta
  */
 export function createFilePanel(options: FilePanelOptions) {
   const pane = el('aside', `file-panel${options.reviewOnly ? ' review-panel' : ''}`); pane.hidden = true;
+  const remoteNotice = el('p', 'meta remote-project-notice', () => t('Remote files and command results are shown in the conversation. Local Files, Review and terminal do not access the development server.'));
+  remoteNotice.hidden = true; pane.append(remoteNotice);
   ui(pane, 'aria-label', () => t(options.reviewOnly ? 'Review' : 'Files'));
   if (!options.mount) attachWorkPanelResize(options.host, pane);
 
@@ -510,6 +512,7 @@ export function createFilePanel(options: FilePanelOptions) {
     pane.hidden = false;
     if (!options.mount) options.host.classList.add('has-file-panel');
     options.toggle?.setAttribute('aria-expanded', 'true');
+    if (project.remote) { render(); return; }
     if (mode === 'files' && !listings.has('')) await loadDirectory('');
     else render();
     if (reconcile) void reconcileGitChanges();
@@ -1243,6 +1246,7 @@ export function createFilePanel(options: FilePanelOptions) {
 
   async function reconcileGitChanges(forceDiff = false): Promise<void> {
     const current = project;
+    if (current?.remote) { render(); return; }
     if (!current) {
       gitSnapshot = null; gitLoading = false; updateChangesButton(); renderTree(); renderChangesList(); return;
     }
@@ -1327,6 +1331,9 @@ export function createFilePanel(options: FilePanelOptions) {
   }
 
   function render(): void {
+    const remote = !!project?.remote;
+    remoteNotice.hidden = !remote; toolbar.hidden = body.hidden = remote;
+    if (remote) { syncWatches(); return; }
     const showingChanges = mode === 'changes';
     const showingReview = mode === 'review';
     const showingDiff = showingReview || (showingChanges && gitDiffPath !== null);
@@ -1408,7 +1415,7 @@ export function createFilePanel(options: FilePanelOptions) {
 
   function syncWatches(): void {
     if (options.reviewOnly) return;
-    const current = pane.hidden ? null : project;
+    const current = pane.hidden || project?.remote ? null : project;
     const directories = current ? watchedDirectories() : [];
     const signature = current ? `${current.id}\0${directories.join('\0')}` : '<none>';
     if (signature === watchSignature) return;

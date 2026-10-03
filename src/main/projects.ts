@@ -7,18 +7,22 @@ import { getConfig } from './config.js';
 import { nativePathIdentity, resolvePath } from './sandbox.js';
 import { bindSessionProject, findSessionByConversation, getSession } from './session/store.js';
 import type { LocalProject } from '../shared/projects.js';
+import { probeRemoteWorkspace, remoteBindingSchema, validateRemoteProject } from './remote-workspace.js';
 
 const MAX_ADDITIONAL_FOLDERS = 64;
 const projectPathSchema = z.string().min(1).max(32768);
 const projectSchema = z.object({
   id: z.string().uuid(), name: z.string().min(1).max(160), path: projectPathSchema,
   additionalPaths: z.array(projectPathSchema).max(MAX_ADDITIONAL_FOLDERS).optional(),
+  remote: remoteBindingSchema.optional(),
   createdAt: z.number().finite().nonnegative(), ungrouped: z.boolean().optional()
 });
 const catalogSchema = z.array(projectSchema).max(200);
 let mutations: Promise<unknown> = Promise.resolve();
 const samePath = (a: string, b: string) => nativePathIdentity(a) === nativePathIdentity(b);
 const folders = (project: LocalProject): string[] => [project.path, ...(project.additionalPaths ?? [])];
+const projectIdentity = (project: LocalProject): string => project.remote
+  ? `remote:${project.remote.pluginId}:${project.remote.endpointId}:${project.remote.workspaceId}` : nativePathIdentity(project.path);
 
 /**
  * Primary workspace identity is authoritative and therefore must stay unambiguous. Older builds
@@ -30,12 +34,16 @@ const folders = (project: LocalProject): string[] => [project.path, ...(project.
 function sanitizeAdditionalFolders(projects: LocalProject[]): LocalProject[] {
   const primary = new Set<string>();
   for (const project of projects) {
-    const identity = nativePathIdentity(project.path);
+    const identity = projectIdentity(project);
     if (primary.has(identity)) throw new Error('Project catalog is invalid');
     primary.add(identity);
   }
   const claimed = new Set(primary);
   return projects.map(project => {
+    if (project.remote) {
+      if (project.additionalPaths?.length) throw new Error('Remote projects cannot contain local folders');
+      return project;
+    }
     if (!project.additionalPaths?.length) return project;
     const kept: string[] = [];
     for (const folder of project.additionalPaths) {
@@ -82,7 +90,7 @@ export function addProject(folderPath: string): Promise<LocalProject> {
   const operation = mutations.then(async () => {
     const real = await approvedDirectory(folderPath, path.isAbsolute(folderPath) ? 'Choose a project folder' : 'Choose an absolute local project folder');
     const projects = await listProjects();
-    const owner = projects.find(project => folders(project).some(folder => samePath(folder, real)));
+    const owner = projects.find(project => !project.remote && folders(project).some(folder => samePath(folder, real)));
     if (owner) {
       if (!samePath(owner.path, real)) throw new Error('Project folder already belongs to another project');
       if (!owner.ungrouped) return owner;
@@ -99,6 +107,48 @@ export function addProject(folderPath: string): Promise<LocalProject> {
   return operation;
 }
 
+export async function addRemoteProject(pluginId: string, folderPath: string): Promise<LocalProject> {
+  const verified = await probeRemoteWorkspace(pluginId, folderPath);
+  const operation = mutations.then(async () => {
+    const project: LocalProject = { id: randomUUID(), name: path.posix.basename(verified.path).slice(0, 160),
+      path: verified.path, remote: verified.remote, createdAt: Date.now() };
+    validateRemoteProject(project);
+    const projects = await listProjects();
+    const previous = projects.find(row => projectIdentity(row) === projectIdentity(project));
+    if (previous && !previous.ungrouped) return previous;
+    if (previous) {
+      const { ungrouped: _, ...restored } = previous;
+      await writeDurableNow('projects', projects.map(row => row.id === previous.id ? restored : row));
+      return restored;
+    }
+    if (projects.length >= 200) throw new Error('Project catalog limit reached');
+    await writeDurableNow('projects', [...projects, project]);
+    return project;
+  });
+  mutations = operation.catch(() => undefined);
+  return operation;
+}
+
+export async function validateProject(projectId: string): Promise<LocalProject> {
+  const project = await getProject(projectId);
+  if (!project) throw new Error('Project not found');
+  if (project.remote) validateRemoteProject(project);
+  else await resolveProject(project);
+  return project;
+}
+
+export async function sessionProjectBinding(sessionId: string): Promise<LocalProject | null> {
+  const session = await getSession(sessionId);
+  if (!session?.projectId) return null;
+  const project = await getProject(session.projectId);
+  if (!project) throw new Error('The session project is unavailable');
+  return project;
+}
+
+export async function hasRemoteProjects(): Promise<boolean> {
+  return (await listProjects()).some(project => !!project.remote);
+}
+
 /** Adds one independently approved folder without changing the project's primary workspace. */
 export function addProjectFolder(projectId: string, folderPath: string): Promise<LocalProject> {
   const operation = mutations.then(async () => {
@@ -106,9 +156,10 @@ export function addProjectFolder(projectId: string, folderPath: string): Promise
     const projects = await listProjects();
     const project = projects.find(row => row.id === projectId);
     if (!project) throw new Error('Project not found');
+    if (project.remote) throw new Error('Remote projects cannot contain local folders');
     const real = await approvedDirectory(folderPath, path.isAbsolute(folderPath)
       ? 'Choose an additional project folder' : 'Choose an absolute additional project folder');
-    const owner = projects.find(row => folders(row).some(folder => samePath(folder, real)));
+    const owner = projects.find(row => !row.remote && folders(row).some(folder => samePath(folder, real)));
     if (owner?.id === project.id) return project;
     if (owner) throw new Error('Project folder already belongs to another project');
     const additionalPaths = [...(project.additionalPaths ?? []), real];
@@ -158,14 +209,13 @@ export function removeProject(id: string): Promise<LocalProject> {
   return operation;
 }
 export async function assignSessionProject(sessionId: string, projectId: string): Promise<void> {
-  const project = await getProject(projectId);
-  if (!project) throw new Error('Project not found');
-  await resolveProject(project);
+  const project = await validateProject(projectId);
   await bindSessionProject(sessionId, project.id);
 }
 export async function projectWorkspace(projectId: string, folderPath?: string): Promise<{ virtual: string; real: string }> {
   const project = await getProject(projectId);
   if (!project) throw new Error('Project not found');
+  if (project.remote) throw new Error('This project is on the development server. Use its remote tools; local Files, Review and terminal do not access it.');
   if (folderPath === undefined) return resolveProject(project);
   const requested = await resolvePath(getConfig().roots, folderPath);
   const stored = folders(project).find(folder => samePath(folder, requested.real));
@@ -189,6 +239,7 @@ export async function projectAdditionalWorkspaces(projectId: string): Promise<Ar
   return resolved;
 }
 async function resolveProject(project: LocalProject): Promise<{ virtual: string; real: string }> {
+  if (project.remote) throw new Error('REMOTE_PROJECT: Use this project’s CodexPro tools on Chat On Steroids Plugins. Local filesystem and terminal tools are unavailable for this conversation.');
   return resolveStoredFolder(project.path);
 }
 /** Null means no project. A broken explicit binding is an error, never permission to guess cwd. */

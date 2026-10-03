@@ -49,7 +49,7 @@ import { logInfo, logWarn } from './logger.js';
 import { APP_VERSION } from './version.js';
 import { isNewer, type UpdateStatus } from '../shared/types.js';
 
-const REPO = 'totec448-spec/chat-on-steroids';
+const REPO = 'yatotm/chat-on-steroids';
 const LATEST_RELEASE_API = `https://api.github.com/repos/${REPO}/releases/latest`;
 
 const CHECK_TIMEOUT_MS = 15_000;

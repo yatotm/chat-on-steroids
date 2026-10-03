@@ -233,6 +233,7 @@ const api = {
     call<SessionList>('sessions:list', options ?? {}),
   listProjects: () => call<LocalProject[]>('projects:list'),
   addProject: () => call<LocalProject | null>('projects:add'),
+  addRemoteProject: (pluginId: string, path: string) => call<LocalProject>('projects:addRemote', { pluginId, path }),
   removeProject: (id: string) => call<LocalProject>('projects:remove', { id }),
   addProjectFolder: (id: string) => call<LocalProject | null>('projects:addFolder', { id }),
   removeProjectFolder: (id: string, path: string) => call<LocalProject>('projects:removeFolder', { id, path }),

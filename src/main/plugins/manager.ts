@@ -790,8 +790,10 @@ export class PluginManager {
     this.changed();
   }
   tools(): Tool[] { return [...this.exposure().tools]; }
+  toolOwner(name: string): string | null { return this.exposure().owners.get(name) ?? null; }
   async call(name: string, args: Record<string, unknown> = {},
-    onOutcome?: (outcome: 'tool_rejected' | 'tool_execution_error') => void): Promise<CallToolResult> {
+    onOutcome?: (outcome: 'tool_rejected' | 'tool_execution_error') => void,
+    expected?: { pluginId: string; sourceUrl: string; beforeDispatch?: () => void }): Promise<CallToolResult> {
     // The invocation owner knows whether a tool failed or was never admitted.
     // Keep this internal evidence out of the upstream MCP result/content contract.
     const errorResult = (text: string, outcome: 'tool_rejected' | 'tool_execution_error' = 'tool_execution_error'): CallToolResult => {
@@ -807,10 +809,12 @@ export class PluginManager {
         const owner = this.exposure().owners.get(name);
         const row = this.records.find(row => row.id === owner && row.enabled);
         if (!row) return;
+        const matchesOwner = () => !expected || (row.id === expected.pluginId && row.source.kind === 'remote' && row.source.url === expected.sourceUrl);
+        if (!matchesOwner()) return;
         let live = this.live.get(row.id);
         if (!live) { await this.connect(row); live = this.live.get(row.id); startupFailed = !live && row.enabled && row.status === 'error'; }
         // Discovery/configuration may have changed the exact declaration during startup.
-        if (!live || !row.enabled || this.closing || this.exposure().owners.get(name) !== row.id) {
+        if (!live || !row.enabled || this.closing || this.exposure().owners.get(name) !== row.id || !matchesOwner()) {
           if (live && live.users === 0) await this.disconnect(row);
           return;
         }
@@ -852,6 +856,8 @@ export class PluginManager {
     }
     const { row, live, tool } = acquired;
     try {
+      try { expected?.beforeDispatch?.(); }
+      catch (error) { return refused(error instanceof Error ? error.message : 'Remote project permission changed.'); }
       // Supply our bounded discovery result: SDK validates output against it without
       // rediscovery or the modern header-mismatch retry path for ambiguous mutations.
       const result = await live.client.callTool({ name: tool.name, arguments: args }, { timeout: 120000, toolDefinition: tool });

@@ -20,6 +20,7 @@ import { startTunnel, TunnelError, type TunnelHandle } from './tunnel/index.js';
 import { desktopAutomationSupported } from './platform.js';
 import { publishPluginSurface, unpublishPluginSurface, pluginRefreshPublications } from './plugin-refresh.js';
 import { pluginManager } from './plugins/manager.js';
+import { hasRemoteProjects } from './projects.js';
 
 let endpoint: McpEndpoint | null = null;
 /** Retain custody while draining so final shutdown can bound that same stop. */
@@ -296,8 +297,12 @@ async function connectImpl(): Promise<void> {
   // not by the mere presence or absence of Desktop. Otherwise enabling screen/clipboard
   // could accidentally waive the root needed by Core's file or command semantics.
   if (config.roots.length === 0 && requiresApprovedFilesystemRoot(config)) {
-    setStatus({ state: 'disconnected', detail: 'Add a folder before connecting.' });
-    return;
+    const remote = await hasRemoteProjects();
+    if (shutdownRequested || pendingDisconnect || generation !== connectionGeneration) return;
+    if (!remote) {
+      setStatus({ state: 'disconnected', detail: 'Add a folder before connecting.' });
+      return;
+    }
   }
 
   try {

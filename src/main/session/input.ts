@@ -11,7 +11,7 @@ import { randomUUID } from 'node:crypto';
 import { userTitle } from './title.js';
 import { readDurable, writeDurableNow, writeDurableSoon } from '../durable.js';
 import { getSession, findSessionByConversation, createSession, deleteSession, rebindSession, conversationWasSuperseded, readRecentEvents, listUsageSessions, turnHasMcpCall, questionHasMcpCall, sessionDirectoryMissing, readCompletedFinal, readLatestUserMessage } from './store.js';
-import { assignSessionProject, projectWorkspace, getSessionProject } from '../projects.js';
+import { assignSessionProject, validateProject } from '../projects.js';
 import { isChatBlocked } from './blocked-chats.js';
 import { wakeBrowserWork } from '../browser-wake.js';
 import { logInfo, logWarn } from '../logger.js';
@@ -696,11 +696,10 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
       ...(injectionOwner ? { toolTurnId: injectionOwner.turnId } : {}), ...(transportIntent ? { transportIntent } : {}),
       ...(requestedMode !== input.mode ? { requestedMode } : {}), ...(finishOwner ? { finishOwner } : {}), state: 'queued', owner: null, createdAt: Date.now(), conversationId: null };
     if (input.projectId) {
-      await projectWorkspace(input.projectId);
+      await validateProject(input.projectId);
       if (input.sessionId) {
         const session = await getSession(input.sessionId);
         if (session?.projectId !== input.projectId) throw new Error('Message project does not match the session');
-        await getSessionProject(input.sessionId);
       }
     }
     if (retryOpening) { entry.opening = true; entry.requestedSessionId = input.sessionId; }
@@ -1340,7 +1339,7 @@ export function claimBrowserInput(id: string, owner: string, conversationId: str
     if (await target(entry) !== conversationId) return null;
     if (!(await browserInputAllowed(entry))) return null;
     if (entry.purpose === 'decision' && !decisionWaiters.has(id)) return null;
-    if (entry.projectId) await projectWorkspace(entry.projectId);
+    if (entry.projectId) await validateProject(entry.projectId);
     if (entry.sessionId) {
       if (current.some((row) => !sameDelivery(entry, row) && row.sessionId === entry.sessionId && ['browser', 'tool'].includes(row.state))) return null;
       const first = ordered(current).find((row) => row.sessionId === entry.sessionId && row.state === 'queued' && queuedFollowup(row) === queuedFollowup(entry) && row.dueAt <= Date.now());

@@ -746,7 +746,7 @@ function missingStep(
   // This is the same capability rule as the main-process admission gate. Desktop and
   // clipboard may legitimately be rootless; enabling one must not hide a root still needed
   // by an effective file/patch/command capability on Core.
-  if (config.roots.length === 0 && requiresApprovedFilesystemRoot(config)) {
+  if (config.roots.length === 0 && requiresApprovedFilesystemRoot(config) && !next.hasRemoteProjects) {
     return { step: 'folder', text: t("Choose a folder to share — step 1.") };
   }
   if (config.tunnel.kind === 'openai') {

@@ -99,6 +99,10 @@ jobs:
       - name: Smoke packaged runtime natively
         run: node scripts/smoke-packaged-runtime.mjs --platform ${{ matrix.platform }} --arch ${{ matrix.arch }}
 
+      - name: Verify remote project interface on Apple Silicon
+        if: matrix.platform == 'darwin' && matrix.arch == 'arm64'
+        run: npm run verify:ui -- remote-project
+
       - name: Audit packaged macOS bundle metadata and Mach-O payloads
         if: matrix.platform == 'darwin'
         run: node scripts/smoke-macos-bundle.mjs ${{ matrix.arch }}

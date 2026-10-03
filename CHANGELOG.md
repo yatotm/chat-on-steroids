@@ -9,6 +9,10 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.2.0] — Remote Linux projects from the Mac workspace
+
+This fork adds CodexPro remote projects through Plugins, explicit workspace routing, local-execution refusal for remote conversations, and session-owned remote processes. Workers, continuation, queues and tool history keep their existing owners. See [remote development setup](docs/remote-development.md). Native Files, Review and manual terminals remain local. Update and extension downloads use this fork.
+
 ## [2.1.26] — New chats and long runs stay on track
 
 Your first message lands, your long runs keep going, and the app tells you what it's doing. This release fixes the lost first answers in new chats and the sends that failed in existing chats, and stops the false stalls and reload loops in long Goal, Loop and worker runs. You can now also watch a new chat's first answer take shape.

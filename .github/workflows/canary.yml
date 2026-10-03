@@ -34,6 +34,8 @@ concurrency:
 jobs:
   preflight:
     name: Preflight
+    # fork 自动发布使用版本标签，canary 保留手动入口。
+    if: github.repository == 'totec448-spec/chat-on-steroids' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

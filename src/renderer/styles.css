@@ -3776,6 +3776,16 @@ select option::checkmark { order: 1; margin-inline-start: auto; color: var(--ink
 [data-panel='chat'].is-work-dock-expanded { grid-template-columns: 0 minmax(0, 1fr); }
 .is-work-dock-expanded:not(.is-dock-handover) > .is-session, .is-work-dock-expanded .work-panel-resize { display: none; }
 .app[data-screen='settings'] .header-dock-controls { display: none; }
+.remote-project-dialog { width: min(560px, calc(100vw - 40px)); max-height: calc(100vh - 40px); margin: auto; padding: 24px; overflow: auto; border: 1px solid var(--line); border-radius: 14px; background: var(--page); color: var(--ink); }
+.remote-project-dialog::backdrop { background: #0008; }
+.remote-project-dialog form { display: grid; gap: 14px; }
+.remote-project-dialog h2, .remote-project-dialog p { margin: 0; }
+.remote-project-field { display: grid; gap: 6px; min-width: 0; }
+.remote-project-field input, .remote-project-field select { width: 100%; min-width: 0; padding: 9px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--page); color: var(--ink); font: inherit; }
+.remote-project-field[hidden] { display: none; }
+.remote-project-status { overflow-wrap: anywhere; }
+.remote-project-notice { padding: 18px; line-height: 1.6; }
+.remote-project-actions { display: flex; justify-content: flex-end; gap: 8px; }
 @media (max-width: 850px) {
   [data-panel='chat'].has-work-dock { grid-template-columns: 0 minmax(0, 1fr); }
   .has-work-dock > .is-session { display: none; }

@@ -7,6 +7,8 @@ name: Publish release
 # installers attached to a release are provably the ones produced from that tag by the
 # pipeline in that tag's own tree.
 on:
+  push:
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:

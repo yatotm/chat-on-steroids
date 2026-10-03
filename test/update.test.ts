@@ -137,10 +137,10 @@ describe('the file Get update opens for an installation that cannot update itsel
   });
   it('links that file for the announced version, and the release page otherwise', () => {
     expect(manualDownloadUrl('2.1.17', 'Chat-On-Steroids-macOS-arm64.dmg'))
-      .toBe('https://github.com/totec448-spec/chat-on-steroids/releases/download/v2.1.17/Chat-On-Steroids-macOS-arm64.dmg');
-    expect(manualDownloadUrl(null, 'Chat-On-Steroids-macOS-arm64.dmg')).toBe('https://github.com/totec448-spec/chat-on-steroids/releases/latest');
-    expect(manualDownloadUrl('2.1.17', null)).toBe('https://github.com/totec448-spec/chat-on-steroids/releases/latest');
-    expect(manualDownloadUrl('../evil', 'x.dmg')).toBe('https://github.com/totec448-spec/chat-on-steroids/releases/latest');
+      .toBe('https://github.com/yatotm/chat-on-steroids/releases/download/v2.1.17/Chat-On-Steroids-macOS-arm64.dmg');
+    expect(manualDownloadUrl(null, 'Chat-On-Steroids-macOS-arm64.dmg')).toBe('https://github.com/yatotm/chat-on-steroids/releases/latest');
+    expect(manualDownloadUrl('2.1.17', null)).toBe('https://github.com/yatotm/chat-on-steroids/releases/latest');
+    expect(manualDownloadUrl('../evil', 'x.dmg')).toBe('https://github.com/yatotm/chat-on-steroids/releases/latest');
   });
 });
 

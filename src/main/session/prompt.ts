@@ -2,7 +2,8 @@ import path from 'node:path';
 import { readFileStream } from '../codex/filesystem.js';
 import { effectiveCapabilities, getConfig } from '../config.js';
 import { currentCoreInstructions } from '../mcp/instructions.js';
-import { getSessionProject, projectAdditionalWorkspaces, projectWorkspace } from '../projects.js';
+import { getProject, getSessionProject, projectAdditionalWorkspaces, projectWorkspace, sessionProjectBinding } from '../projects.js';
+import { remoteProjectInstructions } from '../remote-workspace.js';
 import { resolvePath } from '../sandbox.js';
 import { MAX_CHATGPT_MESSAGE_CHARS, prependUserPrompt } from '../../shared/user-prompt.js';
 import { selectedSkillInstructions, type SelectedSkill } from './skill-prompt.js';
@@ -15,8 +16,10 @@ type ProjectInstructions = { directory: string; text: string; truncated: boolean
 const limits: PromptLimits = { maxChars: MAX_CHATGPT_MESSAGE_CHARS, maxBytes: Infinity };
 const cutNotice = '\n\n[Cut off because of the message limit. Read AGENTS.md yourself for the remaining instructions.]';
 
-const promptFolder = (scope: PromptScope) => scope.sessionId ? getSessionProject(scope.sessionId)
-  : scope.projectId ? projectWorkspace(scope.projectId) : Promise.resolve(null);
+const promptProject = (scope: PromptScope) => scope.sessionId ? sessionProjectBinding(scope.sessionId)
+  : scope.projectId ? getProject(scope.projectId) : Promise.resolve(null);
+const promptFolder = async (scope: PromptScope) => (await promptProject(scope))?.remote ? null
+  : scope.sessionId ? getSessionProject(scope.sessionId) : scope.projectId ? projectWorkspace(scope.projectId) : null;
 
 async function promptAdditionalDirectories(scope: PromptScope): Promise<string[]> {
   const projectId = scope.sessionId ? (await getSession(scope.sessionId))?.projectId : scope.projectId;
@@ -141,13 +144,15 @@ export function fitSessionPrompt(text: string, core: string, agents: ProjectInst
 /** Opening normal/worker messages only. Callers own first-message eligibility;
  * follow-ups, helpers, handoff requests and resumed bootstraps never call this. */
 export async function prepareSessionPrompt(text: string, scope: PromptScope = {}, budget = limits, authored = text): Promise<string> {
+  const project = await promptProject(scope);
   const folder = await promptFolder(scope);
   const skillScope = { projectPath: folder?.real ?? null };
   const library = await listSkillLibrary(skillScope);
-  const core = await currentCoreInstructions(library);
+  const core = [await currentCoreInstructions(library), project?.remote ? remoteProjectInstructions(project) : ''].filter(Boolean).join('\n\n');
   const skills = await selectedSkillInstructions(authored, skillScope, library);
   fitSessionPrompt(text, core, null, budget); // Only Core/task overflow is mandatory.
-  const agents = await projectInstructions(scope);
+  const agents = project?.remote ? null : await projectInstructions(scope);
+  if ((await promptProject(scope))?.id !== project?.id) throw new Error('The selected project changed during prompt preparation');
   if ((await promptFolder(scope))?.real !== folder?.real) throw new Error('The selected project changed during Skill preparation');
   return fitSessionPrompt(text, core, agents, budget, skills);
 }

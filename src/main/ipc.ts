@@ -71,7 +71,7 @@ import { keychainNoticeReady } from './keychain-notice.js';
 import { runDiagnostics } from './diagnostics.js';
 import { formatLogAsJson, formatLogForClipboard, getLog, logInfo, onLog } from './logger.js';
 import { RESERVED_ROOT_NAMES, uniqueRootName, validateNewRoot, SandboxError, resolvePath } from './sandbox.js';
-import { addProject, addProjectFolder, getProject, getSessionProject, listProjects, projectWorkspace, removeProject, removeProjectFolder } from './projects.js';
+import { addProject, addProjectFolder, addRemoteProject, getProject, getSessionProject, hasRemoteProjects, listProjects, projectWorkspace, removeProject, removeProjectFolder, sessionProjectBinding } from './projects.js';
 import { createProjectEntry, listProjectDirectory, previewProjectFile, projectFileTarget, renameProjectEntry, revalidateProjectFileTarget, saveProjectTextFile } from './project-files.js';
 import { ProjectFileWatchSet } from './project-file-watcher.js';
 import { ProjectGitWatchSet, readProjectGitDiff, readProjectGitSnapshot } from './project-git.js';
@@ -476,6 +476,8 @@ async function buildState(): Promise<AppState> {
   const config = getConfig();
   return {
     config,
+    // 项目目录损坏时仍允许打开设置；执行入口继续严格校验。
+    hasRemoteProjects: await hasRemoteProjects().catch(() => false),
     status: getStatus(),
     connectorSchemas: Object.fromEntries(
       pluginRefreshPublications().map(({ surface, schemaId }) => [surface, schemaId])
@@ -793,8 +795,11 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   });
   handle('skills:library', async payload => {
     const scope = z.object({ sessionId: z.string().min(1).max(80).nullable().optional(), projectId: z.string().uuid().nullable().optional() }).strict().parse(payload ?? {});
-    const folder = () => scope.sessionId ? getSessionProject(scope.sessionId)
-      : scope.projectId ? projectWorkspace(scope.projectId) : Promise.resolve(null);
+    const folder = async () => {
+      const project = scope.sessionId ? await sessionProjectBinding(scope.sessionId) : scope.projectId ? await getProject(scope.projectId) : null;
+      return project?.remote ? null : scope.sessionId ? getSessionProject(scope.sessionId)
+        : scope.projectId ? projectWorkspace(scope.projectId) : null;
+    };
     const before = await folder();
     const library = await listSkillLibrary({ projectPath: before?.real ?? null });
     if ((await folder())?.real !== before?.real) throw new Error('The project changed while Skills were loading');
@@ -804,6 +809,13 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     const { id } = z.object({ id: z.string().uuid() }).parse(payload);
     const project = await removeProject(id);
     push('session:changed');
+    return project;
+  });
+  handle('projects:addRemote', async payload => {
+    const { pluginId, path: directory } = z.object({ pluginId: z.string().uuid(), path: z.string().min(2).max(4096) }).strict().parse(payload);
+    const project = await addRemoteProject(pluginId, directory);
+    push('session:changed');
+    push('state:changed', await buildState());
     return project;
   });
   handle('projects:add', async () => {
@@ -824,7 +836,9 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   });
   handle('projects:addFolder', async payload => {
     const { id } = z.object({ id: z.string().uuid() }).strict().parse(payload);
-    if (!(await getProject(id))) throw new Error('Project not found');
+    const owner = await getProject(id);
+    if (!owner) throw new Error('Project not found');
+    if (owner.remote) throw new Error('Remote projects cannot contain local folders');
     const window = getWindow();
     if (!window) throw new Error('No window');
     const result = await dialog.showOpenDialog(window, { title: 'Choose an additional project folder', properties: ['openDirectory'] });

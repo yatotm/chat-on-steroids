@@ -40,7 +40,7 @@ import {
   type Resolved
 } from '../sandbox.js';
 import { currentWorkspace, forgetMissingWorkspace, learnWorkspace, setCurrentWorkspace } from '../workspace.js';
-import { getSessionProject } from '../projects.js';
+import { getSessionProject, hasRemoteProjects, sessionProjectBinding } from '../projects.js';
 import { firstTaskRoot, resolveLinkedSkillAlias } from '../skill-access.js';
 import { ExecError } from '../exec.js';
 import { ComputerError } from '../computer/index.js';
@@ -692,6 +692,8 @@ async function dispatchTracked(
   // mate while a swarm is active. Use the full exact-id window, not the shorter prime window:
   // the live worker failure that motivated IDENTITY_EVIDENCE_MS arrived ~8 seconds late.
   const identitySensitive = needsWorkspaceIdentity(name, args);
+  const localProjectTool = surface === 'core' && ['read', 'view_image', 'find', 'apply_patch', 'exec_command', 'write_stdin'].includes(name);
+  const remoteScope = (localProjectTool || surface === 'plugins') && await hasRemoteProjects();
   // update_plan and session_finish consume this exact session, even outside a swarm. Resolve it
   // before the shared blocked/superseded checks rather than guessing from selection.
   // Observation and its dependent input must resolve the same caller before either
@@ -706,7 +708,7 @@ async function dispatchTracked(
   // Windows observation/input gets one short grace even under the opt-in. Exact proof can then
   // alias the observation directly to the durable session, while a genuinely headless caller
   // falls back to its request principal instead of waiting the old full identity window.
-  const needsExactIdentity = name === 'session_finish' || desktopContext || (!allowUnattributed && (
+  const needsExactIdentity = remoteScope || name === 'session_finish' || desktopContext || (!allowUnattributed && (
     name === 'exec' || name === 'update_plan' || (identitySensitive && swarmRunning())
   ));
   if (!context.caller.conversationId && needsExactIdentity && requestId) {
@@ -950,7 +952,13 @@ async function dispatchTracked(
   if (admissionRefusal === STRICT_CHAT_REFUSAL) await recordUntrustedRefusalNotice(context);
   let handlerRan = false;
   markTiming('identity');
-  const invokeHandler = (): Promise<ToolResult> => {
+  const invokeHandler = async (): Promise<ToolResult> => {
+    if (remoteScope && !context.caller.sessionId)
+      return failIdentity('CALLER_IDENTITY_REQUIRED: Remote projects are configured. Wait for exact conversation identity before choosing a local or remote execution target. No tool was dispatched.');
+    if (localProjectTool && remoteScope && context.caller.sessionId) {
+      const project = await sessionProjectBinding(context.caller.sessionId);
+      if (project?.remote) return fail('REMOTE_PROJECT: This conversation works on the development server. Use its CodexPro tools on Chat On Steroids Plugins; Core filesystem and terminal tools operate on the app computer and are refused.');
+    }
     handlerRan = true;
     return run();
   };

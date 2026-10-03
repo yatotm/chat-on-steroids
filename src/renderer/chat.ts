@@ -9,6 +9,7 @@ import { marked, Marked, type TokenizerAndRendererExtension } from 'marked';
 import { safeExternalLink } from '../shared/external-link.js';
 import { createAgentPanel } from './agent-panel.js';
 import { createFilePanel } from './file-panel.js';
+import { requestRemoteProject } from './remote-project-dialog.js';
 import { renderAgentPlan } from './agent-plan.js';
 import { userPromptText } from '../shared/user-prompt.js';
 import { messageReaction, withoutMessageReaction } from '../shared/message-reaction.js';
@@ -796,8 +797,8 @@ function paintSessions(): void {
     heading.dataset.sortHandle = '';
     heading.setAttribute('aria-keyshortcuts', 'Alt+ArrowUp Alt+ArrowDown');
     const label = el('span', 'project-name', () => project?.name ?? t("Unavailable project"));
-    ui(heading, 'title', () => project?.path ?? t("Unavailable project"));
-    heading.append(icon('i-folder'), label); section.append(heading);
+    ui(heading, 'title', () => project?.remote ? `${t('Remote development server')}: ${project.path}` : project?.path ?? t("Unavailable project"));
+    heading.append(icon(project?.remote ? 'i-globe' : 'i-folder'), label); section.append(heading);
     // Native `toggle` is queued after activation. A concurrent activity repaint can replace
     // this node first and lose the click. Commit the summary's pointer/keyboard click to the
     // one disclosure owner synchronously, then project it onto this details element.
@@ -854,7 +855,7 @@ function paintSessions(): void {
         const row = el('div', 'project-folder-row'); row.setAttribute('role', 'listitem');
         const value = el('span', 'project-folder-path', folder); value.setAttribute('translate', 'no'); value.title = folder;
         row.append(icon('i-folder'), value);
-        if (primary) row.append(ui(el('span', 'project-folder-primary'), 'textContent', () => t('Primary project folder')));
+        if (primary) row.append(ui(el('span', 'project-folder-primary'), 'textContent', () => project.remote ? t('Remote project directory') : t('Primary project folder')));
         else {
           const detach = el('button', 'btn project-folder-remove') as HTMLButtonElement;
           detach.type = 'button'; detach.append(icon('i-x'));
@@ -894,7 +895,9 @@ function paintSessions(): void {
           expandedProjects.add(id); paintSessions();
         } finally { addFolder.disabled = false; }
       });
-      folderList.append(addFolder); section.append(folderList);
+      if (!project.remote) folderList.append(addFolder);
+      else folderList.append(el('p', 'meta', () => t('Remote development server')));
+      section.append(folderList);
     }
     const tasks = projectRows.get(id) ?? [];
     const count = projectVisibleCounts.get(id) ?? PROJECT_TASK_PAGE_SIZE;
@@ -3285,7 +3288,7 @@ function paintDetail(followBottom = historyBefore === null): void {
   if (config) paintContextMeter(summary, config, confirmedComposerModel());
   const project = selectedLocalProject();
   $('chatProjectContext').hidden = !project;
-  $('chatProjectName').textContent = project?.name ?? '';
+  ui($('chatProjectName'), 'textContent', () => project?.remote ? `${project.name} · ${t('Remote development server')}` : project?.name ?? '');
   ui($('chatTitle'), 'textContent', () => summary ? summary.title || t("Untitled session") : t("New chat"));
 
   paintDeliveryControls();
@@ -5424,6 +5427,20 @@ export function initChat(next: Deps): void {
       expandedProjects.add(project.id);
       if (generation === selectionGeneration) selectNewChat(project.id); else paintSessions();
     } finally { button.disabled = false; }
+  });
+  $('addRemoteProject').addEventListener('click', async event => {
+    event.preventDefault(); event.stopPropagation();
+    const button = $<HTMLButtonElement>('addRemoteProject'); button.disabled = true;
+    const generation = selectionGeneration;
+    try {
+      const project = await requestRemoteProject();
+      if (!project) return;
+      ++sessionsLoadGeneration;
+      projects = [...projects.filter(row => row.id !== project.id), project];
+      expandedProjects.add(project.id);
+      if (generation === selectionGeneration) selectNewChat(project.id); else paintSessions();
+    } catch (error) { toast(error instanceof Error ? error.message : String(error)); }
+    finally { button.disabled = false; }
   });
   $('settingsSearch').addEventListener('input', () => {
     filterSettingsSections(document.querySelector<HTMLElement>('[data-view="settings"]')!, $<HTMLInputElement>('settingsSearch').value);

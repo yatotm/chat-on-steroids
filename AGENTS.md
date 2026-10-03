@@ -21,7 +21,7 @@ changed lines before applying an older patch. Document the work and its actual v
 the code currently does it. Known implementation gaps are collected in §21 instead of being
 mixed into the happy path as features.
 
-Source alignment: **2026-09-17**, including the 2.1.14 release candidate. App/extension **2.1.14**,
+Fork remote-development alignment: **2026-10-04**. App/extension **2.2.0**,
 bridge protocol **14** in the checked declarations (`package.json`, `src/main/version.ts`,
 `extension/manifest.json`). This does not prove release, installation or live Chrome behavior.
 
@@ -716,6 +716,17 @@ Negative cases matter: accepted virtual/native in-root paths, rejected traversal
 escapes, live revocation during an await, and preserving an unrelated user's newer file edit.
 
 ## 9. Projects, workspaces and project instructions
+
+本 fork 的远程项目在原记录中增加 `remote`（插件 UUID、工作区 ID、服务地址指纹）。
+`remote-workspace.ts` 复用 Plugins 验证 CodexPro 目录；远程路径绝不交给本机文件系统。
+`validateProject` 验证任一项目，`sessionProjectBinding` 返回会话绑定；`projectWorkspace`
+和 `getSessionProject` 仍只解析本机目录，遇到远程项目拒绝。输入、worker 与接续保留
+原 projectId；远程提示要求使用 Plugins 显式工具，每次调用强制工作区。Core 调度拒绝
+远程会话的本机文件与终端调用，未确认归属不猜测执行位置。远程进程的 CoS 会话归属
+由该模块及 `remote-process-owners` 独占，返回进程 ID 前持久化；实际进程归开发机。
+不自动重发失败调用。添加远程项目复用 Plugins 安装与凭据，Mac 桌面和浏览器位置不变。
+Files、Review、手动终端仍是本机面板，远程工具操作与结果显示在聊天中。
+配置见 `docs/remote-development.md`。
 
 **Intent:** a chat consistently works in its selected local folder, and workers/resumed chats
 retain that choice. Sidebar organization must not destroy work or grant access.
@@ -3765,9 +3776,9 @@ relaunch. Failed checks never replace a verified staged candidate with unverifie
 
 CI verifies supported OS families; native `release.yml` builds/smokes all six targets, then
 assembles installers, extension ZIP, native-sources archive and `SHA256SUMS.txt`. `publish.yml`
-is dispatched **at the reviewed version tag**, calls that reusable build in the same run,
+由版本标签推送或标签上的手动调度触发，并在同次运行调用原有构建流程，
 requires `docs/release-notes/vX.Y.Z.md`, rechecks versions/privacy/hashes and refuses an existing
-release. A tag alone does not build/publish. An unpublished candidate can be built separately,
+release. 本 fork 的版本标签会构建并发布。 An unpublished candidate can be built separately,
 but do not mix artifacts from another ref/run into a release.
 
 `verify:notices` checks installed production dependencies against the lockfile and rejects

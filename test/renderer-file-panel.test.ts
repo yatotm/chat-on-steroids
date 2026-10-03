@@ -127,6 +127,24 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+it('replaces local file views with a remote notice and releases their watches without local I/O', async () => {
+  const panel = createFilePanel({ host, toggle });
+  panel.update(projectA); await panel.show();
+  const listing = vi.mocked(window.api.listProjectFiles), git = vi.mocked(window.api.getProjectGitSnapshot);
+  listing.mockClear(); git.mockClear();
+  panel.update({ ...projectA, id: 'remote-project', path: '/srv/project', remote: {
+    pluginId: 'remote-connection', workspaceId: 'ws_fixture', endpointId: '0'.repeat(64)
+  } });
+  await panel.show();
+  expect(listing).not.toHaveBeenCalled(); expect(git).not.toHaveBeenCalled();
+  expect(window.api.watchProjectFiles).toHaveBeenLastCalledWith(null, []);
+  expect(host.querySelector<HTMLElement>('.remote-project-notice')!.hidden).toBe(false);
+  expect(host.querySelector<HTMLElement>('.file-panel-body')!.hidden).toBe(true);
+  panel.update(projectA); await panel.show();
+  expect(host.querySelector<HTMLElement>('.remote-project-notice')!.hidden).toBe(true);
+  expect(listing).toHaveBeenCalledWith(projectA.id, '');
+});
+
 it('is unavailable without a local project and lazily expands only the chosen directory', async () => {
   const onShow = vi.fn();
   const panel = createFilePanel({ host, toggle, onShow, onAttach: file => attached.push(file.name) });

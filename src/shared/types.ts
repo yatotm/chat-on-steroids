@@ -652,7 +652,7 @@ export interface UpdateStatus {
 }
 
 /** Where an installation that cannot update itself gets the new version by hand. */
-export const RELEASES_PAGE = 'https://github.com/totec448-spec/chat-on-steroids/releases/latest';
+export const RELEASES_PAGE = 'https://github.com/yatotm/chat-on-steroids/releases/latest';
 
 /**
  * Whether `candidate` is a later release than `current`, compared as three numbers.
@@ -695,6 +695,7 @@ export function browserExtensionRequired(_config: Pick<Config, 'sessions' | 'mul
 
 export interface AppState {
   config: Config;
+  hasRemoteProjects?: boolean;
   status: ConnectionStatus;
   /**
    * Exact declaration fingerprints for connectors currently published by the local MCP server.
