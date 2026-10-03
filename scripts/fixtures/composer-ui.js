@@ -31,7 +31,7 @@
   {seq:2,time:now+1,source:'extension',kind:'assistant_message',messageId:'a-1',turnId:'t-1',message:message('The layout can be adjusted while preserving the controls and interactions.'),state:'final',final:true}];
  const controls={sessionId:id,conversationId:'preview-chat',automation:'off',objective:'Polish the dashboard without changing its behavior.',activeTurnId:null,finishHeld:false,finishWaiting:false,queueAtFinish:false,canInject:false,canSendDirectly:true,blocked:'',job:null,plan:null};
  let inputs=[];
- const notify=()=>emit('onSessionChanged',id);
+ const notify=()=>emit('onSessionChanged',{sessionIds:[id]});
  const fixture={
   getState:()=>ok(appState),getLog:()=>ok([]),getChatModels:()=>ok(models),requestChatModels:()=>{emit('onChatModelsChanged',models);return ok(models);},
   getZoom:()=>ok(1),pluginsSnapshot:()=>ok(null),listManagedSkills:()=>ok([]),listRecommendedSkills:()=>ok([]),extensionPath:()=>ok('Isolated preview — no extension connection'),

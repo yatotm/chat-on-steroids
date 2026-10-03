@@ -32,9 +32,20 @@ app.whenReady().then(async () => {
   await win.webContents.executeJavaScript(`document.querySelector('#sessionList [data-id="composer-preview"]').click()`);
   await pause(500);
   const js = source => win.webContents.executeJavaScript(source);
+  // 等待真实控制状态，避免把合并刷新和渲染延迟当作按钮失效。
+  const waitFor = source => js(`new Promise(resolve => {
+    let observer, timer;
+    const finish = value => { observer?.disconnect(); clearTimeout(timer); resolve(value); };
+    const check = () => { if (${source}) finish(true); };
+    observer = new MutationObserver(check);
+    observer.observe(document.body, { subtree:true, childList:true, attributes:true });
+    timer = setTimeout(() => finish(false), 5000);
+    check();
+  })`);
   const checks = [];
   const check = async (name, source) => {
     const passed = await js(source);
+    if (!passed) console.error('Actual composer state: ' + await js(`JSON.stringify({action:document.getElementById('chatSend').dataset.action,draft:document.getElementById('chatInput').value,selectedSkills:document.getElementById('composerSelectedSkills').textContent,turn:composerFixture.controls.activeTurnId,finishHeld:composerFixture.controls.finishHeld})`));
     if (!passed) { await capture('failure'); console.error(await js(`({menuOpen:document.getElementById('composerSettings').open,menuClass:document.getElementById('composerSettings').className,controlsHidden:document.getElementById('sessionControls').hidden,objectiveDisabled:document.getElementById('sessionObjective').disabled,objectiveRect:document.getElementById('sessionObjective').getBoundingClientRect().toJSON()})`)); }
     if (!passed) console.error(await js(`({dock:document.getElementById('composerDock').getBoundingClientRect().toJSON(),children:[...document.querySelector('.composer-dock-body').children].map(e=>({id:e.id,hidden:e.hidden,height:e.getBoundingClientRect().height,text:e.textContent})),planHidden:document.getElementById('agentPlan').hidden,goalHidden:document.getElementById('activeGoalRow').hidden,queued:document.querySelectorAll('#finishQueue .queued-input').length,context:getComputedStyle(document.getElementById('contextMeterInfo')).display,focus:document.activeElement.id})`));
     assert.equal(passed, true, name); checks.push(name);
@@ -91,7 +102,8 @@ app.whenReady().then(async () => {
   await check('Completion removes plan while preserving queue and Goal', `document.getElementById('agentPlan').hidden&&!document.getElementById('activeGoalRow').hidden&&document.querySelectorAll('#finishQueue .queued-input').length===1`);
   await js(`composerFixture.scenario('empty')`); await pause(1000);
   await check('Empty dock leaves no strip', `document.getElementById('composerDock').getBoundingClientRect().height===0`);
-  await js(`composerFixture.scenario('hold')`); await pause(500);
+  await js(`composerFixture.scenario('hold')`);
+  await waitFor(`document.getElementById('chatSend').dataset.action==='stop'`);
   await check('Stop is available during finish hold', `document.getElementById('chatSend').dataset.action==='stop'`);
   await click('#chatSend'); await pause(350);
   await check('Stop reaches native controller', `composerFixture.controls.activeTurnId===null`);
