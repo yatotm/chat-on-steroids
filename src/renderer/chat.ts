@@ -5428,9 +5428,11 @@ export function initChat(next: Deps): void {
       if (generation === selectionGeneration) selectNewChat(project.id); else paintSessions();
     } finally { button.disabled = false; }
   });
-  $('addRemoteProject').addEventListener('click', async event => {
+  const remoteProjectButtons = ['addRemoteProject', 'wizAddRemoteProject'].map(id => $<HTMLButtonElement>(id));
+  for (const button of remoteProjectButtons) button.addEventListener('click', async event => {
     event.preventDefault(); event.stopPropagation();
-    const button = $<HTMLButtonElement>('addRemoteProject'); button.disabled = true;
+    if (remoteProjectButtons.some(control => control.disabled)) return;
+    for (const control of remoteProjectButtons) control.disabled = true;
     const generation = selectionGeneration;
     try {
       const project = await requestRemoteProject();
@@ -5440,7 +5442,7 @@ export function initChat(next: Deps): void {
       expandedProjects.add(project.id);
       if (generation === selectionGeneration) selectNewChat(project.id); else paintSessions();
     } catch (error) { toast(error instanceof Error ? error.message : String(error)); }
-    finally { button.disabled = false; }
+    finally { for (const control of remoteProjectButtons) control.disabled = false; }
   });
   $('settingsSearch').addEventListener('input', () => {
     filterSettingsSections(document.querySelector<HTMLElement>('[data-view="settings"]')!, $<HTMLInputElement>('settingsSearch').value);

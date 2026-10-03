@@ -9,6 +9,10 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.2.1] — 首次设置直接连接 Linux 开发机
+
+连接设置第一步新增“连接 Linux 开发机”，明确区分远程项目和本机文件夹。添加成功后显示“已添加远程项目”，无需批准 Mac 目录。远程项目的 ChatGPT 连接步骤增加 Plugins 配置入口，并等待该连接也连通。
+
 ## [2.2.0] — Remote Linux projects from the Mac workspace
 
 This fork adds CodexPro remote projects through Plugins, explicit workspace routing, local-execution refusal for remote conversations, and session-owned remote processes. Workers, continuation, queues and tool history keep their existing owners. See [remote development setup](docs/remote-development.md). Native Files, Review and manual terminals remain local. Update and extension downloads use this fork.

@@ -21,7 +21,7 @@ changed lines before applying an older patch. Document the work and its actual v
 the code currently does it. Known implementation gaps are collected in §21 instead of being
 mixed into the happy path as features.
 
-Fork remote-development alignment: **2026-10-04**. App/extension **2.2.0**,
+Fork remote-development alignment: **2026-10-04**. App/extension **2.2.1**,
 bridge protocol **14** in the checked declarations (`package.json`, `src/main/version.ts`,
 `extension/manifest.json`). This does not prove release, installation or live Chrome behavior.
 
@@ -725,6 +725,9 @@ escapes, live revocation during an await, and preserving an unrelated user's new
 远程会话的本机文件与终端调用，未确认归属不猜测执行位置。远程进程的 CoS 会话归属
 由该模块及 `remote-process-owners` 独占，返回进程 ID 前持久化；实际进程归开发机。
 不自动重发失败调用。添加远程项目复用 Plugins 安装与凭据，Mac 桌面和浏览器位置不变。
+首次连接设置的第一步直接提供 Linux 开发机入口，与聊天侧栏共用添加流程。
+项目提交后由 `hasRemoteProjects` 完成第一步，不增加本机根目录权限；取消或失败不算完成。
+设置第 5 步提示进入 Plugins 配置，并等待远程项目必需的 Plugins 连接请求证明。
 Files、Review、手动终端仍是本机面板，远程工具操作与结果显示在聊天中。
 配置见 `docs/remote-development.md`。
 

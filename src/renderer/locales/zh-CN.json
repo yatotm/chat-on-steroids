@@ -1830,5 +1830,14 @@
   "The remote server address changed. Add the remote project again.": "开发机地址已变更，请重新添加远程项目。",
   "The remote CodexPro workspace tool is unavailable. Check Plugins for disabled or conflicting tools.": "远程 CodexPro 工作区工具不可用，请在插件设置中检查是否被禁用或存在工具冲突。",
   "Turn off Read-only before connecting a remote project.": "连接远程项目前，请关闭只读模式。",
-  "Could not open the remote workspace.": "无法打开远程工作区。"
+  "Could not open the remote workspace.": "无法打开远程工作区。",
+  "Choose where to work": "选择工作位置",
+  "Connect your Linux development server, or choose a folder on this computer. Remote projects do not need a local folder.": "连接 Linux 开发机，或选择本机文件夹。远程项目无需选择本机文件夹。",
+  "Connect Linux development server": "连接 Linux 开发机",
+  "Choose local folder": "选择本机文件夹",
+  "Add a remote project or choose a local folder — step 1.": "添加远程项目或选择本机文件夹 — 第 1 步。",
+  "Remote project added": "已添加远程项目",
+  "Connect remote tools": "连接远程工具",
+  "Remote projects also need Chat On Steroids Plugins in ChatGPT. Open Plugins and choose Set up plugins to configure its connection.": "远程项目还需要在 ChatGPT 中连接 Chat On Steroids Plugins。打开“插件”页面，点击“设置插件”完成连接配置。",
+  "Open Plugins": "打开插件页面"
 }

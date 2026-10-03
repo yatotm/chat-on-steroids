@@ -552,13 +552,16 @@
                   <i class="ico tick ph ph-check" aria-hidden="true"></i>
                 </div>
                 <div class="step-body">
-                  <h3>Pick a folder to share</h3>
+                  <h3>Choose where to work</h3>
                   <p>
-                    Choose the folder you want ChatGPT to work in. You can add more folders later.
+                    Connect your Linux development server, or choose a folder on this computer. Remote projects do not need a local folder.
                   </p>
                   <div class="step-actions">
-                    <button class="btn btn-solid" id="wizAddFolder" type="button">
-                      <i class="ico ph ph-folder" aria-hidden="true"></i>Choose folder
+                    <button class="btn btn-solid" id="wizAddRemoteProject" type="button">
+                      <i class="ico ph ph-globe-hemisphere-west" aria-hidden="true"></i>Connect Linux development server
+                    </button>
+                    <button class="btn" id="wizAddFolder" type="button">
+                      <i class="ico ph ph-folder" aria-hidden="true"></i>Choose local folder
                     </button>
                     <button class="btn" id="wizManageFolders" type="button">Manage folders</button>
                     <span class="chosen" id="wizFolders">None yet</span>
@@ -704,6 +707,11 @@
                        on when it decides whether to load a connector's tools at all, so both are
                        given as copyable text rather than described. -->
                   <div class="connectors" id="connectorCards"></div>
+                  <div id="wizRemotePlugins" hidden>
+                    <h4 class="setup-subheading">Connect remote tools</h4>
+                    <p>Remote projects also need Chat On Steroids Plugins in ChatGPT. Open Plugins and choose Set up plugins to configure its connection.</p>
+                    <div class="step-actions"><button class="btn" id="wizOpenPlugins" type="button">Open Plugins</button></div>
+                  </div>
                   <div class="plugin-permission-step">
                     <strong>Before you start: choose “Allow all actions”</strong>
                     <p>In ChatGPT, open Settings → Plugins, select this plugin, and set its action permissions to <b>Allow all actions</b>. Repeat for the Desktop plugin if you added it.</p>

@@ -1319,7 +1319,7 @@ it('guides rootless setup from the capabilities that actually need a filesystem 
   mounted.push(mixed);
   const connect = mounted.window.document.getElementById('connectionPopoverToggle') as HTMLButtonElement;
   expect(connect.disabled).toBe(true);
-  expect(connect.title).toContain('Choose a folder');
+  expect(connect.title).toContain('Add a remote project or choose a local folder');
   expect(mounted.window.document.querySelector('[data-step="folder"]')?.classList.contains('is-current')).toBe(true);
 
   const commandAndDesktop = structuredClone(mixed) as any;
@@ -1327,7 +1327,7 @@ it('guides rootless setup from the capabilities that actually need a filesystem 
   commandAndDesktop.config.capabilities.command = true;
   mounted.push(commandAndDesktop);
   expect(connect.disabled).toBe(true);
-  expect(connect.title).toContain('Choose a folder');
+  expect(connect.title).toContain('Add a remote project or choose a local folder');
 
   const desktopOnly = structuredClone(mixed) as any;
   desktopOnly.config.capabilities.browse = false;
@@ -1341,6 +1341,44 @@ it('guides rootless setup from the capabilities that actually need a filesystem 
   clipboardOnly.status.surfaces[1].tools = ['computer'];
   mounted.push(clipboardOnly);
   expect(connect.disabled).toBe(false);
+});
+
+it('completes remote folder setup without local grants and requires the Plugins connection', async () => {
+  const mounted = await mountChat({ hasApiKey: true });
+  const state = structuredClone(mounted.state) as any;
+  state.config.roots = [];
+  state.hasRemoteProjects = true;
+  state.status.lastRequestAt = Date.now();
+  const doc = mounted.window.document;
+  const folder = doc.querySelector('[data-step="folder"]')!;
+  const chatgpt = doc.querySelector('[data-step="chatgpt"]')!;
+  mounted.push(state);
+  expect(folder.classList.contains('is-done')).toBe(true);
+  expect(doc.getElementById('wizFolders')!.textContent).toBe('Remote project added');
+  expect((doc.getElementById('connectionPopoverToggle') as HTMLButtonElement).disabled).toBe(false);
+  expect(doc.getElementById('wizRemotePlugins')!.hidden).toBe(false);
+  expect(chatgpt.classList.contains('is-done')).toBe(false);
+  state.status.surfaces = [{
+    id: 'plugins', connectorName: 'Chat On Steroids Plugins', description: '', cardSummary: '', optional: true,
+    available: true, localUrl: null, publicUrl: null, tools: [], state: 'live', detail: '',
+    lastRequestAt: null, lastToolCallAt: null
+  }];
+  mounted.push(state);
+  expect(chatgpt.classList.contains('is-done')).toBe(false);
+  state.status.surfaces[0].lastRequestAt = Date.now();
+  mounted.push(state);
+  expect(chatgpt.classList.contains('is-done')).toBe(true);
+  state.hasRemoteProjects = false;
+  mounted.push(state);
+  expect(folder.classList.contains('is-done')).toBe(false);
+  expect(doc.getElementById('wizFolders')!.textContent).toBe('None yet');
+  expect(doc.getElementById('wizRemotePlugins')!.hidden).toBe(true);
+  expect((doc.getElementById('connectionPopoverToggle') as HTMLButtonElement).disabled).toBe(true);
+  state.config.roots = [{ name: 'repo', path: 'C:/repo' }];
+  state.status.surfaces[0].lastRequestAt = null;
+  mounted.push(state);
+  expect(folder.classList.contains('is-done')).toBe(true);
+  expect(chatgpt.classList.contains('is-done')).toBe(true);
 });
 
 it('preserves optional Desktop disclosures and inline screenshots across status pushes', async () => {

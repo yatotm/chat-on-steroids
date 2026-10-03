@@ -747,7 +747,7 @@ function missingStep(
   // clipboard may legitimately be rootless; enabling one must not hide a root still needed
   // by an effective file/patch/command capability on Core.
   if (config.roots.length === 0 && requiresApprovedFilesystemRoot(config) && !next.hasRemoteProjects) {
-    return { step: 'folder', text: t("Choose a folder to share — step 1.") };
+    return { step: 'folder', text: t('Add a remote project or choose a local folder — step 1.') };
   }
   if (config.tunnel.kind === 'openai') {
     if (!TUNNEL_ID_PATTERN.test(values.tunnelId)) {
@@ -1327,7 +1327,11 @@ function apply(next: AppState): void {
   const desktopSurface = status.surfaces.find((surface) => surface.id === 'desktop');
   $('desktopTunnelField').hidden = !openai || !desktopSurface?.available;
 
-  ui($('wizFolders'), 'textContent', () => config.roots.length === 0 ? t("None yet") : config.roots.map((r) => `/${r.name}`).join('  '));
+  ui($('wizFolders'), 'textContent', () => [
+    ...config.roots.map(r => `/${r.name}`),
+    ...(next.hasRemoteProjects ? [t('Remote project added')] : [])
+  ].join('  ') || t('None yet'));
+  $('wizRemotePlugins').hidden = !next.hasRemoteProjects;
   const secureStorageAvailable = next.secureStorage?.available ?? true;
   const apiKey = $<HTMLInputElement>('apiKey');
   ui(apiKey, 'placeholder', () => next.hasApiKey ? t("•••••••• stored") : 'sk-…');
@@ -1393,15 +1397,14 @@ function apply(next: AppState): void {
   if (!openai || TUNNEL_ID_PATTERN.test(config.tunnel.tunnelId)) done.add('tunnel');
   if (!openai || next.hasApiKey) done.add('key');
   if (connected) done.add('connect');
-  // The only honest proof step 5 is finished: ChatGPT has actually called the connectors
-  // this app cannot work without. Judged per surface, because a Core request says nothing
-  // about whether the Desktop connector was ever created. An optional connector never
-  // blocks completion — a user may enable clipboard access and still not want a second
-  // connector — but it is reported separately below rather than quietly counted as done.
+  // Core 的请求不能证明 Plugins 已连通；远程项目必须分别验证两条连接。
   const requiredUnverified = status.surfaces.some(
     (surface) => surface.available && !surface.optional && surface.lastRequestAt === null
   );
-  if (status.lastRequestAt !== null && !requiredUnverified) done.add('chatgpt');
+  const remotePluginsVerified = !next.hasRemoteProjects || status.surfaces.some(
+    surface => surface.id === 'plugins' && surface.available && surface.lastRequestAt !== null
+  );
+  if (status.lastRequestAt !== null && !requiredUnverified && remotePluginsVerified) done.add('chatgpt');
   // Pairing is durable authorization, not liveness. A token surviving an app restart says
   // only that this extension is allowed to connect; setup is complete when a required browser
   // has actually checked in during this process. If no enabled feature needs the browser,
@@ -1940,6 +1943,7 @@ $('readOnlyBtn').addEventListener('click', () => {
 
 $('addFolder').addEventListener('click', () => void addFolder());
 $('wizAddFolder').addEventListener('click', () => void addFolder());
+$('wizOpenPlugins').addEventListener('click', () => showTab('plugins'));
 $('wizManageFolders').addEventListener('click', () => {
   showTab('home');
   $('foldersCard').scrollIntoView({ block: 'nearest' });

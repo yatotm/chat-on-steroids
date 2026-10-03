@@ -1830,5 +1830,14 @@
   "The remote server address changed. Add the remote project again.": "The remote server address changed. Add the remote project again.",
   "The remote CodexPro workspace tool is unavailable. Check Plugins for disabled or conflicting tools.": "The remote CodexPro workspace tool is unavailable. Check Plugins for disabled or conflicting tools.",
   "Turn off Read-only before connecting a remote project.": "Turn off Read-only before connecting a remote project.",
-  "Could not open the remote workspace.": "Could not open the remote workspace."
+  "Could not open the remote workspace.": "Could not open the remote workspace.",
+  "Choose where to work": "Choose where to work",
+  "Connect your Linux development server, or choose a folder on this computer. Remote projects do not need a local folder.": "Connect your Linux development server, or choose a folder on this computer. Remote projects do not need a local folder.",
+  "Connect Linux development server": "Connect Linux development server",
+  "Choose local folder": "Choose local folder",
+  "Add a remote project or choose a local folder — step 1.": "Add a remote project or choose a local folder — step 1.",
+  "Remote project added": "Remote project added",
+  "Connect remote tools": "Connect remote tools",
+  "Remote projects also need Chat On Steroids Plugins in ChatGPT. Open Plugins and choose Set up plugins to configure its connection.": "Remote projects also need Chat On Steroids Plugins in ChatGPT. Open Plugins and choose Set up plugins to configure its connection.",
+  "Open Plugins": "Open Plugins"
 }
