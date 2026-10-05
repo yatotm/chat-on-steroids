@@ -11,9 +11,12 @@ commit, push, tag, or release, run `npm run verify:privacy`. The versioned Git h
 Do not bypass these guards with `--no-verify`. If a privacy check blocks a change, remove the
 private value at its source and create a new clean commit instead.
 
-Never push this clone's local branch history. Publish work as fresh commits built on the remote
-branch tip (`git write-tree` / `git commit-tree`, or a merge of `origin/main` done the same way),
-pointed at by a new local branch. The local history is private and stays here.
+后续使用正常 `git commit`，从已经核对过的公共基线继续，不再例行重建提交历史。旧的私有实验
+分支仍不得混入公开历史；保留隐私检查、noreply 身份与上游作者历史。
+
+仅在用户明确安排 push 时推送，并把已批准的改动正常合并到 `main`。若该次授权同时允许更新
+版本，则同步版本声明、更新发布说明并发布新 release；若只允许 push，则仅合并 `main`，
+不自动升级版本、不打发布标签、不创建 release。一次授权不代表以后可自动推送。
 
 Never add a `Co-Authored-By` trailer, a "Generated with" line, or any other Claude attribution to
 commits, pull requests, tags or release notes. The maintainer is the only author on this repository.

@@ -25,7 +25,6 @@ permissions:
 
 jobs:
   verify:
-    if: github.repository == 'totec448-spec/chat-on-steroids'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:

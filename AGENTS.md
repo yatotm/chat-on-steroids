@@ -4161,6 +4161,10 @@ Tests: `report-scrub.test.ts`, `diagnostics-report.test.ts` and `ipc.test.ts` (n
 
 ## 20. Build, installation, updater and release
 
+本 fork 的交付约定：日常使用正常 commit；push 必须听用户本次安排。获准 push 时把批准的
+改动合并到 `main`；只有同次明确允许“更新版本”才升级版本声明、打标签并发布 release。
+未获发版授权的 push 只更新 `main`。保持隐私检查及干净的公开基线，不把旧私有实验历史带入。
+
 Source, bundle, package, installed bytes and live behavior are separate gates (§3). The app id
 is `com.chatonsteroids.app`. Native release targets are Windows x64/arm64 NSIS, macOS x64/arm64
 DMG+ZIP and Linux x64/arm64 AppImage+DEB. Windows is per-user-capable and `asInvoker`; replacing
