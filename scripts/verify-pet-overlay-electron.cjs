@@ -258,7 +258,8 @@ function attachOverlay(win) {
           return { rect: rect?.toJSON(), region: bar && getComputedStyle(bar).webkitAppRegion,
             hit: hit?.className ?? null, hitRegion: hit && getComputedStyle(hit).webkitAppRegion, point };
         })()`);
-        assert.ok(titlebar.rect?.height >= 27.5, // fractional scaling measures 28px as 27.998
+        // 原生标题栏高度按窗口 DIP 保持不变，CSS 坐标随页面缩放变化。
+        assert.ok(titlebar.rect?.height * owner.webContents.getZoomFactor() >= 27.5,
           `The titlebar needs a real drag row: ${JSON.stringify(titlebar)}`);
         assert.equal(titlebar.region, 'drag', `The titlebar lost its native drag region: ${JSON.stringify(titlebar)}`);
         assert.ok(String(titlebar.hit).includes('app-topbar'), `The drag point is covered: ${JSON.stringify(titlebar)}`);

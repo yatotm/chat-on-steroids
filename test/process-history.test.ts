@@ -181,6 +181,22 @@ it('records an exit already resolved before recorder admission without another m
   } });
 });
 
+it('keeps the launch unchanged when its remote completion observation disconnects', async () => {
+  const session = await createSession({ conversationId: 'owner', title: 'process' });
+  let disconnect!: (error: Error) => void;
+  const completion = new Promise<ProcessCompletion>((_resolve, reject) => { disconnect = reject; });
+  await recordToolCall({ tool: 'exec_command', args: { cmd: 'fixture' }, content: [{ type: 'text', text: 'initial' }],
+    startedAt: 100, durationMs: 10, outcome: 'ok', conversationId: 'owner', sessionId: session.id,
+    requestId: 'request', evidence: { ...emptyEvidence(), running: true, processSessionId: '1234', processCompletion: completion } });
+  const before = await readEvents(session.id);
+  disconnect(new Error('remote connection closed'));
+  await new Promise(resolve => setImmediate(resolve));
+  await flushRecorder();
+  expect(await readEvents(session.id)).toEqual(before);
+  expect(before.find(event => event.kind === 'tool_call')).toMatchObject({ call: { process: { sessionId: '1234' } } });
+  expect(before.find(event => event.kind === 'tool_call')?.call.process).not.toHaveProperty('exitCode');
+});
+
 it('real process exit updates history while all output remains available to its owner', async () => {
   const session = await createSession({ conversationId: 'owner', title: 'process' });
   const manager = new UnifiedExecProcessManager(60_000);

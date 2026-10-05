@@ -315,16 +315,13 @@ it('serializes settings intent so rapid toggles and later UI changes cannot undo
   pending.shift()!({ ok: true, data: current });
   await new Promise((resolve) => setTimeout(resolve, 0));
 
-  // The title-bar theme action uses the same serialized settings owner as Appearance. Two
-  // quick presses must request dark then light even though the first save has not answered.
-  const theme = w.document.getElementById('themeBtn') as HTMLButtonElement;
-  expect(theme.getAttribute('aria-label')).toBe('Switch to dark mode');
-  theme.click();
+  // Appearance changes must request dark then light in order,
+  // even though the first dark save has not answered yet.
+  const theme = w.document.getElementById('appearanceTheme') as HTMLSelectElement;
+  theme.value = 'dark'; theme.dispatchEvent(new w.Event('change', { bubbles: true }));
   await vi.waitFor(() => expect(calls).toHaveLength(4));
   expect(calls[3].ui.theme).toBe('dark');
-  expect(w.document.documentElement.dataset.theme).toBe('dark');
-  expect(theme.getAttribute('aria-label')).toBe('Switch to light mode');
-  theme.click();
+  theme.value = 'light'; theme.dispatchEvent(new w.Event('change', { bubbles: true }));
   expect(calls).toHaveLength(4);
 
   current = appState({ ...baseConfig, readOnly: false, ui: { ...baseConfig.ui, autoConnect: true, theme: 'dark' } });
@@ -598,6 +595,149 @@ it('shows committed resume inheritance as trusted and revokes it through the cur
   await vi.waitFor(() => expect(setSessionTrusted).toHaveBeenCalledWith(session.id, current, false));
 });
 
+it('names a chat in place: Enter saves, Escape keeps the old name, empty restores ChatGPT\'s title, repaints keep the field (#1107)', async () => {
+  const session = {
+    id: 'rename-session-0001', title: 'ChatGPT title', conversationId: 'rename-conversation-0001', chatIds: ['rename-conversation-0001'],
+    startedAt: 1, updatedAt: 2, endedAt: null, events: 0, userMessages: 0, toolCalls: 0,
+    lastToolCallAt: null, processExitNonzero: 0, toolRejected: 0, toolInternalErrors: 0, errors: 0,
+    estimatedTokens: 0, contextTokens: 0, lastTurnOutcome: null, activeTurnId: null, agents: [], origin: null
+  };
+  const renameSession = vi.fn(async () => ({ ok: true, data: true }));
+  const mounted = await mountChat({}, [], {
+    listProjects: async () => ({ ok: true, data: [] }),
+    listSessions: async () => ({ ok: true, data: { sessions: [session], activeId: null, pressure: [], blocked: [], trusted: [] } }),
+    renameSession
+  });
+  const doc = mounted.window.document;
+  const row = () => doc.querySelector<HTMLElement>(`[data-id="${session.id}"]`)!;
+  const field = () => row().querySelector<HTMLInputElement>('.sess-rename');
+  await vi.waitFor(() => expect(row().querySelector('button.sess-name')).not.toBeNull());
+  expect(field()).toBeNull();
+  const press = (key: string) => field()!.dispatchEvent(new mounted.window.KeyboardEvent('keydown', { key, bubbles: true }));
+  const type = (text: string) => { field()!.value = text; field()!.dispatchEvent(new mounted.window.Event('input', { bubbles: true })); };
+
+  // Escape: nothing is saved, the title is back.
+  row().querySelector<HTMLButtonElement>('button.sess-name')!.click();
+  await vi.waitFor(() => expect(field()).not.toBeNull());
+  expect(field()!.value).toBe('ChatGPT title');
+  type('Never saved');
+  press('Escape');
+  await vi.waitFor(() => expect(field()).toBeNull());
+  expect(renameSession).not.toHaveBeenCalled();
+  expect(row().querySelector('.sess-top b')!.textContent).toBe('ChatGPT title');
+
+  // The sidebar repaints while the user types; the field and its text survive.
+  row().querySelector<HTMLButtonElement>('button.sess-name')!.click();
+  await vi.waitFor(() => expect(field()).not.toBeNull());
+  type('  Release   prep  ');
+  const editing = field();
+  mounted.push(structuredClone(mounted.state));
+  await new Promise(resolve => setTimeout(resolve, 50));
+  // The same node: an input method's composition would not survive a replaced field.
+  expect(field()).toBe(editing);
+  expect(field()?.value).toBe('  Release   prep  ');
+  press('Enter');
+  await vi.waitFor(() => expect(renameSession).toHaveBeenCalledWith(session.id, 'Release   prep'));
+
+  // Empty asks for ChatGPT's title again.
+  row().querySelector<HTMLButtonElement>('button.sess-name')!.click();
+  await vi.waitFor(() => expect(field()).not.toBeNull());
+  type('   ');
+  press('Enter');
+  await vi.waitFor(() => expect(renameSession).toHaveBeenLastCalledWith(session.id, null));
+});
+
+it('searches chats from the sidebar: results replace the lists, matches are marked, Escape brings the lists back (#1107)', async () => {
+  const base = { conversationId: null, chatIds: [], startedAt: 1, updatedAt: 2, endedAt: null, events: 0, userMessages: 0, toolCalls: 0,
+    lastToolCallAt: null, processExitNonzero: 0, toolRejected: 0, toolInternalErrors: 0, errors: 0,
+    estimatedTokens: 0, contextTokens: 0, lastTurnOutcome: null, activeTurnId: null, agents: [], origin: null };
+  const listed = { ...base, id: 'search-listed-0001', title: 'Listed chat', conversationId: 'search-listed-conversation' };
+  let indexed = 1;
+  const searchSessions = vi.fn(async (query: string) => ({ ok: true, data: query === 'bridge' ? {
+    results: [{ id: 'search-hit-0001', title: 'Release planning', projectId: null,
+      snippet: { text: '…then the bridge gets its installer.', matches: [[10, 16]] } }],
+    indexed, total: 3 } : { results: [], indexed: 3, total: 3 } }));
+  const getSession = vi.fn(async (id: string) => ({ ok: true, data: { summary: { ...base, id, title: 'Release planning' }, events: [], total: 0, nextFrom: 1 } }));
+  const mounted = await mountChat({}, [], {
+    listProjects: async () => ({ ok: true, data: [] }),
+    listSessions: async () => ({ ok: true, data: { sessions: [listed], activeId: null, pressure: [], blocked: [], trusted: [] } }),
+    searchSessions, getSession
+  });
+  const doc = mounted.window.document;
+  const field = doc.getElementById('chatSearch') as HTMLInputElement;
+  const results = doc.getElementById('searchResults')!;
+  const lists = doc.getElementById('sessionList')!;
+  await vi.waitFor(() => expect(doc.querySelector('[data-id="search-listed-0001"]')).not.toBeNull());
+  expect(results.hidden).toBe(true);
+
+  field.value = 'bridge';
+  field.dispatchEvent(new mounted.window.Event('input', { bubbles: true }));
+  await vi.waitFor(() => expect(results.querySelector('.search-result')).not.toBeNull());
+  expect(lists.hidden).toBe(true);
+  expect(results.hidden).toBe(false);
+  expect((doc.getElementById('chatSearchClear') as HTMLButtonElement).hidden).toBe(false);
+  expect(results.querySelector('.search-result b')!.textContent).toBe('Release planning');
+  expect([...results.querySelectorAll('.search-snippet mark')].map(mark => mark.textContent)).toEqual(['bridge']);
+  // Indexing is not done yet: the result says so, and asks again until it is.
+  expect(results.querySelector('.search-status')!.textContent).toContain('1 of 3');
+  indexed = 3;
+  await vi.waitFor(() => expect(results.querySelector('.search-status')).toBeNull());
+
+  (results.querySelector('.search-result') as HTMLButtonElement).click();
+  await vi.waitFor(() => expect(getSession).toHaveBeenCalledWith('search-hit-0001', expect.anything()));
+  expect(results.querySelector('.search-result')!.classList.contains('is-sel')).toBe(true);
+
+  field.value = 'nothing';
+  field.dispatchEvent(new mounted.window.Event('input', { bubbles: true }));
+  await vi.waitFor(() => expect(results.textContent).toContain('No chats match'));
+
+  field.dispatchEvent(new mounted.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  await vi.waitFor(() => expect(lists.hidden).toBe(false));
+  expect(results.hidden).toBe(true);
+  expect(field.value).toBe('');
+});
+
+it.each([['Win32', 'ctrlKey', 'metaKey'], ['MacIntel', 'metaKey', 'ctrlKey']] as const)(
+  'focuses chat search with the primary shortcut on %s, never from the terminal, and says when results were capped', async (platform, primary, other) => {
+  vi.stubGlobal('navigator', { ...globalThis.navigator, platform });
+  try {
+    const base = { conversationId: null, chatIds: [], startedAt: 1, updatedAt: 2, endedAt: null, events: 0, userMessages: 0, toolCalls: 0,
+      lastToolCallAt: null, processExitNonzero: 0, toolRejected: 0, toolInternalErrors: 0, errors: 0,
+      estimatedTokens: 0, contextTokens: 0, lastTurnOutcome: null, activeTurnId: null, agents: [], origin: null };
+    const listed = { ...base, id: 'search-shortcut-0001', title: 'Listed chat', conversationId: 'search-shortcut-conversation' };
+    const mounted = await mountChat({}, [], {
+      listProjects: async () => ({ ok: true, data: [] }),
+      listSessions: async () => ({ ok: true, data: { sessions: [listed], activeId: null, pressure: [], blocked: [], trusted: [] } }),
+      searchSessions: async () => ({ ok: true, data: { results: [{ id: 'search-shortcut-0001', title: 'Listed chat', projectId: null }],
+        indexed: 1, total: 1, limited: true } })
+    });
+    const doc = mounted.window.document;
+    const field = doc.getElementById('chatSearch') as HTMLInputElement;
+    await vi.waitFor(() => expect(doc.querySelector('[data-id="search-shortcut-0001"]')).not.toBeNull());
+    const press = (target: EventTarget, modifier: string) =>
+      target.dispatchEvent(new mounted.window.KeyboardEvent('keydown', { key: 'k', [modifier]: true, bubbles: true, cancelable: true }));
+    expect(press(doc.body, other)).toBe(true);
+    expect(doc.activeElement).not.toBe(field);
+    // Ctrl+K deletes to the end of the line in a shell; the terminal keeps it.
+    const terminal = doc.createElement('div');
+    terminal.className = 'xterm';
+    const input = terminal.appendChild(doc.createElement('textarea'));
+    doc.body.append(terminal);
+    input.focus();
+    expect(press(input, primary)).toBe(true);
+    expect(doc.activeElement).toBe(input);
+    expect(press(doc.body, primary)).toBe(false);
+    expect(doc.activeElement).toBe(field);
+
+    field.value = 'listed';
+    field.dispatchEvent(new mounted.window.Event('input', { bubbles: true }));
+    await vi.waitFor(() => expect(doc.getElementById('searchResults')!.textContent)
+      .toContain('Showing the first 1 matches. Add a word to narrow them down.'));
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
 it('shows an inherited Block ahead of Trust on a committed resumed row', async () => {
   const source = 'strict-resume-blocked-source-0001';
   const current = 'strict-resume-blocked-current-0001';
@@ -675,7 +815,7 @@ it('keeps project keyboard focus across activity repaint without taking composer
 
 // Adapted from @Haz4rdovisk's #345: typed Setup values used to reach the app only on blur, so a
 // Connect click right after typing did nothing.
-it.each(['headerConnect', 'wizConnect', 'connectionPopoverToggle'])(
+it.each(['wizConnect', 'connectionPopoverToggle'])(
   'persists valid Setup drafts before %s starts the tunnel',
   async (buttonId) => {
     let live: any;
@@ -722,61 +862,6 @@ it.each(['headerConnect', 'wizConnect', 'connectionPopoverToggle'])(
   }
 );
 
-it('keeps titlebar Connect clickable with incomplete setup and focuses the missing Setup step', async () => {
-  const connect = vi.fn();
-  const mounted = await mountChat({}, [], { connect });
-  const doc = mounted.window.document;
-  const header = doc.getElementById('headerConnect') as HTMLButtonElement;
-  const popover = doc.getElementById('connectionPopoverToggle') as HTMLButtonElement;
-  const wizard = doc.getElementById('wizConnect') as HTMLButtonElement;
-  const missing = doc.querySelector<HTMLElement>('[data-step="key"]')!;
-
-  expect(header.textContent).toBe('Connect');
-  expect(header.disabled).toBe(false);
-  expect(popover.disabled).toBe(true);
-  expect(wizard.disabled).toBe(true);
-  header.click();
-
-  await vi.waitFor(() => expect(doc.querySelector('[data-panel="setup"]')?.classList.contains('is-active')).toBe(true));
-  expect(missing.classList.contains('is-current')).toBe(true);
-  expect(doc.activeElement).toBe(missing);
-  expect(connect).not.toHaveBeenCalled();
-});
-
-it('shows titlebar Connect only before connection and never turns it into Disconnect', async () => {
-  const connect = vi.fn();
-  const disconnect = vi.fn();
-  const mounted = await mountChat({ hasApiKey: true }, [], { connect, disconnect });
-  const header = mounted.window.document.getElementById('headerConnect') as HTMLButtonElement;
-  const pushState = (state: any) => mounted.push({ ...mounted.state, status: { ...mounted.state.status, state } });
-
-  for (const state of ['disconnected', 'auth-failed', 'tunnel-unavailable'] as const) {
-    pushState(state);
-    expect(header.hidden).toBe(false);
-    expect(header.textContent).toBe('Connect');
-    expect(header.disabled).toBe(false);
-    expect(header.classList.contains('is-running')).toBe(false);
-  }
-  for (const state of ['starting-server', 'connecting-tunnel'] as const) {
-    pushState(state);
-    expect(header.hidden).toBe(false);
-    expect(header.textContent).toBe('Connecting…');
-    expect(header.disabled).toBe(true);
-    expect(header.classList.contains('is-running')).toBe(false);
-  }
-  for (const state of ['connected', 'offline', 'disconnecting'] as const) {
-    pushState(state);
-    expect(header.hidden).toBe(true);
-    expect(header.classList.contains('is-running')).toBe(false);
-  }
-
-  pushState('connected');
-  header.click();
-  await settle();
-  expect(disconnect).not.toHaveBeenCalled();
-  expect(connect).not.toHaveBeenCalled();
-});
-
 it('keeps global connection controls in a compact sidebar popover', async () => {
   const mounted = await mountChat({ hasApiKey: true });
   const doc = mounted.window.document;
@@ -794,12 +879,8 @@ it('keeps global connection controls in a compact sidebar popover', async () => 
   mounted.push(connected);
 
   const trigger = doc.getElementById('sidebarConnection') as HTMLButtonElement;
-  const topbarAction = doc.getElementById('headerConnect') as HTMLButtonElement;
   const popover = doc.getElementById('connectionPopover') as HTMLElement;
   expect(doc.querySelector('#chatTitle')!.closest('header')!.querySelector('#connectBtn')).toBeNull();
-  expect(topbarAction.closest('.app-topbar')).not.toBeNull();
-  expect(topbarAction.hidden).toBe(true);
-  expect(topbarAction.classList.contains('is-running')).toBe(false);
   expect(trigger.closest('.sidebar-bottom')).not.toBeNull();
   expect(trigger.textContent?.trim()).toBe('');
   expect(trigger.getAttribute('aria-label')).toMatch(/Connected.*verified/i);
@@ -893,20 +974,6 @@ it('shows connection status once and keeps diagnostics out of the desktop popove
   expect(doc.activeElement).toBe(trigger);
   expect(diagnostics).not.toHaveBeenCalled();
   expect(internalBrowser).not.toHaveBeenCalled();
-});
-
-it('always offers setup collapse and preserves the choice across incomplete status updates', async () => {
-  const mounted = await mountChat();
-  const doc = mounted.window.document;
-  const button = doc.getElementById('wizExpand') as HTMLButtonElement;
-  expect(button.hidden).toBe(false);
-  button.click();
-  expect(doc.getElementById('wizard')!.classList.contains('is-tidy')).toBe(true);
-  expect(button.getAttribute('aria-expanded')).toBe('false');
-  mounted.push({ ...mounted.state, hasApiKey: true });
-  expect(doc.getElementById('wizard')!.classList.contains('is-tidy')).toBe(true);
-  button.click();
-  expect(doc.getElementById('wizard')!.classList.contains('is-tidy')).toBe(false);
 });
 
 it('adds and selects setup profiles and rejects an older profile status response', async () => {
@@ -1064,6 +1131,20 @@ it('saves the ChatGPT browser choice from its settings control and restores it o
   expect(browser.value).toBe('edge');
   mounted.push({ ...mounted.state, config: { ...mounted.state.config, ui: { ...mounted.state.config.ui, chatBrowser: 'chrome' } } });
   expect(browser.value).toBe('chrome');
+});
+
+it('saves Auto-select Skills from Settings and restores it on state push', async () => {
+  const mounted = await mountChat();
+  const w = mounted.window;
+  const toggle = w.document.getElementById('autoSelectSkills') as HTMLInputElement;
+  expect(toggle).not.toBeNull();
+  expect(toggle.checked).toBe(false);
+  toggle.checked = true;
+  toggle.dispatchEvent(new w.Event('change', { bubbles: true }));
+  await vi.waitFor(() => expect(mounted.calls).toHaveLength(1));
+  expect(mounted.calls[0].ui.autoSelectSkills).toBe(true);
+  mounted.push({ ...mounted.state, config: { ...mounted.state.config, ui: { ...mounted.state.config.ui, autoSelectSkills: false } } });
+  expect(toggle.checked).toBe(false);
 });
 
 it('saves and restores the global worker admission cap from Settings', async () => {
@@ -1300,6 +1381,8 @@ it('guides rootless setup from the capabilities that actually need a filesystem 
   mixed.hasApiKey = true;
   mixed.config.roots = [];
   mixed.config.readOnly = false;
+  // ChatGPT's browser is Setup's first step; connected here so the folder step is the one judged.
+  mixed.bridge = { ...mixed.bridge, present: true, paired: true, externalExtension: { present: true, version: mixed.update.current, lastSeenAt: Date.now(), signedIn: true } };
   for (const capability of Object.keys(mixed.config.capabilities)) mixed.config.capabilities[capability] = false;
   mixed.config.capabilities.browse = true;
   mixed.config.capabilities.screen = true;
@@ -1317,6 +1400,7 @@ it('guides rootless setup from the capabilities that actually need a filesystem 
   ];
 
   mounted.push(mixed);
+  mounted.window.document.getElementById('browserContinue')!.click();
   const connect = mounted.window.document.getElementById('connectionPopoverToggle') as HTMLButtonElement;
   expect(connect.disabled).toBe(true);
   expect(connect.title).toContain('Add a remote project or choose a local folder');
@@ -1343,42 +1427,180 @@ it('guides rootless setup from the capabilities that actually need a filesystem 
   expect(connect.disabled).toBe(false);
 });
 
-it('completes remote folder setup without local grants and requires the Plugins connection', async () => {
+it('completes remote setup with Core alone while Plugins stays optional', async () => {
   const mounted = await mountChat({ hasApiKey: true });
   const state = structuredClone(mounted.state) as any;
   state.config.roots = [];
   state.hasRemoteProjects = true;
   state.status.lastRequestAt = Date.now();
+  const surface = { description: '', cardSummary: '', available: true, localUrl: null, publicUrl: null,
+    tools: [], state: 'live', detail: '', lastRequestAt: null, lastToolCallAt: null };
+  state.status.surfaces = [
+    { ...surface, id: 'core', connectorName: 'Chat On Steroids Core', optional: false },
+    { ...surface, id: 'plugins', connectorName: 'Chat On Steroids Plugins', optional: true }
+  ];
   const doc = mounted.window.document;
   const folder = doc.querySelector('[data-step="folder"]')!;
   const chatgpt = doc.querySelector('[data-step="chatgpt"]')!;
   mounted.push(state);
   expect(folder.classList.contains('is-done')).toBe(true);
   expect(doc.getElementById('wizFolders')!.textContent).toBe('Remote project added');
-  expect((doc.getElementById('connectionPopoverToggle') as HTMLButtonElement).disabled).toBe(false);
-  expect(doc.getElementById('wizRemotePlugins')!.hidden).toBe(false);
-  expect(chatgpt.classList.contains('is-done')).toBe(false);
-  state.status.surfaces = [{
-    id: 'plugins', connectorName: 'Chat On Steroids Plugins', description: '', cardSummary: '', optional: true,
-    available: true, localUrl: null, publicUrl: null, tools: [], state: 'live', detail: '',
-    lastRequestAt: null, lastToolCallAt: null
-  }];
-  mounted.push(state);
+  expect(doc.getElementById('wizRemotePlugins')).toBeNull();
   expect(chatgpt.classList.contains('is-done')).toBe(false);
   state.status.surfaces[0].lastRequestAt = Date.now();
   mounted.push(state);
   expect(chatgpt.classList.contains('is-done')).toBe(true);
+  expect(state.status.surfaces[1].lastRequestAt).toBeNull();
+  state.status.lastToolCallAt = Date.now();
+  state.status.surfaces[0].lastToolCallAt = Date.now();
+  mounted.push(state);
+  expect(doc.getElementById('wizChatgpt')!.textContent).not.toContain('Plugins');
+  state.config.tunnel.pluginsTunnelId = 'tunnel_' + 'b'.repeat(32);
+  mounted.push(state);
+  expect(doc.getElementById('wizChatgpt')!.textContent).toContain('Plugins');
   state.hasRemoteProjects = false;
   mounted.push(state);
   expect(folder.classList.contains('is-done')).toBe(false);
-  expect(doc.getElementById('wizFolders')!.textContent).toBe('None yet');
-  expect(doc.getElementById('wizRemotePlugins')!.hidden).toBe(true);
-  expect((doc.getElementById('connectionPopoverToggle') as HTMLButtonElement).disabled).toBe(true);
-  state.config.roots = [{ name: 'repo', path: 'C:/repo' }];
-  state.status.surfaces[0].lastRequestAt = null;
-  mounted.push(state);
-  expect(folder.classList.contains('is-done')).toBe(true);
-  expect(chatgpt.classList.contains('is-done')).toBe(true);
+  expect(doc.getElementById('wizFolders')!.textContent).toBe('No folder shared yet. Choose one to start.');
+});
+
+it('fills an empty folder list with a place to choose one, not a blank', async () => {
+  const pick = vi.fn(() => Promise.resolve({ ok: true, data: null }));
+  const mounted = await mountChat({}, [], { addRoot: pick });
+  const empty = structuredClone(mounted.state);
+  empty.config.roots = [];
+  mounted.push(empty);
+  const doc = mounted.window.document;
+  const invite = doc.querySelector<HTMLButtonElement>('#wizFolders .folder-empty')!;
+  expect(invite.textContent).toBe('No folder shared yet. Choose one to start.');
+  invite.click();
+  await settle();
+  expect(pick).toHaveBeenCalled();
+  // With a folder shared, the list shows it instead.
+  mounted.push(structuredClone(mounted.state));
+  expect(doc.querySelector('#wizFolders .folder-empty')).toBeNull();
+  expect(doc.getElementById('wizFolders')!.textContent).toBe('/repo');
+});
+
+it('ends Setup on Ready, which names what is still open and leads back to it', async () => {
+  const mounted = await mountChat();
+  const doc = mounted.window.document;
+  doc.querySelector<HTMLButtonElement>('[data-rail-step="ready"]')!.click();
+  expect(doc.querySelector('[data-step="ready"]')!.classList.contains('is-open')).toBe(true);
+  expect(doc.getElementById('readyTitle')!.textContent).toBe('Almost there');
+  expect(doc.getElementById('readyStart')!.hidden).toBe(true);
+  const pending = [...doc.querySelectorAll<HTMLButtonElement>('#readyChecks .ready-go')];
+  expect(pending.length).toBeGreaterThan(0);
+  expect(pending.map(button => button.textContent)).toContain('Step 4API key stored');
+  pending.find(button => button.textContent!.includes('API key'))!.click();
+  expect(doc.querySelector('[data-step="key"]')!.classList.contains('is-open')).toBe(true);
+});
+
+it('requires external installation before choosing the built-in browser and signing in', async () => {
+  const shown: unknown[] = [];
+  const opened: Array<[string, unknown]> = [];
+  const mounted = await mountChat({}, [], {
+    showCosBrowser: () => { shown.push(true); return Promise.resolve({ ok: true, data: true }); },
+    openChatGpt: () => { shown.push('external'); return Promise.resolve({ ok: true, data: true }); },
+    signOutChatGpt: () => { shown.push('sign-out'); return Promise.resolve({ ok: true, data: true }); },
+    openLink: (url: string, options: unknown) => { opened.push([url, options]); return Promise.resolve({ ok: true, data: true }); }
+  });
+  const document = mounted.window.document;
+  const browserStep = document.querySelector<HTMLElement>('[data-step="browser"]')!;
+  const visible = (variant: string) => [...browserStep.querySelectorAll<HTMLElement>(`[data-browser-variant="${variant}"]`)]
+    .every(node => !node.hidden);
+  expect(document.querySelector('#wizard > li.step')).toBe(browserStep);
+  const checked = () => [...browserStep.querySelectorAll<HTMLElement>('[data-browser-choice]')]
+    .filter(option => option.getAttribute('aria-checked') === 'true').map(option => option.dataset.browserChoice);
+  // Two equal choices; with Chrome saved, the built-in browser is offered, not preselected.
+  expect(checked()).toEqual(['extension']);
+
+  const cos = structuredClone(mounted.state);
+  cos.config.ui = { ...cos.config.ui, chatBrowser: 'cos' };
+  cos.cosBrowserSignedIn = false;
+  mounted.push(cos);
+  expect(visible('cos')).toBe(true);
+  expect(visible('extension')).toBe(false);
+  expect(checked()).toEqual(['cos']);
+  expect(browserStep.classList.contains('is-current')).toBe(true);
+  expect(document.getElementById('cosBrowserState')!.textContent).toBe('Not signed in yet.');
+  (document.getElementById('showCosBrowser') as HTMLButtonElement).click();
+  expect(shown).toHaveLength(1);
+  // Every page Setup opens in the built-in browser also offers the system's own browser.
+  const others = [...document.querySelectorAll<HTMLButtonElement>('#wizard [data-link-external]')];
+  expect(others.map(button => button.dataset.linkExternal)).toEqual([
+    'https://platform.openai.com/settings/organization/tunnels',
+    'https://platform.openai.com/settings/organization/api-keys',
+    'https://chatgpt.com/plugins'
+  ]);
+  for (const other of others) {
+    expect(other.hidden).toBe(false);
+    expect(other.previousElementSibling?.getAttribute('data-link')).toBe(other.dataset.linkExternal);
+  }
+  others[0]!.click();
+  expect(opened).toEqual([['https://platform.openai.com/settings/organization/tunnels', { external: true }]]);
+
+  // Signed in is the user's part; the step is done once the companion has checked in too.
+  mounted.push({ ...cos, cosBrowserSignedIn: true });
+  expect(browserStep.classList.contains('is-done')).toBe(false);
+  mounted.push({ ...cos, cosBrowserSignedIn: true, bridge: { ...cos.bridge, present: true } });
+  expect(browserStep.classList.contains('is-done')).toBe(false);
+  expect((document.getElementById('browserContinue') as HTMLButtonElement).disabled).toBe(true);
+  const externalReady = { ...cos, cosBrowserSignedIn: true, bridge: { ...cos.bridge, present: true, paired: true,
+    externalExtension: { present: true, version: cos.update.current, lastSeenAt: Date.now() } } };
+  // The extension connecting moves the step on by itself; nobody has to find Continue.
+  mounted.push(externalReady);
+  expect((document.getElementById('browserLocationStage') as HTMLElement).hidden).toBe(false);
+  // Chrome's extension answering is not the CoS browser's own copy reaching the app.
+  expect(browserStep.classList.contains('is-done')).toBe(false);
+  expect(document.getElementById('cosBrowserState')!.textContent).toBe('Signed in. Connecting to ChatGPT…');
+  mounted.push({ ...externalReady, bridge: { ...externalReady.bridge, cosExtension: { present: true } } });
+  expect(browserStep.classList.contains('is-done')).toBe(true);
+  expect(document.getElementById('cosBrowserState')!.textContent).toBe('Signed in. ChatGPT is connected.');
+  // Surely signed in, the same button signs out instead.
+  const cosButton = document.getElementById('showCosBrowser') as HTMLButtonElement;
+  expect(cosButton.textContent).toBe('Sign out of ChatGPT');
+  expect(cosButton.classList.contains('btn-solid')).toBe(true);
+  expect(cosButton.querySelector('i')!.className).toBe('ico ph ph-sign-out');
+  cosButton.click();
+  expect(shown.at(-1)).toBe('sign-out');
+
+  // Chrome, Edge and Brave keep the extension instructions, and a way back to the built-in browser.
+  const chrome = structuredClone(mounted.state);
+  chrome.config.ui = { ...chrome.config.ui, chatBrowser: 'chrome' };
+  mounted.push(chrome);
+  expect(visible('extension')).toBe(true);
+  expect(visible('cos')).toBe(false);
+  expect([...document.querySelectorAll<HTMLElement>('#wizard [data-link-external]')].every(button => button.hidden)).toBe(true);
+  expect(checked()).toEqual(['extension']);
+  // Open ChatGPT opens it where the person chose: their own browser on this path. Being signed in
+  // to the built-in browser does not make this one a sign-out.
+  const externalButton = document.getElementById('openSelectedChatGpt') as HTMLButtonElement;
+  expect(externalButton.textContent).toBe('Sign in to ChatGPT');
+  expect(externalButton.classList.contains('btn-solid')).toBe(true);
+  externalButton.click();
+  expect(shown.at(-1)).toBe('external');
+  // Only a certain answer from that browser turns it into a sign-out.
+  mounted.push({ ...chrome, bridge: { ...chrome.bridge, externalExtension: { present: true, version: chrome.update.current, lastSeenAt: Date.now(), signedIn: true } } });
+  expect(externalButton.textContent).toBe('Sign out of ChatGPT');
+  externalButton.click();
+  expect(shown.at(-1)).toBe('sign-out');
+  mounted.push(chrome);
+  expect(externalButton.textContent).toBe('Sign in to ChatGPT');
+  (document.getElementById('useCosBrowser') as HTMLButtonElement).click();
+  await settle();
+  expect(mounted.calls.at(-1)?.ui?.chatBrowser).toBe('cos');
+
+  // Installation choice is local until the person explicitly chooses where to run ChatGPT.
+  mounted.push(cos);
+  const savesBeforeInstallChoice = mounted.calls.length;
+  (document.querySelector('[data-external-browser="edge"]') as HTMLButtonElement).click();
+  await settle();
+  expect(mounted.calls).toHaveLength(savesBeforeInstallChoice);
+  mounted.push(cos);
+  (document.getElementById('useExtensionBrowser') as HTMLButtonElement).click();
+  await settle();
+  expect(mounted.calls.at(-1)?.ui?.chatBrowser).toBe('edge');
 });
 
 it('preserves optional Desktop disclosures and inline screenshots across status pushes', async () => {
@@ -1392,25 +1614,26 @@ it('preserves optional Desktop disclosures and inline screenshots across status 
   mounted.push(state);
   const doc = mounted.window.document;
   const field = doc.getElementById('desktopTunnelField') as HTMLDetailsElement;
-  const card = () => doc.querySelector<HTMLDetailsElement>('#connectorCards details')!;
   expect(field.hidden).toBe(false);
   expect(field.open).toBe(false);
-  expect(card().open).toBe(false);
-  field.querySelector('summary')!.click(); card().querySelector('summary')!.click();
+  // Desktop is shown like Core, never folded: its name and description are there to copy.
+  expect(doc.querySelectorAll('#connectorCards details')).toHaveLength(0);
+  expect(doc.querySelector('#connectorCards')!.textContent).toContain('Desktop');
+  field.querySelector('summary')!.click();
   const guide = doc.querySelector('[data-setup-guide="tunnel"]')!;
-  expect(guide.querySelectorAll('img')).toHaveLength(1);
+  expect(guide.querySelectorAll('img')).toHaveLength(2);
   expect(doc.querySelectorAll('[data-setup-guide="developer"] img')).toHaveLength(1);
-  expect(doc.querySelectorAll('[data-setup-guide="plugin"] img')).toHaveLength(2);
+  expect(doc.querySelectorAll('[data-setup-guide="plugin"] img')).toHaveLength(4);
+  // Each picture's places are the step's numbered moves.
+  expect([...guide.querySelectorAll('.guide-move')].map(move => move.textContent)).toEqual(
+    ['1Name it', '2Pick your ChatGPT workspace', '3Click Create', '4Copy the tunnel ID']);
   const image = guide.querySelector('img')!;
   mounted.push(structuredClone(state));
   expect(field.open).toBe(true);
-  expect(card().open).toBe(true);
   expect(guide.querySelector('img')).toBe(image);
-  expect(image.src).toContain('workspace.png');
+  expect(image.src).toContain('tunnel-create.png');
   expect(mounted.calls).toEqual([]);
-  card().querySelector('summary')!.click();
   mounted.push(structuredClone(state));
-  expect(card().open).toBe(false);
   expect(field.open).toBe(true);
 });
 
@@ -1449,21 +1672,212 @@ it('highlights missing required setup fields while respecting drafts and a store
   expect(mounted.calls).toEqual([]);
 });
 
+it('names every connector ChatGPT never called, joined in the UI language', async () => {
+  const mounted = await mountChat({ hasApiKey: true });
+  const doc = mounted.window.document;
+  const surface = (id: string, connectorName: string, optional: boolean, called: boolean) => ({
+    id, connectorName, description: '', cardSummary: '', optional, available: true, localUrl: null, publicUrl: null, tools: ['read'],
+    state: 'live', detail: '', lastRequestAt: called ? Date.now() - 60_000 : null, lastToolCallAt: called ? Date.now() - 60_000 : null, proof: null
+  });
+  const state = structuredClone(mounted.state);
+  state.config.tunnel.desktopTunnelId = 'tunnel_' + 'a'.repeat(32);
+  state.config.tunnel.pluginsTunnelId = 'tunnel_' + 'b'.repeat(32);
+  state.status.state = 'connected';
+  state.status.lastRequestAt = Date.now() - 60_000;
+  state.status.lastToolCallAt = Date.now() - 60_000;
+  state.status.surfaces = [surface('core', 'Core', false, true), surface('desktop', 'Desktop', true, false), surface('plugins', 'Plugins', true, false)];
+  mounted.push(state);
+  const note = () => doc.getElementById('wizChatgpt')!.textContent!;
+  expect(note()).toContain('“Desktop” and “Plugins” have never been called — create them in ChatGPT');
+  const { setLanguage } = await import('../src/renderer/i18n.js');
+  setLanguage('de');
+  try {
+    // One language throughout: no English "and", and the plural grammar.
+    expect(note()).toContain('“Desktop” und “Plugins” wurden noch nie aufgerufen – lege sie in ChatGPT an');
+  } finally { setLanguage('en'); }
+  const single = structuredClone(state);
+  single.status.surfaces = [surface('core', 'Core', false, true), surface('desktop', 'Desktop', true, false)];
+  mounted.push(single);
+  expect(note()).toContain('“Desktop” has never been called — create it in ChatGPT');
+});
+
+it('counts a plugin ChatGPT used in an earlier run, so a restart does not reopen Setup', async () => {
+  const mounted = await mountChat({ hasApiKey: true });
+  const doc = mounted.window.document;
+  const core = {
+    id: 'core', connectorName: 'Core', description: '', cardSummary: '', optional: false,
+    available: true, localUrl: null, publicUrl: null, tools: ['read'], state: 'live', detail: '',
+    lastRequestAt: null, lastToolCallAt: null, proof: null as null | { requestAt: number; toolCallAt: number }
+  };
+  // Just restarted: connected, but ChatGPT has not called again yet in this run.
+  const restarted = structuredClone(mounted.state);
+  restarted.status.state = 'connected';
+  restarted.status.lastRequestAt = null;
+  restarted.bridge = { ...restarted.bridge, present: true, paired: true, externalExtension: { present: true, version: restarted.update.current, lastSeenAt: Date.now(), signedIn: true } };
+  restarted.status.surfaces = [core];
+  mounted.push(restarted);
+  const chatgpt = doc.querySelector('[data-step="chatgpt"]')!;
+  expect(chatgpt.classList.contains('is-done')).toBe(false);
+  expect(doc.getElementById('readyTitle')!.textContent).toBe('Almost there');
+
+  const yesterday = Date.now() - 86_400_000;
+  const proven = structuredClone(restarted);
+  proven.status.surfaces = [{ ...core, proof: { requestAt: yesterday, toolCallAt: yesterday } }];
+  mounted.push(proven);
+  expect(chatgpt.classList.contains('is-done')).toBe(true);
+  expect(doc.getElementById('readyTitle')!.textContent).toBe('You’re all set!');
+  expect(doc.getElementById('wizChatgpt')!.textContent).toMatch(/whole chain works/);
+
+  // ChatGPT listing the plugin is enough: Setup does not ask for a test message.
+  const listed = structuredClone(restarted);
+  listed.status.surfaces = [{ ...core, proof: { requestAt: null, toolCallAt: null, installedAt: yesterday } as any }];
+  mounted.push(listed);
+  expect(chatgpt.classList.contains('is-done')).toBe(true);
+  expect(doc.getElementById('readyTitle')!.textContent).toBe('You’re all set!');
+  expect(doc.getElementById('wizChatgpt')!.textContent).toMatch(/plugin is in your ChatGPT/);
+
+  // Deleted in ChatGPT: the plugins list no longer names it, the proof goes and the step reopens.
+  mounted.push(structuredClone(restarted));
+  expect(chatgpt.classList.contains('is-done')).toBe(false);
+});
+
+// Mounts the whole app many times over; under a fully parallel suite that alone can pass 30 s.
+it('recognizes a finished first step after a restart from live or lasting evidence, without a click', async () => {
+  type External = { present: boolean; version: string | null; lastSeenAt: number | null; signedIn?: boolean | null;
+    proof?: { version: string; signedIn: boolean } | null };
+  // Each scenario is a fresh launch: main.ts binds to the window it is first imported into.
+  const launch = async (overrides: Record<string, unknown> = {}) => { vi.resetModules(); return mountChat(overrides, []); };
+  const scenario = async (browser: 'chrome' | 'cos', external: External | null, extra: Record<string, unknown> = {}) => {
+    const mounted = await launch();
+    const state = structuredClone(mounted.state);
+    state.config.ui = { ...state.config.ui, chatBrowser: browser };
+    state.bridge = { ...state.bridge, running: true, paired: true, present: true, externalExtension: external, ...extra };
+    mounted.push(state);
+    const doc = mounted.window.document;
+    return {
+      done: doc.querySelector('[data-step="browser"]')!.classList.contains('is-done'),
+      choosing: !(doc.getElementById('browserLocationStage') as HTMLElement).hidden,
+      status: doc.getElementById('extensionStatus')!.textContent,
+      version: state.update.current
+    };
+  };
+  const now = Date.now();
+  const app = (await launch()).state.update.current as string;
+  const old = '0.0.1';
+
+  // Chrome closed, but this browser had the extension and ChatGPT answered signed in there.
+  let result = await scenario('chrome', { present: false, version: null, lastSeenAt: null, signedIn: null, proof: { version: app, signedIn: true } });
+  expect(result).toMatchObject({ done: true, choosing: true, status: 'Extension installed and up to date' });
+  // Chrome open with no ChatGPT tab: no live answer, the lasting one stands.
+  result = await scenario('chrome', { present: true, version: app, lastSeenAt: now, signedIn: null, proof: { version: app, signedIn: true } });
+  expect(result).toMatchObject({ done: true, status: 'Extension connected and up to date' });
+  // A live signed-out answer wins over the lasting one.
+  result = await scenario('chrome', { present: true, version: app, lastSeenAt: now, signedIn: false, proof: { version: app, signedIn: true } });
+  expect(result.done).toBe(false);
+  // Never signed in there.
+  result = await scenario('chrome', { present: true, version: app, lastSeenAt: now, signedIn: null, proof: { version: app, signedIn: false } });
+  expect(result.done).toBe(false);
+  // An old extension, live or remembered, asks to update and opens on the install part.
+  result = await scenario('chrome', { present: true, version: old, lastSeenAt: now, signedIn: true, proof: { version: app, signedIn: true } });
+  expect(result).toMatchObject({ done: false, choosing: false, status: 'Update your extension' });
+  result = await scenario('chrome', { present: false, version: null, lastSeenAt: null, proof: { version: old, signedIn: true } });
+  expect(result).toMatchObject({ done: false, choosing: false, status: 'Update your extension' });
+  // No extension ever: the install part, waiting.
+  result = await scenario('chrome', null);
+  expect(result).toMatchObject({ done: false, choosing: false, status: 'Waiting for the browser extension' });
+
+  // Built-in: the extension proven, signed in in its own jar, and its own copy reaching the app.
+  const proven = { present: false, version: null, lastSeenAt: null, proof: { version: app, signedIn: true } };
+  result = await scenario('cos', proven, { cosBrowserSignedIn: undefined, cosExtension: { present: true } });
+  expect(result.done).toBe(false);
+  const cos = async (signedIn: boolean | null, cosPresent: boolean) => {
+    const mounted = await launch({ cosBrowserSignedIn: signedIn });
+    const state = structuredClone(mounted.state);
+    state.config.ui = { ...state.config.ui, chatBrowser: 'cos' };
+    state.cosBrowserSignedIn = signedIn;
+    state.bridge = { ...state.bridge, running: true, paired: true, present: true, externalExtension: proven, cosExtension: { present: cosPresent } };
+    mounted.push(state);
+    return mounted.window.document.querySelector('[data-step="browser"]')!.classList.contains('is-done');
+  };
+  expect(await cos(true, true)).toBe(true);
+  expect(await cos(true, false)).toBe(false);
+  expect(await cos(false, true)).toBe(false);
+}, 60_000);
+
+// Mounts the whole app many times over; under a fully parallel suite that alone can pass 30 s.
+it('reports each path’s own sign-in, whatever the other browser says, and keeps a logout a logout', async () => {
+  vi.resetModules();
+  const mounted = await mountChat({}, []);
+  const doc = mounted.window.document;
+  const app = mounted.state.update.current as string;
+  const step = doc.querySelector('[data-step="browser"]')!;
+  type Answer = boolean | null;
+  const paint = (where: 'cos' | 'chrome', cos: { signedIn: Answer; connected: boolean },
+    external: { live: boolean; answer: Answer; proof: Answer }) => {
+    const state = structuredClone(mounted.state);
+    state.config.ui = { ...state.config.ui, chatBrowser: where };
+    state.cosBrowserSignedIn = cos.signedIn;
+    state.bridge = { ...state.bridge, running: true, paired: true, present: true, cosExtension: { present: cos.connected },
+      externalExtension: { present: external.live, version: external.live ? app : null, lastSeenAt: external.live ? Date.now() : null,
+        signedIn: external.answer, proof: { version: app, signedIn: external.proof } } };
+    mounted.push(state);
+    const status = doc.getElementById(where === 'cos' ? 'cosBrowserState' : 'externalBrowserState')!;
+    return { done: step.classList.contains('is-done'), text: status.textContent, tone: status.dataset.tone };
+  };
+  const anyExternal = [
+    { live: true, answer: true, proof: true }, { live: true, answer: false, proof: false },
+    { live: true, answer: null, proof: null }, { live: false, answer: null, proof: null }
+  ];
+  // Built-in: only its own jar and its own companion count; Chrome's sign-in changes nothing.
+  for (const external of anyExternal) {
+    expect(paint('cos', { signedIn: true, connected: true }, external)).toEqual({ done: true, text: 'Signed in. ChatGPT is connected.', tone: 'ok' });
+    expect(paint('cos', { signedIn: true, connected: false }, external)).toEqual({ done: false, text: 'Signed in. Connecting to ChatGPT…', tone: 'wait' });
+    expect(paint('cos', { signedIn: false, connected: true }, external)).toEqual({ done: false, text: 'Not signed in yet.', tone: 'wait' });
+    expect(paint('cos', { signedIn: null, connected: true }, external)).toEqual({ done: false, text: 'Starting the built-in browser…', tone: 'wait' });
+  }
+  // Your browser: only ChatGPT's answer there counts; the built-in browser's sign-in changes nothing.
+  for (const cos of [{ signedIn: true, connected: true }, { signedIn: false, connected: false }, { signedIn: null, connected: false }]) {
+    expect(paint('chrome', cos, { live: true, answer: true, proof: true })).toEqual({ done: true, text: 'Signed in. ChatGPT is connected.', tone: 'ok' });
+    expect(paint('chrome', cos, { live: true, answer: false, proof: false })).toEqual({ done: false, text: 'Not signed in to ChatGPT in Chrome.', tone: 'wait' });
+    // A live logout wins over an older sign-in.
+    expect(paint('chrome', cos, { live: true, answer: false, proof: true }).done).toBe(false);
+    // No tab open: the last answer stands, whichever it was.
+    expect(paint('chrome', cos, { live: true, answer: null, proof: true })).toEqual({ done: true, text: 'Signed in. ChatGPT is connected.', tone: 'ok' });
+    expect(paint('chrome', cos, { live: true, answer: null, proof: false })).toEqual({ done: false, text: 'Not signed in to ChatGPT in Chrome.', tone: 'wait' });
+    expect(paint('chrome', cos, { live: true, answer: null, proof: null })).toEqual({ done: false, text: 'Open ChatGPT in Chrome to check the sign-in.', tone: 'wait' });
+    // Browser closed: the same answers, without claiming a live connection.
+    expect(paint('chrome', cos, { live: false, answer: null, proof: true })).toEqual({ done: true, text: 'Signed in.', tone: 'ok' });
+    expect(paint('chrome', cos, { live: false, answer: null, proof: false })).toEqual({ done: false, text: 'Not signed in to ChatGPT in Chrome.', tone: 'wait' });
+    expect(paint('chrome', cos, { live: false, answer: null, proof: null })).toEqual({ done: false, text: 'Open ChatGPT in Chrome to check the sign-in.', tone: 'wait' });
+  }
+}, 60_000);
+
 it('keeps folder access discoverable after setup and navigates without granting access', async () => {
   const addRoot = vi.fn();
   const mounted = await mountChat({ hasApiKey: true }, [], { addRoot });
   const connected = structuredClone(mounted.state);
   connected.status.state = 'connected';
   connected.status.lastRequestAt = Date.now();
-  connected.bridge.present = true;
+  connected.bridge = { ...connected.bridge, present: true, paired: true, externalExtension: { present: true, version: connected.update.current, lastSeenAt: Date.now(), signedIn: true } };
   mounted.push(connected);
+  mounted.window.document.getElementById('browserContinue')!.click();
+  mounted.window.document.querySelector<HTMLButtonElement>('[data-rail-step=ready]')!.click();
   const doc = mounted.window.document;
   const styles = doc.createElement('style');
   styles.textContent = await fs.readFile(path.join(process.cwd(), 'src/renderer/styles.css'), 'utf8');
   doc.head.append(styles);
   doc.querySelector<HTMLButtonElement>('[data-tab="setup"]')!.click();
 
-  expect(doc.getElementById('wizard')!.classList.contains('is-tidy')).toBe(true);
+  // A finished setup opens on its proof: every check passed, and the way into a chat. There is
+  // no guide to hide any more; each step stays one click away on the rail.
+  expect(doc.getElementById('wizExpand')).toBeNull();
+  expect(doc.querySelector('[data-step="ready"]')!.classList.contains('is-open')).toBe(true);
+  // A finished setup leads with its proof: every check passed, and the way into a chat.
+  expect(doc.getElementById('readyTitle')!.textContent).toBe('You’re all set!');
+  expect(doc.getElementById('readyStart')!.hidden).toBe(false);
+  expect(doc.querySelectorAll('#readyChecks .ready-check.is-passed')).toHaveLength(6);
+  expect(mounted.window.getComputedStyle(doc.getElementById('readyChecks')!).display).not.toBe('none');
+  doc.querySelector<HTMLButtonElement>('[data-rail-step="folder"]')!.click();
   const manage = doc.getElementById('wizManageFolders')!;
   expect(mounted.window.getComputedStyle(manage.parentElement!).display).not.toBe('none');
   expect(doc.getElementById('wizFolders')!.textContent).toBe('/repo');
@@ -1527,15 +1941,15 @@ it('always requires the live browser because recording is an invariant', async (
 
   expect(browserStep.classList.contains('is-done')).toBe(false);
   expect(browserStep.classList.contains('is-current')).toBe(true);
-  expect(doc.getElementById('wizard')!.classList.contains('is-tidy')).toBe(false);
   expect(doc.getElementById('bridgeState')!.textContent).toContain('Authorized');
   expect(doc.getElementById('bridgeState')!.textContent).not.toContain('Connected.');
 
   const live = structuredClone(mounted.state) as any;
   live.hasApiKey = true;
   live.status = (mounted.state as any).status;
-  live.bridge = { running: true, port: 8765, paired: true, present: true, lastSeenAt: Date.now() };
+  live.bridge = { running: true, port: 8765, paired: true, present: true, lastSeenAt: Date.now(), externalExtension: { present: true, version: live.update.current, lastSeenAt: Date.now(), signedIn: true } };
   mounted.push(live);
+  doc.getElementById('browserContinue')!.click();
   expect(browserStep.classList.contains('is-done')).toBe(true);
   expect(doc.getElementById('bridgeState')!.textContent).toContain('Connected.');
 
@@ -1551,7 +1965,6 @@ it('always requires the live browser because recording is an invariant', async (
   mounted.push(browserFree);
   expect(browserStep.hidden).toBe(false);
   expect(browserStep.classList.contains('is-current')).toBe(true);
-  expect(doc.getElementById('wizard')!.classList.contains('is-tidy')).toBe(false);
   expect(doc.getElementById('bridgeState')!.textContent).not.toContain('not needed');
   expect((doc.getElementById('chatAutomation') as HTMLSelectElement).disabled).toBe(false);
   expect(doc.getElementById('chatAutomation')!.title).toContain('Continue');
@@ -2126,6 +2539,54 @@ it('gives twenty rapid New Chat sends independent visible local chats before any
   expect(sendInput.mock.calls.every(([request]) => request.sessionId === null)).toBe(true);
 });
 
+it('shows the frozen Auto-selected Skill receipt for an accepted ordinary send', async () => {
+  const rows: any[] = [], summaries: any[] = [];
+  const ok = (data: any) => ({ ok: true, data });
+  const sendInput = vi.fn(async (request: any) => {
+    const row = {
+      ...request,
+      sessionId: request.id,
+      opening: true,
+      autoSkills: [{ id: 'code-review', revision: 'a'.repeat(64) }],
+      state: 'queued',
+      owner: null,
+      createdAt: Date.now(),
+      conversationId: null
+    };
+    rows.push(row);
+    summaries.push({
+      id: row.sessionId,
+      title: row.text,
+      conversationId: null,
+      origin: { kind: 'desktop' },
+      createdAt: row.createdAt,
+      updatedAt: row.createdAt,
+      eventCount: 0,
+      projectId: null,
+      selectedModel: null,
+      usage: {}
+    });
+    return ok(row);
+  });
+  const mounted = await mountChat({}, [], {
+    sendInput,
+    getChatModels: async () => ok({ state: 'ready', requestedAt: 1, observedAt: Date.now(), models: [{ id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', efforts: ['high'] }] }),
+    listInputs: async () => ok([...rows]),
+    runningTools: async () => ok([]),
+    livePreview: async () => ok(null),
+    listPausedHelpers: async () => ok([]),
+    listSessions: async () => ok({ sessions: [...summaries], activeId: null, pressure: [] }),
+    getSession: async (id: string) => ok({ summary: summaries.find(row => row.id === id), events: [], nextCursor: null })
+  });
+  const w = mounted.window, doc = w.document, field = doc.getElementById('chatInput') as HTMLTextAreaElement;
+  (doc.getElementById('newChat') as HTMLButtonElement).click();
+  await settle();
+  field.value = 'Review this source code change for correctness.';
+  doc.getElementById('composer')!.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
+  await vi.waitFor(() => expect(sendInput).toHaveBeenCalledTimes(1));
+  await vi.waitFor(() => expect(doc.querySelector('.toast')?.textContent).toContain('Auto-selected Skill: /code-review'));
+});
+
 it('does not steal a newer New Chat draft when an older admission response arrives', async () => {
   let release!: (value: any) => void;
   const rows: any[] = [], summaries: any[] = [];
@@ -2150,4 +2611,87 @@ it('does not steal a newer New Chat draft when an older admission response arriv
   expect(field.value).toBe('Keep this newer draft');
   expect(doc.querySelector('.sess.is-sel')).toBeNull();
   expect(doc.getElementById('chatTitle')!.textContent).toBe('New chat');
+});
+
+it('shows each startup log line once and in order when lines arrive while the log is loading', async () => {
+  // Seen on Windows: the Activity page listed "session catalog ready" and "renderer state ready"
+  // both before "app started" and again after it. Those lines arrived live while the page was
+  // still loading the log, and the loaded log contained them too.
+  let live: (entry: any) => void = () => undefined;
+  let release!: (reply: any) => void;
+  const line = (time: number, message: string) => ({ time, level: 'info', message });
+  const mounted = await mountChat({}, [], {
+    getLog: () => new Promise(resolve => { release = resolve; }),
+    onLogEntry: (fn: any) => { live = fn; return () => undefined; }
+  });
+  await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+  live(line(2, 'session catalog ready'));
+  live(line(3, 'renderer state ready'));
+  release({ ok: true, data: [line(1, 'app started'), line(2, 'session catalog ready'), line(3, 'renderer state ready')] });
+  await settle(); await settle();
+  live(line(4, 'window loaded'));
+  // A row shows the line's source and text in separate cells; compare without the spacing.
+  const rows = () => [...mounted.window.document.querySelectorAll('#fullFeed > *')].map(row => (row.textContent ?? '').replace(/\s/g, ''));
+  await vi.waitFor(() => expect(rows()).toHaveLength(4));
+  expect(rows().map(text => ['app started', 'session catalog ready', 'renderer state ready', 'window loaded'].find(m => text.includes(m.replace(/\s/g, '')))))
+    .toEqual(['app started', 'session catalog ready', 'renderer state ready', 'window loaded']);
+});
+
+it.each(['.project-color', '.project-new'])('keeps keyboard focus on a project row button (%s) across an activity repaint', async selector => {
+  // Seen live on Windows: after picking a project color, focus went back to the color button and
+  // the next sidebar repaint dropped it to the page. Only the project heading kept its focus.
+  const { project, session } = projectSidebarFixture();
+  const mounted = await mountChat({}, [], {
+    listProjects: async () => ({ ok: true, data: [project] }),
+    listSessions: async () => ({ ok: true, data: { sessions: [session], activeId: null, pressure: [], blocked: [] } })
+  });
+  const doc = mounted.window.document;
+  const control = () => doc.querySelector<HTMLElement>(`[data-project-id="${project.id}"] ${selector}`)!;
+  await vi.waitFor(() => expect(control()).not.toBeNull());
+  await settle();
+  const before = control();
+  before.focus();
+  expect(doc.activeElement).toBe(before);
+  mounted.push(structuredClone(mounted.state));
+  await settle();
+  expect(control()).not.toBe(before); // the repaint really replaced the row
+  expect(doc.activeElement).toBe(control());
+});
+
+it('saves this computer\'s connector name, and keeps the saved one while the typed one is invalid', async () => {
+  const mounted = await mountChat();
+  const w = mounted.window, doc = w.document;
+  const field = doc.getElementById('connectorSuffix') as HTMLInputElement;
+  const error = doc.getElementById('connectorSuffixError')!;
+  const details = doc.getElementById('connectorSuffixField') as HTMLDetailsElement;
+  expect(field.value).toBe('');
+  expect(details.open).toBe(false);
+  expect(error.hidden).toBe(true);
+
+  field.value = '  Windows   VM ';
+  field.dispatchEvent(new w.Event('change', { bubbles: true }));
+  await vi.waitFor(() => expect(mounted.calls.at(-1)?.connectorSuffix).toBe('Windows VM'));
+
+  // An invalid name says why at once, and a save it rides in keeps the saved name.
+  field.value = 'Win/VM';
+  field.dispatchEvent(new w.Event('input', { bubbles: true }));
+  expect(error.hidden).toBe(false);
+  expect(field.getAttribute('aria-invalid')).toBe('true');
+  const saves = mounted.calls.length;
+  field.dispatchEvent(new w.Event('change', { bubbles: true }));
+  await vi.waitFor(() => expect(mounted.calls.length).toBe(saves + 1));
+  expect(mounted.calls.at(-1)?.connectorSuffix).toBe('Windows VM');
+  field.value = 'Mac';
+  field.dispatchEvent(new w.Event('input', { bubbles: true }));
+  expect(error.hidden).toBe(true);
+  expect(field.getAttribute('aria-invalid')).toBe('false');
+});
+
+it('shows a computer name set elsewhere and opens its section, so the suffixed card names are explained', async () => {
+  const mounted = await mountChat();
+  const doc = mounted.window.document;
+  mounted.push({ ...mounted.state, config: { ...mounted.state.config, connectorSuffix: 'Windows' } });
+  await settle();
+  expect((doc.getElementById('connectorSuffix') as HTMLInputElement).value).toBe('Windows');
+  expect((doc.getElementById('connectorSuffixField') as HTMLDetailsElement).open).toBe(true);
 });

@@ -1,3 +1,4 @@
+import { checkRemoteProjectAccess } from './remote-workspace.js';
 /**
  * A self-test that answers "where exactly is this broken", one hop at a time.
  *
@@ -303,15 +304,21 @@ export async function runDiagnostics(): Promise<Diagnosis> {
   const enabled = Object.entries(caps)
     .filter(([, on]) => on)
     .map(([name]) => name);
+  const remote = config.roots.length === 0 && enabled.length > 0
+    ? await checkRemoteProjectAccess().catch(() => ({ configured: 0, verified: 0, detail: 'Remote project settings could not be read.' }))
+    : { configured: 0, verified: 0, detail: '' };
+  const accessible = config.roots.length > 0 || surfaceIsUseful('desktop', caps) || remote.verified > 0;
   checks.push({
     name: 'Permissions',
     status:
-      enabled.length > 0 && (config.roots.length > 0 || surfaceIsUseful('desktop', caps)) ? 'pass' : 'fail',
-    ok: enabled.length > 0 && (config.roots.length > 0 || surfaceIsUseful('desktop', caps)),
+      enabled.length > 0 && accessible ? 'pass' : 'fail',
+    ok: enabled.length > 0 && accessible,
     detail:
       enabled.length === 0
         ? 'Nothing is switched on, so the connector would expose no tools.'
-        : `${config.roots.length} folder${config.roots.length === 1 ? '' : 's'} shared; on: ${enabled.join(', ')}${config.readOnly ? ' (read-only)' : ''}`
+        : remote.configured > 0
+          ? `${config.roots.length} local folders; ${remote.configured} remote projects, ${remote.verified > 0 ? 'remote access verified' : 'remote access unavailable: ' + remote.detail}; on: ${enabled.join(', ')}`
+          : `${config.roots.length} folder${config.roots.length === 1 ? '' : 's'} shared; on: ${enabled.join(', ')}${config.readOnly ? ' (read-only)' : ''}`
   });
 
   // Ask the in-process backend that performs protected operations. A settings row or the

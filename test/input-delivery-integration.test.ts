@@ -29,7 +29,7 @@ vi.mock('../src/main/connection.js', async (importOriginal) => {
   return { ...actual, connect: async () => {}, getStatus: () => ({ ...actual.getStatus(), state: 'connected' }) };
 });
 vi.mock('../src/main/browser.js', () => ({ openInPreferredBrowser: async () => 'chrome.exe', isPreferredBrowserRunning: async () => null }));
-const { defaultConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
+const { defaultConfig, getConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
 const { initSecretsPath } = await import('../src/main/secrets.js');
 const { initDurableStore, flushDurable, resetDurableForTests, writeDurableNow } = await import('../src/main/durable.js');
 const { createSession, getSession, rebindSession, initSessionStore, resetSessionStoreForTests } = await import('../src/main/session/store.js');
@@ -394,10 +394,21 @@ it('shows the approval reminder only after an authorized discovery handoff succe
     await vi.waitFor(() => expect(catalog.getChatModels().state).toBe('unavailable'));
     expect(notices()).toHaveLength(0);
 
+    // A fresh install has no Core tunnel yet, so ChatGPT cannot call a tool and has nothing to approve.
+    const config = getConfig();
+    await saveConfig({ ...config, tunnel: { ...config.tunnel, tunnelId: '' } });
+    catalog.resetChatModelsForTests();
+    await catalog.startChatModelDiscovery(true);
+    await vi.waitFor(() => expect(wake).toHaveBeenCalledTimes(2));
+    await new Promise(resolve => setImmediate(resolve));
+    expect(notices()).toHaveLength(0);
+
+    await saveConfig({ ...config, tunnel: { ...config.tunnel, tunnelId: 'tunnel_test_core' } });
     catalog.resetChatModelsForTests();
     await catalog.startChatModelDiscovery(true);
     await vi.waitFor(() => expect(notices()).toHaveLength(1));
     expect(wake).toHaveBeenLastCalledWith(expect.stringContaining('https://chatgpt.com/?cos-model-catalog='), true, true);
+    await saveConfig(config);
   } finally { wake.mockRestore(); catalog.resetChatModelsForTests(); }
 });
 
@@ -2906,4 +2917,18 @@ it('retires an opening send whose receipt never arrives after six hours, and not
     });
     expect((await input.pendingBrowserInputs()).map(row => row.id)).not.toContain(request.id);
   } finally { clock.mockRestore(); }
+});
+
+describe('this install\'s connector names', () => {
+  it('reach the extension with every status reply, and follow a changed suffix at once', async () => {
+    await saveConfig(defaultConfig());
+    expect((await post('/status', { openConversations: [] })).body.connectorNames).toEqual({
+      core: 'Chat On Steroids Core', desktop: 'Chat On Steroids Desktop', plugins: 'Chat On Steroids Plugins'
+    });
+    await saveConfig({ ...defaultConfig(), connectorSuffix: 'Windows' });
+    expect((await post('/status', { openConversations: [] })).body.connectorNames).toEqual({
+      core: 'Chat On Steroids Core (Windows)', desktop: 'Chat On Steroids Desktop (Windows)', plugins: 'Chat On Steroids Plugins (Windows)'
+    });
+    await saveConfig(defaultConfig());
+  });
 });

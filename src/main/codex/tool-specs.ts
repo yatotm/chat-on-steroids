@@ -92,7 +92,7 @@ export const EXEC_COMMAND_LOGIN_DESCRIPTION =
 export const WRITE_STDIN_DESCRIPTION =
   'Polls or writes to the returned session ID. Empty chars reread retained output after completion, including automatic delivery; never reruns work. Completed processes reject input. Retains the latest 64 results in this app, 256 KiB each.';
 
-export const WRITE_STDIN_SESSION_ID_DESCRIPTION = 'Returned running or completed session ID.';
+export const WRITE_STDIN_SESSION_ID_DESCRIPTION = 'Returned running or completed session ID. Pass it unchanged: a number for local execution, or an opaque cos: handle for a remote project.';
 
 export const WRITE_STDIN_CHARS_DESCRIPTION =
   'Bytes to write to stdin. Defaults to empty, which polls without writing.';

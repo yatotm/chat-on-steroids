@@ -1,152 +1,219 @@
-import { createHash } from 'node:crypto';
-import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import type { CallToolResult } from '@modelcontextprotocol/client';
-import type { LocalProject, RemoteProjectBinding } from '../shared/projects.js';
-import { getConfig } from './config.js';
-import { pluginManager } from './plugins/manager.js';
-import { readDurable, writeDurableNow } from './durable.js';
+import { isManagedRemote, type LocalProject } from '../shared/projects.js';
+import { remoteEndpoint, getRemoteHost, type RemoteEndpoint } from './remote-hosts.js';
+import { insideRemoteRoot } from '../shared/remote-hosts.js';
+import { EXECUTION_PROTOCOL, executionMetadataSchema, executionResultSchema, executionWorkspaceSchema,
+  isCoreRemote, parseRemoteProcessHandle, processCompletionSchema, remoteBindingSchema, remoteDirectorySchema,
+  type CoreExecutionTool, type CoreRemoteBinding, type ExecutionScope, type ExecutionWorkspace } from '../shared/remote-execution.js';
+import { effectiveCapabilities, getConfig } from './config.js';
+import { getSecret } from './secrets.js';
+import { ExecutionTransportError, executionRpc } from './execution-client.js';
+import { getProject, listProjects, sessionProjectBinding, remoteBindingFence } from './projects.js';
+import { currentCall, noteOutcome, type CallContext } from './mcp/call-context.js';
+import { fail } from './mcp/execution-common.js';
+import type { ToolResult } from './mcp/kernel.js';
+import type { OutputPublication } from './codex/unified-exec.js';
 
-const workspaceIdSchema = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
-export const remoteBindingSchema = z.object({
-  pluginId: z.string().uuid(), workspaceId: workspaceIdSchema, endpointId: z.string().regex(/^[a-f0-9]{64}$/)
-}).strict();
-const remotePathSchema = z.string().min(2).max(4096).refine(value =>
-  value.startsWith('/') && !value.includes('\\') && !/[\x00-\x1f\x7f]/.test(value) &&
-  !value.split('/').includes('..') && path.posix.normalize(value) === value,
-  'Enter an absolute Linux project path, without .. or a trailing slash.');
-const endpointId = (url: string) => createHash('sha256').update(url).digest('hex');
-
-function remoteServer(pluginId: string, identity?: string) {
-  const row = pluginManager.snapshot().plugins.find(plugin => plugin.id === pluginId);
-  if (!row?.enabled || row.source.kind !== 'remote' || !row.source.url)
-    throw new Error('Enable the remote CodexPro connection in Plugins.');
-  if (identity && endpointId(row.source.url) !== identity)
-    throw new Error('The remote server address changed. Add the remote project again.');
-  if (pluginManager.toolOwner('open_workspace') !== pluginId)
-    throw new Error('The remote CodexPro workspace tool is unavailable. Check Plugins for disabled or conflicting tools.');
-  return { pluginId, sourceUrl: row.source.url };
-}
-
-function errorText(result: CallToolResult): string {
-  return result.content.filter(block => block.type === 'text').map(block => block.text).join('\n').slice(0, 1000);
-}
+export { remoteBindingSchema };
+const clientId = randomUUID();
+interface Prepared { project: LocalProject; binding: CoreRemoteBinding; url: string; serverId: string; roots: string[]; token: string; workspace: ExecutionWorkspace; endpoint?: RemoteEndpoint }
+interface Offered { projectId: string; sessionId: string; serverId: string; epoch: string; publication: OutputPublication; failed?: boolean }
+const preparedCalls = new WeakMap<OutputPublication, Map<string, Promise<Prepared>>>();
+const offered = new Map<string, Offered>();
 
 export function validateRemoteProject(project: LocalProject): void {
   if (!project.remote) throw new Error('Choose a remote project.');
-  remotePathSchema.parse(project.path);
-  remoteServer(project.remote.pluginId, project.remote.endpointId);
+  remoteDirectorySchema.parse(project.path);
+  remoteBindingSchema.parse(project.remote);
+  if (!isCoreRemote(project.remote)) throw new Error('Reconnect this legacy remote project to the CoS execution service. CodexPro is no longer used for remote projects.');
 }
 
-export async function probeRemoteWorkspace(pluginId: string, root: string): Promise<{ path: string; remote: RemoteProjectBinding }> {
-  z.string().uuid().parse(pluginId);
-  remotePathSchema.parse(root);
-  if (getConfig().readOnly) throw new Error('Turn off Read-only before connecting a remote project.');
-  const expected = remoteServer(pluginId);
-  const result = await pluginManager.call('open_workspace', { root, include_tree: false, include_skills: false }, undefined, expected);
-  if (result.isError) throw new Error(errorText(result) || 'Could not open the remote workspace.');
-  const parsed = z.object({ root: remotePathSchema, workspace_id: workspaceIdSchema }).parse(result.structuredContent);
-  remoteServer(pluginId, endpointId(expected.sourceUrl));
-  return { path: parsed.root, remote: { pluginId, workspaceId: parsed.workspace_id, endpointId: endpointId(expected.sourceUrl) } };
+function remoteFailure(result: Record<string, unknown>): void {
+  if (result.isError !== true) return;
+  const content = Array.isArray(result.content) ? result.content : [];
+  const message = content.filter((part): part is { type: string; text: string } =>
+    !!part && typeof part === 'object' && (part as { type?: unknown }).type === 'text' &&
+    typeof (part as { text?: unknown }).text === 'string').map(part => part.text).join('\n').slice(0, 1600);
+  throw new Error(message || 'The CoS execution service rejected this request.');
 }
 
-const PROCESS_ID = /^proc_[a-f0-9]{16}$/;
-const processOwnerSchema = z.object({
-  pluginId: z.string().uuid(), endpointId: z.string().regex(/^[a-f0-9]{64}$/), sessionId: z.string().min(1).max(128),
-  processId: z.string().regex(PROCESS_ID), createdAt: z.number().finite().nonnegative()
-});
-const processOwnersSchema = z.array(processOwnerSchema).max(4096);
-const PROCESS_OWNERS = 'remote-process-owners';
-let processWrites: Promise<unknown> = Promise.resolve();
-async function processOwners() {
-  return processOwnersSchema.parse(await readDurable<unknown>(PROCESS_OWNERS) ?? []);
-}
-function rememberProcess(project: LocalProject, sessionId: string, processId: string): Promise<void> {
-  const work = processWrites.then(async () => {
-    const rows = await processOwners(), remote = project.remote!;
-    const previous = rows.find(row => row.pluginId === remote.pluginId && row.endpointId === remote.endpointId && row.processId === processId);
-    if (previous) {
-      if (previous.sessionId !== sessionId) throw new Error('The remote process already belongs to another conversation.');
-      return;
-    }
-    if (rows.length >= 4096) throw new Error('The remote process ownership limit was reached.');
-    await writeDurableNow(PROCESS_OWNERS, [...rows, { pluginId: remote.pluginId, endpointId: remote.endpointId, sessionId, processId, createdAt: Date.now() }]);
-  });
-  processWrites = work.catch(() => undefined);
-  return work;
+export async function probeRemoteWorkspace(url: string, token: string, directory: string, serverId?: string): Promise<ExecutionWorkspace> {
+  const response = await executionRpc(url, token, 'cos_workspace', { directory, ...(serverId ? { serverId } : {}) });
+  remoteFailure(response);
+  const workspace = executionWorkspaceSchema.parse(response.structuredContent);
+  if (serverId && workspace.serverId !== serverId) throw new Error('The execution service identity changed. Reconnect the intended service.');
+  return workspace;
 }
 
-/** 工作区及进程归属在发出调用前确定；断线不能授权自动重试。 */
-export async function callRemoteProjectTool(project: LocalProject, sessionId: string, name: string, args: Record<string, unknown>,
-  onOutcome?: (outcome: 'tool_rejected' | 'tool_execution_error') => void): Promise<CallToolResult> {
+async function unchanged(project: LocalProject, sessionId?: string): Promise<void> {
+  const now = sessionId ? await sessionProjectBinding(sessionId) : await getProject(project.id);
+  if (!now || now.id !== project.id || now.path !== project.path || JSON.stringify(now.remote) !== JSON.stringify(project.remote))
+    throw new Error('The remote project binding changed. No operation was dispatched.');
+}
+
+async function prepare(project: LocalProject, context?: CallContext): Promise<Prepared> {
   validateRemoteProject(project);
-  const remote = project.remote!, expected = remoteServer(remote.pluginId, remote.endpointId);
-  const beforeDispatch = () => {
-    if (getConfig().readOnly) throw new Error('TOOL_DISABLED: Remote tools are unavailable while CoS Read-only mode is on.');
-    validateRemoteProject(project);
+  const binding = project.remote as CoreRemoteBinding;
+  const perform = async (): Promise<Prepared> => {
+    const endpoint = isManagedRemote(binding) ? await remoteEndpoint(binding.hostId) : undefined;
+    const token = endpoint?.token ?? (!isManagedRemote(binding) ? await getSecret(`execution:${binding.credentialId}`) : null);
+    if (!token) throw new Error('Reconnect this remote project to store its execution service token.');
+    const url = endpoint?.url ?? (!isManagedRemote(binding) ? binding.url : '');
+    const serverId = endpoint?.host.serverId ?? (!isManagedRemote(binding) ? binding.serverId : '');
+    const roots = endpoint?.host.roots ?? [project.path];
+    if (!insideRemoteRoot(roots, project.path)) throw new Error('This project is no longer inside the approved directories for this development server.');
+    await unchanged(project, context?.caller.sessionId ?? undefined);
+    endpoint?.assertCurrent();
+    const workspace = await probeRemoteWorkspace(url, token, project.path, serverId);
+    if (workspace.root !== project.path) throw new Error('The remote directory changed. Reconnect the project.');
+    await unchanged(project, context?.caller.sessionId ?? undefined);
+    endpoint?.assertCurrent();
+    return { project, binding, token, url, serverId, roots, workspace, endpoint };
   };
-  beforeDispatch();
-  if (pluginManager.toolOwner(name) !== remote.pluginId)
-    throw new Error('REMOTE_PROJECT_TOOL_MISMATCH: Use the CodexPro tools from this project’s remote connection.');
-  if (name === 'codexpro' || name === 'open_current_workspace')
-    throw new Error(`REMOTE_WORKSPACE_REQUIRED: Use explicit CodexPro tools with workspace_id=${remote.workspaceId}; open_workspace must use root=${project.path}.`);
-  const bound = { ...args };
-  if (name === 'open_workspace') {
-    if ((args.root !== undefined && args.root !== project.path) || (args.path !== undefined && args.path !== project.path))
-      throw new Error('REMOTE_WORKSPACE_MISMATCH: This conversation is bound to a different remote directory.');
-    bound.root = project.path;
-    delete bound.path;
-  } else {
-    const schema = pluginManager.tools().find(tool => tool.name === name)?.inputSchema;
-    if (schema?.properties && 'workspace_id' in schema.properties) {
-      if (args.workspace_id !== undefined && args.workspace_id !== remote.workspaceId)
-        throw new Error('REMOTE_WORKSPACE_MISMATCH: Use this conversation’s remote workspace.');
-      bound.workspace_id = remote.workspaceId;
-    } else if (!['read_output', 'write_stdin', 'kill_command', 'server_config', 'list_workspaces'].includes(name)) {
-      throw new Error('REMOTE_SCHEMA_UNSUPPORTED: This tool does not expose an explicit workspace_id. No remote operation was dispatched.');
-    }
-  }
-  if (['read_output', 'write_stdin', 'kill_command'].includes(name)) {
-    const owned = (await processOwners()).some(row => row.pluginId === remote.pluginId && row.endpointId === remote.endpointId &&
-      row.sessionId === sessionId && row.processId === args.process_id);
-    if (!owned) throw new Error('REMOTE_PROCESS_NOT_OWNED: This remote process does not belong to this conversation. Do not rerun its command to repair ownership.');
-  }
-  validateRemoteProject(project);
-  if (name === 'exec_command' && (await processOwners()).length >= 4096)
-    throw new Error('The remote process ownership limit was reached. No command was started.');
-  const result = await pluginManager.call(name, bound, onOutcome, { ...expected, beforeDispatch });
-  const reported = result.structuredContent as Record<string, unknown> | undefined;
-  if (!result.isError && reported?.workspace_id !== undefined && reported.workspace_id !== remote.workspaceId) {
-    onOutcome?.('tool_execution_error');
-    return { ...result, isError: true, content: [...result.content, { type: 'text', text:
-      'REMOTE_WORKSPACE_MISMATCH: The server reported a different workspace. Inspect the returned result before any further action; do not repeat this operation.' }] };
-  }
-  if (!result.isError && name === 'exec_command') {
-    const processId = reported?.process_id;
-    if (typeof processId === 'string' && PROCESS_ID.test(processId)) {
-      try { await rememberProcess(project, sessionId, processId); }
-      catch {
-        onOutcome?.('tool_execution_error');
-        return { ...result, isError: true, content: [...result.content, { type: 'text', text:
-          'The remote command started, but its ownership could not be saved. Do not start it again. Check the returned process id on the development server.' }] };
-      }
-    } else {
-      onOutcome?.('tool_execution_error');
-      return { ...result, isError: true, content: [...result.content, { type: 'text', text:
-        'The remote command may have started, but the server returned no valid process_id. Inspect the development server; do not repeat this command.' }] };
-    }
-  }
-  return result;
+  // 一个外层调用（包括 code-mode 子调用）共享只读握手，执行授权仍逐次检查。
+  if (!context?.publication) return perform();
+  let rows = preparedCalls.get(context.publication);
+  if (!rows) { rows = new Map(); preparedCalls.set(context.publication, rows); }
+  const key = `${project.id}:${isManagedRemote(binding) ? binding.hostId : binding.credentialId}`;
+  let pending = rows.get(key);
+  if (!pending) { pending = perform(); rows.set(key, pending); }
+  return pending;
 }
 
-export function remoteProjectInstructions(project: LocalProject): string {
+function scopeFor(prepared: Prepared, sessionId: string): ExecutionScope {
+  const config = getConfig();
+  return { protocol: EXECUTION_PROTOCOL, serverId: prepared.serverId, epoch: prepared.workspace.epoch,
+    clientId, projectId: prepared.project.id, sessionId, directory: prepared.project.path, roots: prepared.roots,
+    policy: { caps: effectiveCapabilities(config), readOnly: config.readOnly, commandPolicy: config.commandAllowlist } };
+}
+
+function requireExecutionPermission(name: CoreExecutionTool | 'cos_save_image', scope: ExecutionScope): void {
+  const caps = scope.policy.caps;
+  const allowed = name === 'read' ? caps.read || caps.browse || caps.metadata
+    : name === 'view_image' ? caps.read : name === 'find' ? caps.search
+    : name === 'cos_save_image' ? caps.create
+    : name === 'apply_patch' ? caps.create || caps.edit || caps.move || caps.deleteFile : caps.command;
+  if (!allowed) throw new Error(`TOOL_DISABLED: ${name} is disabled by the current CoS permissions. No remote operation was dispatched.`);
+}
+
+export async function callRemoteCore(project: LocalProject, sessionId: string, name: CoreExecutionTool | 'cos_save_image', args: unknown,
+  beforeDispatch: () => Promise<void>): Promise<ToolResult> {
+  let dispatched = false;
+  try {
+    const bindingUnchanged = remoteBindingFence(project.id);
+    const context = currentCall();
+    const prepared = await prepare(project, context ?? undefined);
+    if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('Core tool arguments must be an object.');
+    if (name === 'write_stdin') {
+      const handle = parseRemoteProcessHandle((args as Record<string, unknown>).session_id);
+      if (!handle || handle.serverId !== prepared.serverId || handle.epoch !== prepared.workspace.epoch)
+        throw new Error('REMOTE_PROCESS_EXPIRED: Use the original process handle from this execution service. It cannot survive a service restart; do not repeat its command.');
+    }
+    await unchanged(project, sessionId);
+    await beforeDispatch();
+    bindingUnchanged();
+    prepared.endpoint?.assertCurrent();
+    const scope = scopeFor(prepared, sessionId);
+    requireExecutionPermission(name, scope);
+    dispatched = true;
+    const response = await executionRpc(prepared.url, prepared.token, name, args as Record<string, unknown>, scope);
+    const { _meta, ...payload } = response;
+    const result = executionResultSchema.parse(payload);
+    if (_meta && typeof _meta === 'object' && !Array.isArray(_meta)) {
+      const metadata = executionMetadataSchema.parse((_meta as Record<string, unknown>).cosExecution);
+      if (metadata.serverId !== scope.serverId || metadata.epoch !== scope.epoch)
+        throw new Error('The execution response belongs to a different service lifetime. Check existing work; do not repeat the operation.');
+      noteOutcome(metadata.outcome);
+      if (context) {
+        Object.assign(context.evidence, metadata.evidence);
+        if (metadata.hasCompletion && metadata.evidence.processSessionId) {
+          const promise = executionRpc(prepared.url, prepared.token, 'cos_completion',
+            { session_id: metadata.evidence.processSessionId }, scope, { completion: true }).then(completed => {
+            remoteFailure(completed);
+            return processCompletionSchema.parse(completed.structuredContent);
+          });
+          // recorder 接管这条真实结束事件；这里的接收不消耗远程输出。
+          void promise.catch(() => undefined);
+          context.evidence.processCompletion = promise;
+        }
+      }
+    } else if (!result.isError) throw new Error('The execution service omitted result ownership. Check existing work; do not repeat the operation.');
+    return result;
+  } catch (error) {
+    noteOutcome(dispatched ? 'tool_execution_error' : 'tool_rejected');
+    return fail(error instanceof Error ? error.message : 'Remote execution failed. The call was not retried.');
+  }
+}
+
+export async function remoteBackground(context: CallContext, phase: 'ack' | 'offer', budget = 12000,
+  except?: unknown, beforeDispatch?: () => Promise<void>): Promise<string | null> {
+  const sessionId = context.caller.sessionId;
+  if (!sessionId || !context.publication) return null;
+  const project = await sessionProjectBinding(sessionId);
+  if (!project?.remote || !isCoreRemote(project.remote)) return null;
+  const bindingUnchanged = remoteBindingFence(project.id);
+  const prepared = await prepare(project, context);
+  const acknowledged: string[] = [], failed: string[] = [];
+  for (const [id, row] of offered) {
+    if (row.projectId !== project.id || row.sessionId !== sessionId) continue;
+    if (row.serverId !== prepared.serverId || row.epoch !== prepared.workspace.epoch) { offered.delete(id); continue; }
+    if (row.failed || row.publication.failed) failed.push(id);
+    else if (row.publication.completedAt !== null && row.publication.completedAt <= context.startedAt) acknowledged.push(id);
+  }
+  await unchanged(project, sessionId);
+  await beforeDispatch?.();
+  bindingUnchanged();
+  prepared.endpoint?.assertCurrent();
+  const offerId = phase === 'offer' && offered.size < 512 ? randomUUID() : undefined;
+  const receipt: Offered = { projectId: project.id, sessionId, serverId: prepared.serverId,
+    epoch: prepared.workspace.epoch, publication: context.publication };
+  // 发送之前持有 receipt ID，offer 的返回丢失也能明确撤销它并重新交付原输出。
+  if (offerId) offered.set(offerId, receipt);
+  try {
+    const response = await executionRpc(prepared.url, prepared.token, 'cos_background', {
+      phase: phase === 'offer' && !offerId ? 'ack' : phase, acknowledged, failed, maxBytes: budget,
+      ...(offerId ? { offerId } : {}),
+      ...(typeof except === 'string' && parseRemoteProcessHandle(except)?.epoch === prepared.workspace.epoch ? { except } : {})
+    }, scopeFor(prepared, sessionId));
+    remoteFailure(response);
+    for (const id of [...acknowledged, ...failed]) offered.delete(id);
+    const result = z.object({ text: z.string().max(16000).nullable(), receiptId: z.string().uuid().nullable() }).strict().parse(response.structuredContent);
+    if (result.receiptId !== null && result.receiptId !== offerId) throw new Error('The remote output receipt did not match its request.');
+    if (!result.receiptId && offerId) offered.delete(offerId);
+    return result.text;
+  } catch (error) { receipt.failed = true; throw error; }
+}
+
+export async function remoteProjectInstructions(project: LocalProject): Promise<string> {
   validateRemoteProject(project);
-  return `This project runs on a remote Linux development server, not on the computer running the CoS app.\n` +
-    `Remote directory: ${project.path}\nCodexPro workspace_id: ${project.remote!.workspaceId}\n` +
-    `Use the explicit CodexPro tools on Chat On Steroids Plugins for files, searches, patches and commands. Always use this workspace_id. ` +
-    `Start with open_workspace(root=${JSON.stringify(project.path)}, include_tree=false) and read the remote project's AGENTS.md before editing. ` +
-    `Do not use Core read, find, view_image, apply_patch, exec_command or write_stdin for this project: they operate on the app computer and are refused. ` +
-    `Do not use open_current_workspace or the codexpro wrapper. Core agents, update_plan and session_finish still manage this conversation. ` +
-    `Use remote exec_command process_id with Plugins read_output/write_stdin/kill_command; Core terminal ids are different. ` +
-    `If the remote connection fails, report it and inspect earlier results before retrying; never fall back to local execution.`;
+  const roots = project.remote && isManagedRemote(project.remote) ? (await getRemoteHost(project.remote.hostId)).roots : [project.path];
+  const permissions = roots.map(root => '- ' + root).join('\n');
+  return `Approved remote directories:\n${permissions.slice(0, 10000)}${permissions.length > 10000 ? '\n[Directory list shortened.]' : ''}\n` +
+    `The primary directory is the default working directory, not the entire permission boundary.\n` +
+    `This project executes on its connected CoS development server. Remote directory: ${project.path}\n` +
+    `Use the normal Chat On Steroids Core read, view_image, find, apply_patch, exec_command and write_stdin tools. ` +
+    `CoS routes project file and command operations to that server; use /project or its native directory as the working root. File paths and shell commands follow the server's POSIX environment. ` +
+    `Read /project/AGENTS.md before editing. Remote process handles are opaque strings; pass each returned session_id unchanged to write_stdin. ` +
+    `Explicit /skills and /user-skills paths are desktop-owned read-only resources in this remote context; read them separately from remote files and copy any needed scripts into an approved remote directory before running them. ` +
+    `Core agents, update_plan and session_finish remain available. No CodexPro or Plugins connection is required. ` +
+    `If the server connection fails, inspect existing results and report uncertainty; never repeat a possibly executed mutation automatically.`;
+}
+
+/** 健康检查验证真实远端目录；保存的项目记录本身不是可用性证明。 */
+export async function checkRemoteProjectAccess(): Promise<{ configured: number; verified: number; detail: string }> {
+  const projects = (await listProjects()).filter(project => !!project.remote);
+  const unavailable = new Set<string>();
+  let detail = '';
+  for (const project of projects) {
+    const binding = project.remote!;
+    const identity = isManagedRemote(binding) ? binding.hostId : isCoreRemote(binding) ? binding.url : binding.pluginId;
+    if (unavailable.has(identity)) continue;
+    try { await prepare(project); return { configured: projects.length, verified: 1, detail: '' }; }
+    catch (error) {
+      if (error instanceof ExecutionTransportError) unavailable.add(identity);
+      detail ||= error instanceof Error ? error.message : 'Remote verification failed.';
+    }
+  }
+  return { configured: projects.length, verified: 0, detail };
 }

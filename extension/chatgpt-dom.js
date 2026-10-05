@@ -1805,6 +1805,39 @@ var CLF_DOM = (() => {
     }, false);
   }
 
+  /**
+   * The closing sentence every worker wake ends with (src/main/agents.ts planRevivalText), compared
+   * without whitespace: ProseMirror's textContent drops the paragraph break before it.
+   */
+  const REVIVAL_RESIDUE = new RegExp('\\(ChatOnSteroids:youarestill[A-Za-z0-9_-]{1,40}inthesamerun,' +
+    'andthisistheprimeagenttalkingtoyouagaininthechatyoualreadyknow\\.' +
+    'Pickupfromwhatyoudidherebeforeratherthanstartingover\\.' +
+    'Reportwithagentsaction=messageto="prime"asyougoandaction=finishwhenthispieceisdone\\.\\)$');
+
+  /**
+   * Empties an editor that holds only an earlier worker wake (#882).
+   *
+   * ChatGPT keeps unsent editor text as the chat's draft and restores it when the chat opens
+   * again. A wake whose Send never landed therefore came back in every reopened worker tab, and
+   * each later wake waited for an empty editor until its deadline: "the browser did not claim
+   * this command", then the worker failed. Only text that ends with the app's own wake sentence
+   * is reclaimed; anything a person added after it, an attachment, or a busy page keeps it.
+   */
+  function clearRevivalResidue() {
+    return safe(() => {
+      const box = composer();
+      if (!composerWritable() || generating() || stopButton() || hasComposerAttachments()) return false;
+      const text = String(box.textContent || '').replace(/\\(?=[!-/:-@[-`{-~])/g, '').replace(/\s+/g, '');
+      if (!text || !REVIVAL_RESIDUE.test(text)) return false;
+      box.focus();
+      const selection = document.getSelection();
+      if (!selection || document.activeElement !== box) return false;
+      selection.selectAllChildren(box);
+      document.execCommand('delete', false);
+      return (box.textContent || '').trim() === '';
+    }, false);
+  }
+
   /** A visible editor can still be read-only while the provider mounts or changes models. */
   function composerWritable() {
     const box = composer();
@@ -2594,9 +2627,33 @@ var CLF_DOM = (() => {
     const host = composerBox() || composerActions()?.host;
     return host ? [...host.querySelectorAll('button[aria-label]')].map(composerFileName).filter(Boolean).slice(0, 20).sort() : [];
   }
+  /**
+   * This install's connector names in ChatGPT (core, desktop, plugins), as the app reports them.
+   *
+   * A computer that shares its ChatGPT account with another names its connectors with a suffix,
+   * "Chat On Steroids Core (Windows)", and recognizes exactly its own names; the other computer's
+   * calls run there. Null until the app has said, which keeps the plain names. Every ask to the
+   * page-world helper carries them, so it never judges traffic by names it was not told.
+   */
+  const PLAIN_CONNECTORS = ['Chat On Steroids Core', 'Chat On Steroids Desktop', 'Chat On Steroids Plugins'];
+  const SUFFIXED_CONNECTOR = /^Chat On Steroids (Core|Desktop|Plugins) \([\p{L}\p{N} ._-]{1,32}\)$/u;
+  let ownConnectors = null;
+  function setConnectorNames(names) {
+    if (!names || typeof names !== 'object') return false;
+    const list = [names.core, names.desktop, names.plugins];
+    const words = ['Core', 'Desktop', 'Plugins'];
+    if (!list.every((name, at) => typeof name === 'string' && (name === PLAIN_CONNECTORS[at] || SUFFIXED_CONNECTOR.exec(name)?.[1] === words[at]))) return false;
+    ownConnectors = list;
+    return true;
+  }
+  /** This install's three names, or the plain ones while the app has not said. */
+  const connectorNames = () => [...(ownConnectors || PLAIN_CONNECTORS)];
+  /** The Plugins connector of any computer: it only selects that connector's larger action limits. */
+  const pluginsConnectorName = (name) => name === PLAIN_CONNECTORS[2] || SUFFIXED_CONNECTOR.exec(typeof name === 'string' ? name : '')?.[1] === 'Plugins';
+
   /** Observed ChatGPT Plugins settings surface. Missing/ambiguous structure is not proof. */
   async function pluginRefreshView(connectorName, expectedTools = [], expectedAppId = null) {
-    const externalPlugins = connectorName === 'Chat On Steroids Plugins';
+    const externalPlugins = pluginsConnectorName(connectorName);
     const snapshot = await new Promise(resolve => {
       const nonce = crypto.randomUUID();
       const finish = value => { clearTimeout(timer); window.removeEventListener('message', receive); resolve(value); };
@@ -2605,7 +2662,7 @@ var CLF_DOM = (() => {
         if (event.source === window && event.origin === location.origin && data?.source === 'clf-plugin-reply' && data.nonce === nonce && data.v === 1) finish(data.plugin);
       };
       const timer = setTimeout(() => finish(null), 1500);
-      window.addEventListener('message', receive); window.postMessage({ source: 'clf-plugin-ask', nonce }, location.origin);
+      window.addEventListener('message', receive); window.postMessage({ source: 'clf-plugin-ask', nonce, apps: connectorNames() }, location.origin);
     });
     const route = /^#settings\/Plugins\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(location.hash) ||
       (!location.hash ? /^\/(?:settings\/plugins-settings|plugins)\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(location.pathname) : null);
@@ -2729,7 +2786,7 @@ var CLF_DOM = (() => {
       };
       const timer = setTimeout(() => finish(null), 1500);
       window.addEventListener('message', receive);
-      window.postMessage({ source: 'clf-picker-ask', nonce }, location.origin);
+      window.postMessage({ source: 'clf-picker-ask', nonce, apps: connectorNames() }, location.origin);
     });
   }
   /** UI only transports a requested selection. Provider state proves identity and availability. */
@@ -3056,17 +3113,20 @@ var CLF_DOM = (() => {
           return;
         }
         if (clicked) return;
-        // The native header arrives before the source chat finishes loading. Its link
+        // The native Project chrome can arrive before the source chat finishes loading. Its link
         // alone is not readiness: an early click can be swallowed during hydration.
         // Preserve the source draft/generation and spend our one click only once its
         // actual editor is mounted and ready.
         const source = composer();
         if (!source?.isConnected || !composerSubmitReady() || hasComposerAttachments()) return;
-        // The header link to this exact Project home is the native entry. Its folder icon lost
-        // its test id in October 2026, and every Project handoff then waited out its deadline;
-        // the link's own same-origin target is the identity, and it must be the only one on this page.
-        const links = [...document.querySelectorAll('header a[href], [role="banner"] a[href]')].filter(link =>
-          !link.closest(OWN_SURFACES) && !onKeptPage(link) && new URL(link.href, location.href).origin === location.origin &&
+        // The exact same-origin Project-home target is the native entry. ChatGPT has moved this
+        // control across several shells: its folder icon lost a test id in early October, then the
+        // link itself moved outside both <header> and [role="banner"]. Do not bind navigation to
+        // either wrapper. Instead reject quoted/transcript links and hidden kept pages, then require
+        // one visible provider link to this exact Project. Ambiguity still fails closed.
+        const links = [...document.querySelectorAll('a[href]')].filter(link =>
+          !link.closest(`${OWN_SURFACES}, ${TURN}`) && composerCssVisible(link) &&
+          new URL(link.href, location.href).origin === location.origin &&
           projectHomeId(new URL(link.href, location.href).pathname) === entry.id);
         if (links.length !== 1) return;
         clicked = true;
@@ -3133,6 +3193,8 @@ var CLF_DOM = (() => {
     hasComposerAttachments,
     composerAttachmentNames,
     pluginRefreshView,
+    setConnectorNames,
+    connectorNames,
     pluginInstalledButtons,
     pluginManagementIdle,
     selectModelSettings,
@@ -3202,6 +3264,7 @@ var CLF_DOM = (() => {
     errors,
     composer,
     composerSubmitReady,
+    clearRevivalResidue,
     composerWritable,
     composerBox,
     pageTheme,

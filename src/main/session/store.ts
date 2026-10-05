@@ -40,10 +40,10 @@ import type {
   StoredText,
   ToolEditReview
 } from '../../shared/session.js';
-import { committedResumeAncestorsFromSummary, continuationMarkerOf, eventTokens, MAX_TOOL_RESULT_TOKENS, normalizedToolOutcome, storedTextTokens, workSequence } from '../../shared/session.js';
+import { continuationMarkerOf, eventTokens, MAX_TOOL_RESULT_TOKENS, normalizedToolOutcome, storedTextTokens, workSequence } from '../../shared/session.js';
 import { applyTurnIdentity, authoredTimeOf, chronological, injectedUserMessage, positionOf, projectTimeline,
   recordedRequestTurn, responseTurnId, type Chronological, type TimelineTurns } from '../../shared/chronology.js';
-import { automaticTitle, firstTitleMessage, legacyContextTitle, legacyLabelPending, projectPageTitle, providerTitleIgnored, refreshUserTitle } from './title.js';
+import { automaticTitle, firstTitleMessage, legacyContextTitle, legacyLabelPending, projectPageTitle, providerTitleIgnored, refreshUserTitle, userTitle } from './title.js';
 import { agentPlanSchema, agentPlanUpdateSchema, MAX_AGENT_PLAN_BYTES, type AgentPlan, type AgentPlanUpdate } from '../../shared/agent-plan.js';
 import { getConfig } from '../config.js';
 import { logError, logInfo, logWarn } from '../logger.js';
@@ -164,6 +164,12 @@ function assertReady(): void {
   if (root === '') {
     throw new Error('The session store was used before initSessionStore() named a directory');
   }
+}
+
+/** The chat's plain-text search index (search.ts); it lives and is deleted with the session. */
+export function sessionSearchIndexPath(id: string): string {
+  assertSessionId(id);
+  return path.join(sessionDir(id), 'search.txt');
 }
 
 function sessionDir(id: string): string {
@@ -321,6 +327,7 @@ function emptySummary(id: string, title: string, conversationId: string | null):
     userMessages: 0,
     toolCalls: 0,
     lastToolCallAt: null,
+    lastToolActivity: null,
     lastAssistantFinalAt: null,
     lastTurnEndAt: null,
     lastFinishReportAt: null,
@@ -846,6 +853,7 @@ async function rebuildSummaryFromHistory(
         userMessages: rebuilt.userMessages,
         toolCalls: rebuilt.toolCalls,
         lastToolCallAt: rebuilt.lastToolCallAt,
+        lastToolActivity: rebuilt.lastToolActivity,
         lastAssistantFinalAt: rebuilt.lastAssistantFinalAt,
         lastTurnEndAt: rebuilt.lastTurnEndAt,
         lastFinishReportAt: rebuilt.lastFinishReportAt,
@@ -1020,7 +1028,16 @@ function applyToSummary(summary: SessionSummary, event: SessionEvent): void {
   if (event.kind === 'user_message') summary.userMessages += 1;
   if (event.kind === 'tool_call') {
     summary.toolCalls += 1;
-    summary.lastToolCallAt = Math.max(summary.lastToolCallAt ?? 0, event.time);
+    const priorToolAt = summary.lastToolCallAt ?? 0;
+    summary.lastToolCallAt = Math.max(priorToolAt, event.time);
+    // Attribution repair can append an older call after newer activity. Keep the projection
+    // aligned with lastToolCallAt rather than letting append order make an old action look latest.
+    if (event.time >= priorToolAt) {
+      summary.lastToolActivity = {
+        kind: event.call.summary.kind,
+        title: event.call.summary.title.slice(0, 200)
+      };
+    }
     if (event.call.endsActivity === true) {
       summary.lastFinishReportAt = Math.max(summary.lastFinishReportAt ?? 0, event.time);
     }
@@ -1795,6 +1812,11 @@ export async function readCompletedFinal(sessionId: string, conversationId: stri
   const completedAt = final.kind === 'turn_end' ? final.time : final.finalObservedAt ?? final.time;
   const question = questions[0];
   const correction = (event: SessionEvent) => isTurnCorrection(event, final.turnId, entry.summary.timelineTurns) && positionOf(event) < seq;
+  // The question this turn answered, reported again after the answer, is not a new question: a
+  // new chat's first message can reach the page as "just authored" (re-escaped) only after
+  // ChatGPT's redraw, when the turn has already ended. A genuinely new question has a new id.
+  const ownQuestion = final.turnId ? entry.summary.timelineTurns?.[final.turnId]?.questionId : undefined;
+  const nativeFinal = final.kind === 'turn_end' || (final.final === true && !!final.providerMessageId);
   if (question && positionOf(question) >= positionOf(final) && !correction(question)) return null;
   // With no generation identity, require an actual preceding authored boundary.
   if (!final.turnId && (!question || question.time > final.time)) return null;
@@ -1816,9 +1838,16 @@ export async function readCompletedFinal(sessionId: string, conversationId: stri
         sameTurn(owner.turnId, final.turnId) && event.call.conversationId === conversationId &&
         (!event.turnId || sameTurn(event.turnId, final.turnId)));
     }
-    if (event.kind === 'turn_end') return !sameTurn(event.turnId, final.turnId) || event.outcome !== 'completed';
-    if (event.kind === 'turn_start') return !(nativeReopen && event === last);
-    if (event.kind === 'user_message') return !correction(event);
+    // The page's ten-minute check ends a turn as `stalled` when it never saw the end. After
+    // ChatGPT's own final for that turn, the turn did end; nothing new happened (#1099).
+    if (event.kind === 'turn_end') return !sameTurn(event.turnId, final.turnId) ||
+      (event.outcome !== 'completed' && !(event.outcome === 'stalled' && nativeFinal));
+    // The first start of the final's own turn, recorded after that final: ChatGPT reported a fast
+    // answer's end before the page opened the turn from the Send receipt (#1099). Not new work.
+    if (event.kind === 'turn_start') return !(nativeReopen && event === last) &&
+      !(event.source !== 'app' && !!final.turnId && event.turnId === final.turnId &&
+        entry.summary.timelineTurns?.[final.turnId]?.origin === positionOf(event));
+    if (event.kind === 'user_message') return !correction(event) && !(ownQuestion && event.messageId === ownQuestion);
     return event.kind === 'assistant_message' || event.kind === 'page_tool';
   })) return null;
   return { messageId, turnId: final.turnId ?? null, completedAt, contentSeq: seq,
@@ -2290,6 +2319,7 @@ export async function rewriteUnattributedToolCalls(
       userMessages: 0,
       toolCalls: 0,
       lastToolCallAt: null,
+      lastToolActivity: null,
       lastAssistantFinalAt: null,
       lastTurnEndAt: null,
       lastFinishReportAt: null,
@@ -2345,12 +2375,23 @@ function normalizeSummary(id: string, raw: string): MetaCheckpoint | null {
         : {};
     }
     if (publicSummary.titleSource !== undefined && !['fallback', 'provider', 'manual'].includes(publicSummary.titleSource)) delete publicSummary.titleSource;
+    const auto = publicSummary.autoTitle;
+    if (auto !== undefined && (publicSummary.titleSource !== 'manual' || !auto || typeof auto !== 'object' ||
+        typeof auto.title !== 'string' || !['fallback', 'provider'].includes(auto.source))) delete publicSummary.autoTitle;
     const selected = publicSummary.selectedModel;
     if (selected !== undefined && (!selected || typeof selected !== 'object' ||
         typeof selected.conversationId !== 'string' || typeof selected.model !== 'string' ||
         !/^[a-zA-Z0-9 ._-]{1,80}$/.test(selected.model) || !Number.isFinite(selected.observedAt))) {
       delete publicSummary.selectedModel;
     }
+    const lastToolActivity = publicSummary.lastToolActivity;
+    if (lastToolActivity !== undefined && lastToolActivity !== null && (
+      typeof lastToolActivity !== 'object' ||
+      typeof lastToolActivity.title !== 'string' ||
+      lastToolActivity.title.length === 0 ||
+      lastToolActivity.title.length > 200 ||
+      !/^(?:edit|create|delete|move|read|search|browse|run|process|screen|input|clipboard|session|agent|other)$/.test(lastToolActivity.kind)
+    )) delete publicSummary.lastToolActivity;
     const finish = publicSummary.finishTurn;
     if (finish !== undefined && finish !== null && (!finish || typeof finish !== 'object' ||
         typeof finish.turnId !== 'string' || !Number.isFinite(finish.startedAt) ||
@@ -2387,6 +2428,7 @@ function normalizeSummary(id: string, raw: string): MetaCheckpoint | null {
           typeof publicSummary.lastToolCallAt === 'number' && Number.isFinite(publicSummary.lastToolCallAt)
             ? publicSummary.lastToolCallAt
             : null,
+        lastToolActivity: publicSummary.lastToolActivity ?? null,
         lastAssistantFinalAt:
           typeof publicSummary.lastAssistantFinalAt === 'number' && Number.isFinite(publicSummary.lastAssistantFinalAt)
             ? publicSummary.lastAssistantFinalAt
@@ -2946,21 +2988,6 @@ export async function conversationAttachment(
 }
 
 /**
- * Durable Compact & Resume ancestry for the conversation currently attached to a session.
- *
- * The production store has only two rebind paths: the initial null -> chat attachment and
- * continuation commit. `lastCommittedResumeHandoffId` is written atomically with the latter,
- * while `chatIds` retains every frontend oldest-first. Therefore a current chat with committed
- * resume provenance can safely inherit policy from its historical predecessors without keeping
- * the short-lived continuation WAL around. Ambiguous/non-current lookups fail closed.
- */
-export async function committedResumeAncestors(conversationId: string): Promise<string[]> {
-  if (!conversationId) return [];
-  const summary = await findSessionByConversation(conversationId, { requireUnique: true });
-  return summary ? committedResumeAncestorsFromSummary(summary, conversationId) : [];
-}
-
-/**
  * Filesystem time of the newest durable mutation belonging to a session.
  *
  * Session event timestamps describe when an action happened, not when it finally reached
@@ -3104,6 +3131,24 @@ export async function reopenSession(id: string, pageObservedAt?: number): Promis
 export async function renameSession(id: string, title: string, source: SessionSummary['titleSource'] = 'manual', conversationId?: string): Promise<void> {
   const entry = await ensureOpen(id);
   await enqueueSessionOperation(entry, 'rename', async () => {
+    if (source !== 'manual' && entry.summary.titleSource === 'manual') {
+      // The user's name stays; ChatGPT's newer title is kept for when the name is cleared.
+      // The same rules as an unnamed chat: worker and helper chats keep their origin's title, a
+      // chat this app opened is named by its request, and a project page title is never a name.
+      if (source === undefined || (conversationId && entry.summary.conversationId !== conversationId)) return;
+      if (entry.summary.origin && entry.summary.origin.kind !== 'desktop') return;
+      const auto = entry.summary.autoTitle;
+      if (source === 'fallback' && auto?.source === 'provider') return;
+      if (source === 'provider' && (providerTitleIgnored(entry.summary) || projectPageTitle(title))) return;
+      const next = { title: title.slice(0, 120), source };
+      if (auto?.title === next.title && auto.source === next.source) return;
+      entry.summary.autoTitle = next;
+      await writeMeta(entry);
+      return;
+    }
+    if (source === 'manual' && entry.summary.titleSource !== 'manual') {
+      entry.summary.autoTitle = { title: entry.summary.title, source: entry.summary.titleSource === 'provider' ? 'provider' : 'fallback' };
+    }
     if (source !== 'manual') {
       if (conversationId && entry.summary.conversationId !== conversationId) return;
       if (!automaticTitle(entry.summary, firstTitleMessage(entry.messages.values()))) return;
@@ -3113,6 +3158,23 @@ export async function renameSession(id: string, title: string, source: SessionSu
     if (entry.summary.title === title.slice(0, 120) && entry.summary.titleSource === source) return;
     entry.summary.title = title.slice(0, 120);
     entry.summary.titleSource = source;
+    await writeMeta(entry);
+  });
+}
+
+/**
+ * Drops the user's own name for a chat and shows the title the app would show without it: ChatGPT's
+ * current title when one was seen, else the one from the first message (#1107).
+ */
+export async function clearSessionName(id: string): Promise<void> {
+  const entry = await ensureOpen(id);
+  await enqueueSessionOperation(entry, 'rename', async () => {
+    if (entry.summary.titleSource !== 'manual') return;
+    const auto = entry.summary.autoTitle;
+    const first = firstTitleMessage(entry.messages.values());
+    entry.summary.title = auto?.title || (first ? userTitle(first.message.text, first.authoredText) : '') || 'ChatGPT session';
+    entry.summary.titleSource = auto?.source ?? 'fallback';
+    delete entry.summary.autoTitle;
     await writeMeta(entry);
   });
 }
@@ -3165,7 +3227,10 @@ export async function setSessionOrigin(id: string, origin: SessionOrigin, title:
   const entry = await ensureOpen(id);
   await enqueueSessionOperation(entry, 'origin write', async () => {
     if (inheritedProject && entry.summary.projectId && entry.summary.projectId !== inheritedProject) throw new Error('Session origin belongs to another project');
-    const staged = { ...entry.summary, origin, title: title.slice(0, 120), ...(inheritedProject ? { projectId: inheritedProject } : {}) };
+    // A name the user gave the chat stays; the origin's title becomes the one clearing it restores.
+    const named = entry.summary.titleSource === 'manual';
+    const staged = { ...entry.summary, origin, ...(named ? { autoTitle: { title: title.slice(0, 120), source: 'fallback' as const } } : { title: title.slice(0, 120) }),
+      ...(inheritedProject ? { projectId: inheritedProject } : {}) };
     await writeSummary(staged, entry.historySeq);
     entry.summary = staged;
     publishAttachmentSummary(staged);
@@ -3257,7 +3322,10 @@ export async function rebindSession(
     entry.metaDirty = false;
     missingCurrentConversations.delete(toConversationId);
     publishAttachmentSummary(entry.summary);
-    logInfo(`session ${id} moved from ChatGPT conversation ${fromConversationId} to ${toConversationId}`);
+    // A new chat gets its first id here; "moved from conversation null" read like a fault in Activity.
+    logInfo(fromConversationId
+      ? `session ${id} moved from ChatGPT conversation ${fromConversationId} to ${toConversationId}`
+      : `session ${id} is now ChatGPT conversation ${toConversationId}`);
     return true;
   });
 }
@@ -3813,7 +3881,30 @@ export async function readHandoff(sessionId: string, handoffId: string): Promise
   try {
     const raw = await fs.readFile(path.join(sessionDir(sessionId), 'handoffs', `${handoffId}.json`), 'utf8');
     const parsed = JSON.parse(raw) as Handoff;
-    return typeof parsed?.text === 'string' ? parsed : null;
+    if (typeof parsed?.text !== 'string') return null;
+    // Legacy files had no version/provenance and remain readable. New files fail closed if
+    // identity metadata is malformed; recovery must never repair a transaction from guessed
+    // provenance.
+    if (parsed.version !== undefined || parsed.provenance !== undefined) {
+      const provenance = parsed.provenance;
+      if (
+        parsed.version !== 1 ||
+        parsed.id !== handoffId ||
+        parsed.sessionId !== sessionId ||
+        !provenance ||
+        (provenance.sourceConversationId !== null &&
+          (typeof provenance.sourceConversationId !== 'string' ||
+            provenance.sourceConversationId.length === 0 ||
+            provenance.sourceConversationId.length > 256)) ||
+        (provenance.sourceGeneration !== null &&
+          (!Number.isSafeInteger(provenance.sourceGeneration) || provenance.sourceGeneration < 1)) ||
+        (provenance.sourceTurnId !== null &&
+          (typeof provenance.sourceTurnId !== 'string' || provenance.sourceTurnId.length > 256)) ||
+        (provenance.continuationId !== null &&
+          (typeof provenance.continuationId !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(provenance.continuationId)))
+      ) return null;
+    }
+    return parsed;
   } catch {
     return null;
   }

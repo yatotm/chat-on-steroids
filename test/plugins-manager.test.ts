@@ -104,6 +104,8 @@ describe('external plugin authority', () => {
     expect(upstream).toHaveBeenCalledTimes(1);
     expect(outcome).toHaveBeenCalledWith('tool_rejected');
     await manager.setEnabled(row.id, false);
+    expect(manager.snapshot().plugins[0]).toMatchObject({ status: 'disabled', enabled: false });
+    expect(manager.snapshot().plugins[0]?.error).toBeUndefined();
     const disabled = JSON.stringify(await manager.call('Echo.Mixed', { value: 'third' }));
     expect(disabled).toContain('PLUGIN_DISABLED');
     expect(disabled).toContain('Enable');
@@ -124,6 +126,18 @@ describe('external plugin authority', () => {
     expect(await manager.call('Echo.Mixed', { value: 'error text' }, outcome)).toEqual(upstreamError);
     expect(outcome).toHaveBeenCalledExactlyOnceWith('tool_execution_error');
     expect(upstream).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not restore an obsolete connection error on a disabled installation', async () => {
+    await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } });
+    await manager.close();
+    const stored = await durableModule.readDurable<any[]>('plugins');
+    await durableModule.writeDurableNow('plugins', stored!.map(row => ({ ...row, enabled: false, error: 'old fetch failed' })));
+    manager = new PluginManager(); await manager.initialize(dir);
+    expect(manager.snapshot().plugins[0]).toMatchObject({ enabled: false, status: 'disabled' });
+    expect(manager.snapshot().plugins[0]?.error).toBeUndefined();
+    expect(manager.snapshot().plugins[0]?.tools).toHaveLength(1);
+    expect(manager.tools()).toEqual([]);
   });
 
   it('keeps Windows package data below MAX_PATH across installation and replacement', async () => {

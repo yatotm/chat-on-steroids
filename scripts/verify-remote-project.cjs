@@ -3,6 +3,7 @@ const { app, BrowserWindow } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
 const assert = require('node:assert/strict');
+const { fixtureConfigSource } = require('./fixtures/app-defaults.cjs');
 const root = path.resolve(__dirname, '..');
 const output = path.join(root, 'outputs/remote-project');
 app.setPath('userData', path.join(output, 'runtime'));
@@ -12,10 +13,15 @@ app.whenReady().then(async () => {
     <script type="module">
       import { requestRemoteProject } from '/remote-project-dialog.ts';
       import { setLanguage } from '/i18n.ts';
+      import { applyAppearance } from '/appearance.ts';
+      ${fixtureConfigSource()}
+      const config=fixtureConfig({}); applyAppearance(config.ui.theme,config.ui.appearance);
       window.api = {
-        pluginsSnapshot: async () => ({ ok:true, data:{ plugins:[] } }),
-        pluginsInstall: async request => ({ok:true,data:{plugins:[{id:'fixture-remote',name:'Development server',source:request.source}]}}),
-        addRemoteProject: async (id,path) => new Promise(resolve => { window.captured={id,path}; window.release=()=>resolve({ok:true,data:{id:'fixture-project',path}}); })
+        listProjects: async () => ({ ok:true, data:[] }),
+        listRemoteHosts: async () => ({ok:true,data:[]}),
+        listSshHosts: async () => ({ok:true,data:{supported:true,hosts:['dev-example']}}),
+        saveRemoteHost: async request => {window.hostRequest=request;return {ok:true,data:{id:'fixture-host',sshHost:request.sshHost,serverId:'fixture-server',remotePort:request.remotePort,roots:request.roots,revision:1,enabled:true,state:'connected',checkedAt:Date.now(),detail:'',localPort:43210}}},
+        addManagedRemoteProject: async request => new Promise(resolve => { window.captured=request; window.release=()=>resolve({ok:true,data:{id:'fixture-project',path:request.directory}}); })
       };
       window.begin = locale => { setLanguage(locale); void requestRemoteProject().then(value=>window.accepted=value); };
       window.fixtureReady = true;
@@ -33,6 +39,7 @@ app.whenReady().then(async () => {
     await win.loadURL(server.resolvedUrls.local[0]+'fixture.html'); await wait('!!window.fixtureReady');
     for(const locale of ['en','zh-CN']) {
       await js(`window.begin(${JSON.stringify(locale)}); true`); await wait('!!document.querySelector("dialog[open]")');
+      await js(`(()=>{const choice=document.querySelector('select');choice.value='ssh:dev-example';choice.dispatchEvent(new Event('change'));})();true`);
       for(const width of [1000,560]) {
         win.setSize(width,800);
         const geometry = await js(`new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>{
@@ -42,12 +49,13 @@ app.whenReady().then(async () => {
         assert(geometry.left>=0 && geometry.right<=geometry.width && !geometry.overflow,JSON.stringify(geometry));
         fs.writeFileSync(path.join(output,locale+'-'+width+'.png'),(await win.webContents.capturePage(undefined,{stayHidden:true,stayAwake:true})).toPNG());
       }
-      await js(`document.querySelector('input[type=url]').value='http://127.0.0.1:8787/mcp';document.querySelector('input[type=password]').value='fixture-token';
-        document.querySelector('input[placeholder="/srv/project"]').value='/srv/project';document.querySelector('form').requestSubmit(); true`);
+      await js(`document.querySelector('.remote-root-row input').value='/srv';document.querySelector('input[type=password]').value='fixture-execution-token-12345678901234567890';
+        document.querySelector('input[placeholder="/srv/projects/my-project"]').value='/srv/project';document.querySelector('form').requestSubmit(); true`);
       await wait('!!window.captured');
-      assert.deepEqual(await js('window.captured'),{id:'fixture-remote',path:'/srv/project'});
-      assert(await js(`document.querySelector('input[placeholder="/srv/project"]').disabled`));
-      assert(!(await js(`document.body.textContent.includes('fixture-token')`)));
+      assert.deepEqual(await js('window.captured'),{hostId:'fixture-host',directory:'/srv/project',createDirectory:false});
+      assert.equal((await js('window.hostRequest')).sshHost,'dev-example');
+      assert(await js(`document.querySelector('input[placeholder="/srv/projects/my-project"]').disabled`));
+      assert(!(await js(`document.body.textContent.includes('fixture-execution-token-12345678901234567890')`)));
       await js('window.release(); true'); await wait('!document.querySelector("dialog")');
       assert.equal((await js('window.accepted')).id,'fixture-project');
       await js('delete window.captured; true');

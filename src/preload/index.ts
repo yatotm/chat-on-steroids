@@ -1,5 +1,6 @@
 import type { WorkspaceTerminalEvent, WorkspaceTerminalInfo } from '../shared/workspace-terminal.js';
 import type { ChatModelCatalog } from '../shared/chat-models.js';
+import type { ConnectRemoteProject } from '../shared/remote-execution.js';
 import type { GoalModel } from '../shared/goal-reasoning.js';
 import type { TaskProgress } from '../shared/task-progress.js';
 import type { BrowserPreferences } from '../shared/browser-preferences.js';
@@ -7,12 +8,13 @@ import type { SessionControlsView } from '../main/bridge.js';
 import type { InputAttachment } from '../shared/input.js';
 import type { UsageOverview } from '../shared/usage.js';
 import type { InputArgs, InputEntry } from '../main/session/input.js';
-import type { LocalProject } from '../shared/projects.js';
+import type { LocalProject, ProjectColor } from '../shared/projects.js';
 import type { ProjectDirectoryListing, ProjectFileMutationResult, ProjectFilePreview, ProjectFileSaveResult, ProjectFilesChanged } from '../shared/project-files.js';
 import type { ProjectGitChanged, ProjectGitDiff, ProjectGitSnapshot } from '../shared/project-git.js';
 import type { PetLibraryState, PetOverlayControlState, PetRuntimeAsset } from '../shared/pets.js';
 import type { SkillSummary, ManagedSkill, GitHubSkillUpdateCheck, SkillLibrary, SkillsDraftScope } from '../shared/skills.js';
-import type { RunningToolActivity, SessionChange, ToolEditReview } from '../shared/session.js';
+import type { RunningToolActivity, SessionChange, SessionSearchReply, ToolEditReview } from '../shared/session.js';
+import type { RunningExecProcess } from '../shared/background-exec.js';
 import type { PluginSnapshot, PluginInstallRequest, PluginConfigPatch } from '../shared/plugins.js';
 /**
  * The entire renderer-facing API.
@@ -54,6 +56,8 @@ export interface SettingsPatch {
   mcp: Config['mcp'];
   /** Optional so callers that save other sections never have to carry it. */
   controlApi?: Config['controlApi'];
+  /** This computer's connector name suffix; omitted by callers that do not edit it. */
+  connectorSuffix?: string;
 }
 
 /** One page of the model catalogue, as the model picker asks for it. */
@@ -213,6 +217,7 @@ const api = {
   connect: () => call<AppState>('connection:connect'),
   disconnect: () => call<AppState>('connection:disconnect'),
   runDiagnostics: () => call<Diagnosis>('diagnostics:run'),
+  saveDiagnosticsReport: () => call<{ saved: false } | { saved: true; name: string }>('diagnostics:saveReport'),
   requestDesktopAccessibility: () => call<AppState>('desktop:requestAccessibility'),
   getLog: () => call<LogEntry[]>('log:get'),
   getLogText: () => call<string>('log:text'),
@@ -220,7 +225,12 @@ const api = {
   writeClipboard: (text: string) => call<boolean>('clipboard:write', { text }),
   exportMarkdown: (request: { id: string; scope: 'answer' | 'session'; turnId?: string; target: 'clipboard' | 'file' }) =>
     call<{ done: 'copied' } | { done: 'saved'; name: string } | { done: 'cancelled' }>('sessions:exportMarkdown', request),
-  openLink: (url: string) => call<boolean>('link:open', { url }),
+  // `external`: the system's own browser even for a page the CoS browser would open.
+  openLink: (url: string, options: { external?: boolean } = {}) => call<boolean>('link:open', { url, ...(options.external ? { external: true } : {}) }),
+  showCosBrowser: () => call<boolean>('cosBrowser:show'),
+  openChatGpt: () => call<boolean>('chatgpt:open'),
+  signOutChatGpt: () => call<boolean>('chatgpt:signOut'),
+  openSetupBrowser: (browser: 'chrome' | 'edge' | 'brave', page: 'extensions' | 'chatgpt') => call<boolean>('browser:setupOpen', { browser, page }),
   // Applies the update this app has already downloaded and verified: the app quits, the
   // installer runs, and the app comes back as the new version. It takes no argument because
   // there is nothing here to choose - the main process knows what is staged.
@@ -233,10 +243,16 @@ const api = {
     call<SessionList>('sessions:list', options ?? {}),
   listProjects: () => call<LocalProject[]>('projects:list'),
   addProject: () => call<LocalProject | null>('projects:add'),
-  addRemoteProject: (pluginId: string, path: string) => call<LocalProject>('projects:addRemote', { pluginId, path }),
+  addRemoteProject: (request: ConnectRemoteProject) => call<LocalProject>('projects:addRemote', request),
+  listSshHosts: () => call<import('../shared/remote-hosts.js').SshHostChoices>('ssh:hosts'),
+  listRemoteHosts: () => call<import('../shared/remote-hosts.js').RemoteHostView[]>('remoteHosts:list'),
+  saveRemoteHost: (request: import('../shared/remote-hosts.js').SaveRemoteHost) => call<import('../shared/remote-hosts.js').RemoteHostView>('remoteHosts:save', request),
+  refreshRemoteHost: (id: string) => call<import('../shared/remote-hosts.js').RemoteHostView>('remoteHosts:refresh', { id }),
+  reconnectRemoteHost: (id: string) => call<import('../shared/remote-hosts.js').RemoteHostView>('remoteHosts:reconnect', { id }),
+  disconnectRemoteHost: (id: string) => call<import('../shared/remote-hosts.js').RemoteHostView>('remoteHosts:disconnect', { id }),
+  addManagedRemoteProject: (request: import('../shared/remote-hosts.js').ManagedRemoteProject) => call<LocalProject>('projects:addManagedRemote', request),
   removeProject: (id: string) => call<LocalProject>('projects:remove', { id }),
-  addProjectFolder: (id: string) => call<LocalProject | null>('projects:addFolder', { id }),
-  removeProjectFolder: (id: string, path: string) => call<LocalProject>('projects:removeFolder', { id, path }),
+  setProjectColor: (id: string, color: ProjectColor | null) => call<LocalProject>('projects:color', { id, color }),
   listProjectFiles: (projectId: string, directory = '') => call<ProjectDirectoryListing>('projectFiles:list', { projectId, directory }),
   watchProjectFiles: (projectId: string | null, directories: string[]) => call<boolean>('projectFiles:watch', { projectId, directories }),
   onProjectFilesChanged: (listener: (event: ProjectFilesChanged) => void): (() => void) => {
@@ -287,6 +303,7 @@ const api = {
     return () => ipcRenderer.removeListener('chatModels:changed', wrapped);
   },
   getSessionControls: (id: string) => call<SessionControlsView>('sessions:controls', { id }),
+  cancelRecovery: (id: string) => call<boolean>('sessions:cancelRecovery', { id }),
   setSessionAutomation: (id: string, automation: SessionControlsView['automation'], afterTurn?: boolean) => call<SessionControlsView>('sessions:automation', { id, automation, afterTurn }),
   setSessionObjective: (id: string, text: string, mode: 'goal' | 'loop') => call<SessionControlsView>('sessions:objective', { id, text, mode }),
   compactSession: (id: string) => call<SessionControlsView>('sessions:compact', { id }),
@@ -297,6 +314,14 @@ const api = {
   listInputs: () => call<InputEntry[]>('sessions:outbox'),
   listPausedHelpers: () => call<Array<{ id: string; sourceSessionId: string }>>('sessions:pausedHelpers'),
   runningTools: (conversationIds: string[]) => call<RunningToolActivity[]>('sessions:runningTools', { conversationIds }),
+  runningProcesses: (sessionId: string) => call<RunningExecProcess[]>('sessions:runningProcesses', { sessionId }),
+  stopProcess: (sessionId: string, processId: number, incarnation: number) =>
+    call<boolean>('sessions:stopProcess', { sessionId, processId, incarnation }),
+  onBackgroundProcessesChanged: (listener: () => void): (() => void) => {
+    const wrapped = (): void => listener();
+    ipcRenderer.on('sessions:backgroundExecChanged', wrapped);
+    return () => ipcRenderer.removeListener('sessions:backgroundExecChanged', wrapped);
+  },
   livePreview: (conversationIds: string[]) => call<string | null>('sessions:livePreview', { conversationIds }),
   retryHelper: (id: string, sourceSessionId: string) => call<boolean>('sessions:retryHelper', { id, sourceSessionId }),
   editQueuedInput: (id: string, text: string, afterTurn?: boolean) => call<boolean>('sessions:editInput', { id, text, afterTurn }),
@@ -313,6 +338,10 @@ const api = {
   setSessionTrusted: (id: string, expectedConversationId: string, trusted: boolean) =>
     call<string[]>('sessions:trust', { id, expectedConversationId, trusted }),
   deleteSession: (id: string) => call<boolean>('sessions:delete', { id }),
+  /** Chats matching every word of `query`, by title first, then by what was said in them. */
+  searchSessions: (query: string) => call<SessionSearchReply>('sessions:search', { query }),
+  /** The chat's own name in the app; null clears it and ChatGPT's title shows again. */
+  renameSession: (id: string, title: string | null) => call<boolean>('sessions:rename', { id, title }),
   getHandoff: (id: string, handoffId?: string) => call<Handoff | null>('handoff:get', { id, handoffId }),
 
   unpairExtension: () => call<AppState>('bridge:unpair'),

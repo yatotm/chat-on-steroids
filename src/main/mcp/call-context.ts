@@ -46,6 +46,14 @@ export interface CallEvidence {
 export interface CallCaller {
   transportKey: string | null;
   /**
+   * Local Setup profile that owns the MCP endpoint generation which accepted this call.
+   *
+   * This is connection provenance, not a provider account id and not a model argument. A
+   * reconnect after switching Setup profiles gets a new endpoint generation with a different
+   * value; an old endpoint being drained keeps the profile that created it.
+   */
+  setupProfileId?: string | null;
+  /**
    * ChatGPT's own id for this request, from the `x-request-id` header the connector
    * arrives with, trimmed to the part before the `/`.
    *
@@ -296,10 +304,6 @@ export function noteOutcome(outcome: ToolOutcome): void {
   if (store.outcome === null || rank[outcome] > rank[store.outcome]) store.outcome = outcome;
 }
 
-export function noteChange(change: FileChange): void {
-  storage.getStore()?.evidence.changes.push(change);
-}
-
 export function noteChanges(changes: readonly FileChange[], reviews?: readonly { before: string; after: string }[]): void {
   const store = storage.getStore();
   if (!store) return;
@@ -308,10 +312,6 @@ export function noteChanges(changes: readonly FileChange[], reviews?: readonly {
   if (reviews?.length === changes.length) {
     reviews.forEach((review, index) => store.evidence.reviews.push({ changeIndex: offset + index, ...review }));
   }
-}
-
-export function noteAsset(asset: AssetRef): void {
-  storage.getStore()?.evidence.assets.push(asset);
 }
 
 export function noteCount(count: number): void {

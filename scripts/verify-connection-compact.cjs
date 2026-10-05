@@ -7,7 +7,7 @@ const root = path.resolve(__dirname, '..');
 const output = path.join(root, 'outputs/connection-compact');
 app.setPath('userData', path.join(output, 'runtime'));
 app.whenReady().then(async () => {
-  const win = new BrowserWindow({ show: false, width: 1100, height: 800, webPreferences: { sandbox: true } });
+  const win = new BrowserWindow({ show: false, width: 1100, height: 800, webPreferences: { sandbox: true, backgroundThrottling: false } });
   try {
     const css = fs.readFileSync(path.join(root, 'src/renderer/styles.css'), 'utf8');
     const html = fs.readFileSync(path.join(root, 'src/renderer/index.html'), 'utf8')
@@ -77,7 +77,7 @@ app.whenReady().then(async () => {
         assert.equal(result.blur, 'blur(22px) saturate(1.25)');
         results.push({ language, theme, zoom, state: state.name, ...result });
         if (language === 'en' && theme === 'dark' && zoom === 1.17) {
-          await win.webContents.capturePage(undefined, { stayHidden: true, stayAwake: true });
+          // 隐藏窗口也先等待实际绘制，不能用第一次截图请求代替首帧就绪。
           await win.webContents.executeJavaScript('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
           const png = await win.webContents.capturePage(undefined, { stayHidden: true, stayAwake: true });
           fs.writeFileSync(path.join(output, state.name + '.png'), png.toPNG());

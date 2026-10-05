@@ -20,8 +20,8 @@ vi.mock('electron', () => ({
   },
   BrowserWindow: class {},
   clipboard: { readText: () => '', writeText: () => undefined },
-  dialog: { showOpenDialog: vi.fn(async () => ({ canceled: true, filePaths: [] as string[] })) },
-  shell: { openExternal: vi.fn(async () => undefined), openPath: vi.fn(async () => '') },
+  dialog: { showOpenDialog: vi.fn(async () => ({ canceled: true, filePaths: [] as string[] })), showSaveDialog: vi.fn(async () => ({ canceled: true })) },
+  shell: { openExternal: vi.fn(async () => undefined), openPath: vi.fn(async () => ''), showItemInFolder: vi.fn() },
   nativeTheme: { themeSource: 'system' },
   safeStorage: {
     isAsyncEncryptionAvailable: vi.fn(async () => true),
@@ -29,7 +29,7 @@ vi.mock('electron', () => ({
     encryptStringAsync: vi.fn(async (value: string) => Buffer.from(value, 'utf8')),
     decryptStringAsync: vi.fn(async (buffer: Buffer) => ({ result: buffer.toString('utf8'), shouldReEncrypt: false }))
   },
-  app: { on: vi.fn(), getPath: () => '', getVersion: vi.fn(() => '0.0.0'), getAppPath: () => process.cwd(), isPackaged: false }
+  app: { on: vi.fn(), getPath: (_name: string) => '', getLocale: () => 'en-US', getVersion: vi.fn(() => '0.0.0'), getAppPath: () => process.cwd(), isPackaged: false }
 }));
 
 // This suite owns IPC behavior, not Electron's packaged-vs-checkout path discovery.
@@ -62,7 +62,7 @@ const {
   spawn,
   swarmStateForCaller
 } = await import('../src/main/agents.js');
-const { registerIpc } = await import('../src/main/ipc.js');
+const { registerIpc, cleanSessionName } = await import('../src/main/ipc.js');
 const { openInPreferredBrowser } = await import('../src/main/browser.js');
 const { app, nativeTheme, safeStorage, shell, dialog } = await import('electron');
 const { extensionDownloadUrl } = await import('../src/main/version.js');
@@ -110,6 +110,30 @@ it.each(['playfulStatus', 'followOutput'] as const)('saves the %s display switch
   // A stale snapshot that never touched the switch keeps the saved value.
   expect(await save({ ...base, ui: { ...base.ui, theme: base.ui.theme === 'light' ? 'dark' : 'light' } }, base)).toMatchObject({ ok: true });
   expect(getConfig().ui[key]).toBe(wanted);
+});
+
+it('saves Auto-select Skills through Settings and preserves it across a stale unrelated save', async () => {
+  const base = getConfig();
+  const wanted = !(base.ui.autoSelectSkills ?? false);
+  expect(await save({ ...base, ui: { ...base.ui, autoSelectSkills: wanted } }, base)).toMatchObject({ ok: true });
+  expect(getConfig().ui.autoSelectSkills).toBe(wanted);
+  expect(await save({ ...base, ui: { ...base.ui, theme: base.ui.theme === 'light' ? 'dark' : 'light' } }, base)).toMatchObject({ ok: true });
+  expect(getConfig().ui.autoSelectSkills).toBe(wanted);
+});
+
+it('names a chat with one clean line, and clears the name for an empty one (#1107)', async () => {
+  expect(cleanSessionName('  Release\nprep\t\u0000now  ')).toBe('Release prep now');
+  expect(cleanSessionName('x'.repeat(300))).toHaveLength(120);
+  expect(cleanSessionName(' \u2028 ')).toBeNull();
+  expect(cleanSessionName(null)).toBeNull();
+  const session = await createSession({ conversationId: 'ipc-rename-chat', title: 'From ChatGPT' });
+  const rename = (title: unknown) => handlers.get('sessions:rename')!(null, { id: session.id, title }) as Promise<unknown>;
+  await rename('  My   name ');
+  expect(await getSession(session.id)).toMatchObject({ title: 'My name', titleSource: 'manual' });
+  await rename('');
+  expect((await getSession(session.id))?.title).toBe('From ChatGPT');
+  expect(await rename(42)).toMatchObject({ ok: false });
+  expect(await handlers.get('sessions:rename')!(null, { id: 'missing-session-0001', title: 'x' })).toMatchObject({ ok: false, error: expect.stringContaining('Session not found') });
 });
 
 it('enabling strict chat allowlisting keeps existing chats untrusted', async () => {
@@ -479,24 +503,15 @@ it('adds picker-selected projects, reuses containing approval, and leaves cancel
   expect(getConfig().roots).toHaveLength(1);
   const listed = await handlers.get('projects:list')!(null, {}) as any;
   expect(listed.data).toHaveLength(2);
-  const related = path.join(dir, 'picker-related');
-  await fs.mkdir(related);
-  vi.mocked(dialog.showOpenDialog).mockResolvedValue({ canceled: false, filePaths: [related] });
-  const addFolder = () => handlers.get('projects:addFolder')!(null, { id: first.data.id }) as Promise<any>;
-  const withRelated = await addFolder();
-  expect(withRelated).toMatchObject({ ok: true, data: { id: first.data.id } });
-  expect(withRelated.data.additionalPaths).toHaveLength(1);
-  const storedRelated = withRelated.data.additionalPaths[0];
-  expect(path.isAbsolute(storedRelated)).toBe(true);
-  expect((await addFolder()).data.additionalPaths).toEqual([storedRelated]);
-  expect(getConfig().roots).toHaveLength(2);
-  const withoutRelated = await handlers.get('projects:removeFolder')!(null, { id: first.data.id, path: storedRelated }) as any;
-  expect(withoutRelated).toMatchObject({ ok: true, data: { id: first.data.id } });
-  expect(withoutRelated.data.additionalPaths).toBeUndefined();
-  expect(getConfig().roots).toHaveLength(2);
+  const colored = await handlers.get('projects:color')!(null, { id: first.data.id, color: 'blue' }) as any;
+  expect(colored).toMatchObject({ ok: true, data: { id: first.data.id, color: 'blue' } });
+  expect(await handlers.get('projects:color')!(null, { id: first.data.id, color: 'chartreuse' })).toMatchObject({ ok: false });
+  const uncolored = await handlers.get('projects:color')!(null, { id: first.data.id, color: null }) as any;
+  expect(uncolored).toMatchObject({ ok: true, data: { id: first.data.id } });
+  expect(uncolored.data.color).toBeUndefined();
   const removed = await handlers.get('projects:remove')!(null, { id: first.data.id }) as any;
   expect(removed).toMatchObject({ ok: true, data: { id: first.data.id, ungrouped: true } });
-  expect(getConfig().roots).toHaveLength(2);
+  expect(getConfig().roots).toHaveLength(1);
   expect((await fs.stat(folder)).isDirectory()).toBe(true);
   expect(await handlers.get('projects:remove')!(null, { id: folder })).toMatchObject({ ok: false });
   expect(await handlers.get('projectGit:snapshot')!(null, { projectId: folder })).toMatchObject({ ok: false });
@@ -1257,6 +1272,35 @@ describe('every link the window offers', () => {
     expect(vi.mocked(shell.openExternal).mock.calls.length).toBe(before);
   });
 
+  it("opens Setup's ChatGPT and OpenAI pages in the CoS browser when it is the chosen browser", async () => {
+    const original = getConfig();
+    const url = 'https://platform.openai.com/settings/organization/tunnels';
+    try {
+      await saveConfig({ ...original, ui: { ...original.ui, chatBrowser: 'cos' } });
+      vi.mocked(openInPreferredBrowser).mockClear();
+      vi.mocked(shell.openExternal).mockClear();
+      expect(await handlers.get('link:open')!(null, { url })).toEqual({ ok: true, data: true });
+      expect(openInPreferredBrowser).toHaveBeenCalledWith(url, { reveal: true });
+      expect(shell.openExternal).not.toHaveBeenCalled();
+      // "Open in another browser" beside it: the same page in the system's own browser.
+      vi.mocked(openInPreferredBrowser).mockClear();
+      expect(await handlers.get('link:open')!(null, { url, external: true })).toEqual({ ok: true, data: true });
+      expect(shell.openExternal).toHaveBeenLastCalledWith(url);
+      expect(openInPreferredBrowser).not.toHaveBeenCalled();
+      // Every other site still leaves for the system browser.
+      await handlers.get('link:open')!(null, { url: 'https://openrouter.ai/settings/keys' });
+      expect(shell.openExternal).toHaveBeenCalledWith('https://openrouter.ai/settings/keys');
+
+      await saveConfig({ ...original, ui: { ...original.ui, chatBrowser: 'chrome' } });
+      vi.mocked(openInPreferredBrowser).mockClear();
+      await handlers.get('link:open')!(null, { url });
+      expect(shell.openExternal).toHaveBeenLastCalledWith(url);
+      expect(openInPreferredBrowser).not.toHaveBeenCalled();
+    } finally {
+      await saveConfig(original);
+    }
+  });
+
   it('serializes non-Error throws into a real IPC error string', async () => {
     vi.mocked(shell.openExternal).mockRejectedValueOnce('Windows shell refused the request');
     const reply = (await handlers.get('link:open')!(null, {
@@ -1803,7 +1847,18 @@ describe('session IPC contracts', () => {
     expect(isChatTrusted(conversationId)).toBe(true);
     expect(isChatBlocked(conversationId)).toBe(true);
 
-    const rename = vi.spyOn(fs, 'rename').mockRejectedValueOnce(Object.assign(new Error('simulated trust revoke failure'), { code: 'EIO' }));
+    // Block saves on a short delay. Settle it first, and fail only the trust file's save: a
+    // one-shot failure on whatever renames next went to a late Block save on slow runners.
+    await flushDurable();
+    const realRename = fs.rename.bind(fs);
+    let failed = false;
+    const rename = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+      if (!failed && String(to).includes('trusted-chats')) {
+        failed = true;
+        throw Object.assign(new Error('simulated trust revoke failure'), { code: 'EIO' });
+      }
+      return realRename(from, to);
+    });
     try {
       const deleted = (await handlers.get('sessions:delete')!(null, { id: session.id })) as any;
       expect(deleted.ok).toBe(false);
@@ -1927,8 +1982,10 @@ describe('session IPC contracts', () => {
     });
     const reply = await handlers.get('sessions:openChat')!(null, { id: session.id }) as any;
     expect(reply.ok, reply.error).toBe(true);
+    // An explicit user action: only the CoS browser uses `reveal`, to bring its window forward.
     expect(openInPreferredBrowser).toHaveBeenCalledWith(
-      'https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+      'https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      { reveal: true }
     );
 
     const unattributed = await createSession({ title: 'no conversation', conversationId: null });
@@ -1936,6 +1993,36 @@ describe('session IPC contracts', () => {
     expect(refused.ok).toBe(false);
     expect(refused.error).toMatch(/no valid ChatGPT conversation/i);
   });
+});
+
+it('saves this computer\'s connector suffix normalized, refuses an invalid one, and keeps a newer one through an older form', async () => {
+  // The saves below change the theme, which repaints the window.
+  currentWindow = { setBackgroundColor: vi.fn(), setTitleBarOverlay: vi.fn(), isDestroyed: () => false, webContents: { send: vi.fn() } };
+  const base = getConfig();
+  expect(await save({ ...base, connectorSuffix: '  Windows   VM ' }, base)).toMatchObject({ ok: true });
+  expect(getConfig().connectorSuffix).toBe('Windows VM');
+
+  // Invalid characters are refused, and nothing in that save is written.
+  const before = getConfig();
+  expect(await save({ ...before, connectorSuffix: 'Win/VM', ui: { ...before.ui, theme: before.ui.theme === 'light' ? 'dark' : 'light' } }, before))
+    .toMatchObject({ ok: false });
+  expect(getConfig().connectorSuffix).toBe('Windows VM');
+  expect(getConfig().ui.theme).toBe(before.ui.theme);
+
+  // A form opened before another writer changed the suffix, saving something else, keeps the newer suffix.
+  const stale = getConfig();
+  await saveConfig({ ...getConfig(), connectorSuffix: 'Mac' });
+  expect(await save({ ...stale, ui: { ...stale.ui, theme: stale.ui.theme === 'light' ? 'dark' : 'light' } }, stale)).toMatchObject({ ok: true });
+  expect(getConfig().connectorSuffix).toBe('Mac');
+
+  // A caller that does not carry the field at all (the Plugins page) leaves it alone.
+  const { connectorSuffix: _omitted, ...withoutSuffix } = getConfig();
+  expect(await save(withoutSuffix, withoutSuffix)).toMatchObject({ ok: true });
+  expect(getConfig().connectorSuffix).toBe('Mac');
+
+  const clear = getConfig();
+  expect(await save({ ...clear, connectorSuffix: '' }, clear)).toMatchObject({ ok: true });
+  expect(getConfig().connectorSuffix).toBe('');
 });
 
 describe('renderer pushes after the window is gone', () => {
@@ -1979,4 +2066,31 @@ describe('Stop IPC exact session and turn authority', () => {
     const missing = await createSession({ title: 'No browser ownership', conversationId: null });
     expect(await invoke({ id: missing.id, expectedTurnId: 'ipc-stop-one' })).toMatchObject({ ok: false, error: 'session_not_recorded' });
   });
+});
+
+it('saves a diagnostics report through the renderer channel without personal details', async () => {
+  const { flushLogFile, initLogFile, logInfo } = await import('../src/main/logger.js');
+  const home = path.join(dir, 'home-jane');
+  const clients = path.join(home, 'Acme Clients');
+  await fs.mkdir(clients, { recursive: true });
+  initLogFile(path.join(dir, 'app.log'));
+  logInfo(`tool read rejected: ENOENT, open '${path.join(clients, 'invoice 7.xlsx')}' for jane@example.com`);
+  logInfo('bridge: gave up on worker:run-1:worker-2 — the chat this app opened did not report back in time');
+  await flushLogFile();
+  await createSession({ title: 'Quarterly tax return draft', conversationId: 'diagnostics-report-session' });
+  const getPath = app.getPath;
+  const target = path.join(dir, 'report.txt');
+  (app as { getPath: (name: string) => string }).getPath = (name: string) => name === 'home' ? home : dir;
+  vi.mocked(dialog.showSaveDialog).mockResolvedValueOnce({ canceled: false, filePath: target } as never);
+  try {
+    expect(await handlers.get('diagnostics:saveReport')!(null, undefined)).toEqual({ ok: true, data: { saved: true, name: 'report.txt' } });
+  } finally {
+    (app as { getPath: typeof getPath }).getPath = getPath;
+  }
+  const report = await fs.readFile(target, 'utf8');
+  expect(report).toContain('# Chat On Steroids diagnostics report');
+  expect(report).toContain('did not report back in time');
+  expect(report).toMatch(/open '~[\\/]<p:[0-9a-f]{4}>[\\/]<p:[0-9a-f]{4}>\.xlsx'/);
+  for (const personal of ['home-jane', 'Acme', 'invoice', 'jane@example.com', 'Quarterly tax return']) expect(report).not.toContain(personal);
+  expect(shell.showItemInFolder).toHaveBeenCalledWith(target);
 });

@@ -496,6 +496,31 @@ class UnifiedExecProcess {
     return this.failure;
   }
 
+  /** 复用真实结束通知；撤销远程观察时移除等待者，进程及其输出不受影响。 */
+  async completionResult(classify: ExecCommandRequest['classifyExit'], signal?: AbortSignal): Promise<ProcessCompletion> {
+    if (signal) {
+      signal.throwIfAborted();
+      const ended = this.cancelNotify.notified();
+      let abort = () => {};
+      try {
+        if (!this.hasExited()) await Promise.race([
+          ended.promise,
+          new Promise<never>((_resolve, reject) => {
+            abort = () => reject(new Error('Completion observation was cancelled.'));
+            signal.addEventListener('abort', abort, { once: true });
+          })
+        ]);
+        signal.throwIfAborted();
+      } finally { ended.dispose(); signal.removeEventListener('abort', abort); }
+    }
+    const completion = await this.completion;
+    if (!this.outputClosed) {
+      const closed = this.outputClosedNotify.notified();
+      try { await raceWithTimeout([closed], POST_EXIT_CLOSE_WAIT_CAP_MS); } finally { closed.dispose(); }
+    }
+    return { ...completion, benignExit: this.benignExit(classify) };
+  }
+
   async write(data: string): Promise<void> {
     if (this.pty) {
       try {
@@ -616,13 +641,13 @@ export function truncatedOutput(output: ExecCommandToolOutput, maxTokens: number
 }
 
 /** `ExecCommandToolOutput::response_text` — exactly what the model is handed. */
-export function execCommandResponseText(output: ExecCommandToolOutput): string {
+export function execCommandResponseText(output: ExecCommandToolOutput, handle: (id: number) => string | number = id => id): string {
   const sections: string[] = [];
   if (output.chunkId !== '') sections.push(`Chunk ID: ${output.chunkId}`);
   sections.push(`Wall time: ${(output.wallTimeMs / 1000).toFixed(4)} seconds`);
   if (output.exitCode !== null) sections.push(`Process exited with code ${output.exitCode}`);
-  if (output.processId !== null) sections.push(`Process running with session ID ${output.processId}`);
-  if (output.completedSessionId !== undefined) sections.push(`Completed session ID: ${output.completedSessionId}`);
+  if (output.processId !== null) sections.push(`Process running with session ID ${handle(output.processId)}`);
+  if (output.completedSessionId !== undefined) sections.push(`Completed session ID: ${handle(output.completedSessionId)}`);
   if (output.replayed) sections.push('Retained output (already completed; command was not run again):');
   if (output.benignExit) sections.push('This non-zero exit is an expected command result, not a failure.');
   if (output.originalTokenCount !== null) sections.push(`Original token count: ${output.originalTokenCount}`);
@@ -632,13 +657,13 @@ export function execCommandResponseText(output: ExecCommandToolOutput): string {
 }
 
 /** `ExecCommandToolOutput::code_mode_result`, which is also the tool's declared output schema. */
-export function execCommandStructuredOutput(output: ExecCommandToolOutput): Record<string, unknown> {
+export function execCommandStructuredOutput(output: ExecCommandToolOutput, handle: (id: number) => string | number = id => id): Record<string, unknown> {
   return {
     ...(output.chunkId === '' ? {} : { chunk_id: output.chunkId }),
     wall_time_seconds: output.wallTimeMs / 1000,
     ...(output.exitCode === null ? {} : { exit_code: output.exitCode }),
-    ...(output.processId === null ? {} : { session_id: output.processId }),
-    ...(output.completedSessionId === undefined ? {} : { completed_session_id: output.completedSessionId }),
+    ...(output.processId === null ? {} : { session_id: handle(output.processId) }),
+    ...(output.completedSessionId === undefined ? {} : { completed_session_id: handle(output.completedSessionId) }),
     ...(output.benignExit ? { benign_exit: true } : {}),
     ...(output.replayed ? { output_replayed: true } : {}),
     ...(output.originalTokenCount === null ? {} : { original_token_count: output.originalTokenCount }),
@@ -652,6 +677,8 @@ export function execCommandStructuredOutput(output: ExecCommandToolOutput): Reco
 // --------------------------------------------------------------------------- manager
 
 export interface ExecCommandRequest {
+  /** 远端启动时的授权范围；后续输入不能沿用已被收窄的授权。 */
+  permissionRoots?: readonly string[];
   classifyExit?: (exitCode: number | null, rawOutput: string) => boolean;
   batchMarker?: string;
   command: string[];
@@ -679,20 +706,25 @@ export interface WriteStdinRequest {
 
 export interface BackgroundTerminalInfo {
   processId: number;
+  incarnation: number;
   command: string;
   cwd: string;
   pid: number;
   tty: boolean;
+  startedAt: number;
 }
 
 interface ProcessEntry {
+  permissionRoots?: readonly string[];
   classifyExit?: ExecCommandRequest['classifyExit'];
   batchMarker?: string;
   process: UnifiedExecProcess;
   processId: number;
+  incarnation: number;
   cwd: string;
   hookCommand: string;
   tty: boolean;
+  startedAt: number;
   initialExecCommandActive: boolean;
   /** Cursor into this process's own completed buffer; offers never consume bytes. */
   delivery?: { offset: number; offer?: { end: number; publication: OutputPublication } };
@@ -721,9 +753,14 @@ export interface BackgroundExecState {
 
 export class UnifiedExecProcessManager {
   private readonly processes = new Map<number, ProcessEntry>();
-  private readonly completed = new Map<number, Pick<ExecCommandToolOutput, 'rawOutput' | 'displayOutput' | 'exitCode' | 'benignExit'> & { identity: object }>();
+  private readonly completed = new Map<number, Pick<ExecCommandToolOutput, 'rawOutput' | 'displayOutput' | 'exitCode' | 'benignExit'> & { identity: object; incarnation: number; permissionRoots?: readonly string[]; completion: Promise<ProcessCompletion> }>();
   private releaseListener?: (processId: number) => void;
+  private shuttingDown = false;
+  private shutdownPromise: Promise<void> | null = null;
+  private readonly pendingLaunches = new Set<Promise<void>>();
+  private processChangeListener?: () => void;
   private readonly reservedProcessIds = new Set<number>();
+  private nextProcessIncarnation = 1;
   private readonly maxWriteStdinYieldTimeMs: number;
 
   constructor(maxWriteStdinYieldTimeMs: number) {
@@ -735,8 +772,18 @@ export class UnifiedExecProcessManager {
     this.releaseListener = listener;
   }
 
+  /** Presentation observers may reread the manager after a process starts, exits or is discarded. */
+  setProcessChangeListener(listener: () => void): void {
+    this.processChangeListener = listener;
+  }
+
+  private notifyProcessChange(): void {
+    this.processChangeListener?.();
+  }
+
   /** `rand::rng().random_range(1_000..100_000)`, retried against the reservations. */
   allocateProcessId(): number {
+    if (this.shuttingDown) throw UnifiedExecError.processFailed('Execution is shutting down. No process was started.');
     for (;;) {
       const processId = 1_000 + Math.floor(Math.random() * (100_000 - 1_000));
       if (this.reservedProcessIds.has(processId) || this.completed.has(processId)) continue;
@@ -750,6 +797,7 @@ export class UnifiedExecProcessManager {
     this.processes.delete(processId);
     this.completed.delete(processId);
     this.releaseListener?.(processId);
+    this.notifyProcessChange();
   }
 
   private retainCompleted(entry: ProcessEntry): void {
@@ -759,56 +807,73 @@ export class UnifiedExecProcessManager {
     this.reservedProcessIds.delete(entry.processId);
     this.completed.set(entry.processId, {
       identity: entry.process.identity,
+      incarnation: entry.incarnation, permissionRoots: entry.permissionRoots,
+      completion: entry.process.completionResult(entry.classifyExit),
       rawOutput, exitCode,
       ...(entry.batchMarker ? { displayOutput: new CommandBatchDisplay(entry.batchMarker).push(rawOutput, true) } : {}),
       benignExit: entry.process.benignExit(entry.classifyExit)
     });
+    this.notifyProcessChange();
     while (this.completed.size > MAX_COMPLETED_EXEC_RESULTS) this.releaseProcessId(this.completed.keys().next().value!);
   }
 
   async execCommand(request: ExecCommandRequest): Promise<ExecCommandToolOutput> {
     let process: UnifiedExecProcess;
+    let start: number, wallStart: number, processStartedAlive: boolean, incarnation: number;
     try {
+      if (this.shuttingDown) throw UnifiedExecError.processFailed('Execution is shutting down. No process was started.');
       this.ensureProcessCapacity(request.processId);
     } catch (error) {
       this.releaseProcessId(request.processId);
       throw error;
     }
+    let finishLaunch!: () => void;
+    const pendingLaunch = new Promise<void>(resolve => { finishLaunch = resolve; });
+    this.pendingLaunches.add(pendingLaunch);
     try {
-      // `UnifiedExecRuntime::run` prefixes every PowerShell script before it reaches the
-      // process launcher so pipe-mode output is UTF-8 just like PTY output.
-      const command =
-        request.shellType === 'powershell' ? prefixPowershellScriptWithUtf8(request.command) : request.command;
-      process = await UnifiedExecProcess.spawn({
-        batchMarker: request.batchMarker,
-        command,
-        shellType: request.shellType,
-        cwd: request.cwd,
-        env: request.env,
-        tty: request.tty
-      });
-    } catch (error) {
-      this.releaseProcessId(request.processId);
-      throw error instanceof UnifiedExecError
-        ? error
-        : UnifiedExecError.createProcess(error instanceof Error ? error.message : String(error));
-    }
+      try {
+        // `UnifiedExecRuntime::run` prefixes every PowerShell script before it reaches the
+        // process launcher so pipe-mode output is UTF-8 just like PTY output.
+        const command =
+          request.shellType === 'powershell' ? prefixPowershellScriptWithUtf8(request.command) : request.command;
+        process = await UnifiedExecProcess.spawn({
+          batchMarker: request.batchMarker,
+          command,
+          shellType: request.shellType,
+          cwd: request.cwd,
+          env: request.env,
+          tty: request.tty
+        });
+      } catch (error) {
+        this.releaseProcessId(request.processId);
+        throw error instanceof UnifiedExecError
+          ? error
+          : UnifiedExecError.createProcess(error instanceof Error ? error.message : String(error));
+      }
 
-    const start = Date.now();
-    const wallStart = performance.now();
-    // Stored before the yield wait, so interrupting the call cannot drop the session.
-    const processStartedAlive = !process.hasExited() && process.exitCode() === null;
-    if (processStartedAlive) {
-      this.processes.set(request.processId, {
-        process,
-        processId: request.processId,
-        cwd: request.displayCwd,
-        hookCommand: request.hookCommand,
-        tty: request.tty,
-        initialExecCommandActive: true,
-        classifyExit: request.classifyExit, batchMarker: request.batchMarker
-      });
-    }
+      if (this.shuttingDown) {
+        await process.terminate(); this.releaseProcessId(request.processId);
+        throw UnifiedExecError.processFailed('The accepted process was stopped during shutdown. Inspect its work before repeating it.');
+      }
+      start = Date.now();
+      incarnation = this.nextProcessIncarnation++;
+      wallStart = performance.now();
+      // Stored before the yield wait, so interrupting the call cannot drop the session.
+      processStartedAlive = !process.hasExited() && process.exitCode() === null;
+      if (processStartedAlive) {
+        this.processes.set(request.processId, {
+          process,
+          processId: request.processId, incarnation, startedAt: start, permissionRoots: request.permissionRoots,
+          cwd: request.displayCwd,
+          hookCommand: request.hookCommand,
+          tty: request.tty,
+          initialExecCommandActive: true,
+          classifyExit: request.classifyExit, batchMarker: request.batchMarker
+        });
+        void process.completion.then(() => this.notifyProcessChange(), () => this.notifyProcessChange());
+      }
+
+    } finally { this.pendingLaunches.delete(pendingLaunch); finishLaunch(); }
 
     const deadline = start + clampYieldTime(request.yieldTimeMs);
     const collected = await collectOutputUntilDeadline(process, deadline);
@@ -840,8 +905,8 @@ export class UnifiedExecProcessManager {
         throw UnifiedExecError.unknownProcessId(request.processId);
       }
     } else {
-      this.retainCompleted({ process, processId: request.processId, cwd: request.displayCwd,
-        hookCommand: request.hookCommand, tty: request.tty, initialExecCommandActive: false,
+      this.retainCompleted({ process, processId: request.processId, cwd: request.displayCwd, permissionRoots: request.permissionRoots,
+        hookCommand: request.hookCommand, tty: request.tty, startedAt: start, incarnation, initialExecCommandActive: false,
         classifyExit: request.classifyExit, batchMarker: request.batchMarker });
       responseProcessId = null;
       exitCode = process.exitCode();
@@ -849,13 +914,7 @@ export class UnifiedExecProcessManager {
 
     const response = {
       ...(responseProcessId === null ? { completedSessionId: request.processId } : {
-        completion: process.completion.then(async completion => {
-          if (!process.outputClosed) {
-            const closed = process.outputClosedNotify.notified();
-            try { await raceWithTimeout([closed], POST_EXIT_CLOSE_WAIT_CAP_MS); } finally { closed.dispose(); }
-          }
-          return { ...completion, benignExit: process.benignExit(request.classifyExit) };
-        })
+        completion: process.completionResult(request.classifyExit)
       }),
       benignExit: process.benignExit(request.classifyExit),
       chunkId,
@@ -1008,11 +1067,27 @@ export class UnifiedExecProcessManager {
       .sort((left, right) => left.processId - right.processId)
       .map((entry) => ({
         processId: entry.processId,
+        incarnation: entry.incarnation,
         command: entry.hookCommand,
         cwd: entry.cwd,
         pid: entry.process.pid,
-        tty: entry.tty
+        tty: entry.tty,
+        startedAt: entry.startedAt
       }));
+  }
+
+  /** 执行服务只读取真实进程的结束事件，不读取输出，也不建立第二份进程状态。 */
+  completionFor(processId: number, signal?: AbortSignal): Promise<ProcessCompletion> | null {
+    const entry = this.processes.get(processId);
+    if (entry) return entry.process.completionResult(entry.classifyExit, signal);
+    return this.completed.get(processId)?.completion ?? null;
+  }
+
+  processIncarnation(processId: number): number | null {
+    return this.processes.get(processId)?.incarnation ?? this.completed.get(processId)?.incarnation ?? null;
+  }
+  processPermissionRoots(processId: number): readonly string[] | null {
+    return this.processes.get(processId)?.permissionRoots ?? this.completed.get(processId)?.permissionRoots ?? null;
   }
 
   /** Non-destructive obligation view for a caller-owned set of retained sessions. */
@@ -1077,6 +1152,7 @@ export class UnifiedExecProcessManager {
       if (!entry) continue;
       const release = await entry.process.interactionLock.lock();
       try {
+        if (publication.failed) return null;
         if (this.processes.get(processId) !== entry || entry.initialExecCommandActive) continue;
         const output = entry.process.completedOutput();
         if (output === null) continue;
@@ -1096,9 +1172,13 @@ export class UnifiedExecProcessManager {
     return null;
   }
 
-  async terminateProcess(processId: number): Promise<boolean> {
+  async terminateProcess(processId: number, expectedIncarnation?: number): Promise<boolean> {
     const entry = this.processes.get(processId);
     if (!entry) return false;
+    // Renderer actions carry the exact live incarnation they displayed. Refuse a stale row after
+    // natural exit, and refuse ABA reuse of the same numeric id without consuming retained output.
+    if (expectedIncarnation !== undefined &&
+        (entry.incarnation !== expectedIncarnation || entry.process.hasExited())) return false;
     if (!entry.process.hasExited()) await entry.process.terminate();
     const current = this.processes.get(processId);
     if (current && current.process === entry.process) {
@@ -1110,6 +1190,14 @@ export class UnifiedExecProcessManager {
       this.releaseProcessId(processId);
     }
     return true;
+  }
+
+  /** 关闭新进程准入，并等待所有在途启动完成登记或取消，之后清理真实进程。 */
+  shutdown(): Promise<void> {
+    if (this.shutdownPromise) return this.shutdownPromise;
+    this.shuttingDown = true;
+    this.shutdownPromise = Promise.allSettled([...this.pendingLaunches]).then(() => this.terminateAllProcesses());
+    return this.shutdownPromise;
   }
 
   async terminateAllProcesses(): Promise<void> {

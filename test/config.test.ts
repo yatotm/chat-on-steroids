@@ -10,7 +10,7 @@ import {
   saveConfig,
   updateConfig
 } from '../src/main/config.js';
-import { DESKTOP_CAPABILITIES, type Capability } from '../src/shared/types.js';
+import { DESKTOP_CAPABILITIES, type Capability, type Config } from '../src/shared/types.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
 
 let dir: string;
@@ -184,6 +184,14 @@ describe('settings migration', () => {
     expect((await loadConfig()).ui.autoRefreshPlugins).toBe(false);
     await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoRefreshPlugins: true } });
     expect((await loadConfig()).ui.autoRefreshPlugins).toBe(true);
+  });
+  it('defaults automatic Skill selection off for fresh and legacy settings while preserving explicit opt-in', async () => {
+    expect(defaultConfig().ui.autoSelectSkills).toBe(false);
+    const legacy = defaultConfig(); delete legacy.ui.autoSelectSkills;
+    await saveConfig(legacy);
+    expect((await loadConfig()).ui.autoSelectSkills).toBe(false);
+    await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoSelectSkills: true } });
+    expect((await loadConfig()).ui.autoSelectSkills).toBe(true);
   });
   it('defaults Goal and Loop to ChatGPT while preserving explicit backend choices', async () => {
     expect(defaultConfig().goal).toMatchObject({ backend: 'chatgpt', loopBackend: 'chatgpt' });
@@ -515,6 +523,20 @@ describe('shipped defaults', () => {
 
   it('records sessions from first launch', () => {
     expect(defaultConfig().sessions).toMatchObject({ record: true, retainDays: 0 });
+  });
+
+  it('keeps Chrome as the default browser on a first launch and moves no existing config', async () => {
+    // The built-in browser is opt-in, for new installs too.
+    await fs.rm(path.join(dir, 'config.json'), { force: true });
+    expect((await loadConfig()).ui.chatBrowser).toBe('chrome');
+    // Written before the choice existed: it reads as the Chrome it always used.
+    const older = defaultConfig() as Config;
+    delete (older.ui as Partial<Config['ui']>).chatBrowser;
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(older), 'utf8');
+    expect((await loadConfig()).ui.chatBrowser).toBe('chrome');
+    // Nor does a damaged file switch anyone's browser.
+    await fs.writeFile(path.join(dir, 'config.json'), '{"roots":', 'utf8');
+    expect((await loadConfig()).ui.chatBrowser).toBe('chrome');
   });
 
   it('loads a genuinely missing config with every portable Core capability enabled', async () => {

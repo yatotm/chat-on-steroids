@@ -61,6 +61,18 @@ it('pages large Unicode results without loss and gives an explicit poll only the
   expect(await manager.offerCompletedOutput(owned, publication(), 100)).toBeNull();
 });
 
+it('does not reserve output when its publication fails while waiting for process custody', async () => {
+  const { manager, owned, id } = await child('retained-behind-lock');
+  const entry = (manager as any).processes.get(id);
+  const release = await entry.process.interactionLock.lock();
+  const failed = publication();
+  const pending = manager.offerCompletedOutput(owned, failed, 100);
+  failed.failed = true;
+  release();
+  expect(await pending).toBeNull();
+  expect(await manager.offerCompletedOutput(owned, publication(), 100)).toMatchObject({ output: 'retained-behind-lock' });
+});
+
 it('delivers every bounded page and an empty successful result before retirement', async () => {
   for (const output of ['🙂'.repeat(2_000), '']) {
     const { manager, owned, id } = await child(output, 0);

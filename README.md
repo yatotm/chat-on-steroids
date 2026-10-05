@@ -1,4 +1,4 @@
-> **yatotm fork: remote development.** Keep CoS and Chrome on your Mac and run project tools on a Linux development server through CodexPro. [Setup guide / 配置说明](docs/remote-development.md).
+> **yatotm fork: remote development.** Keep CoS and Chrome on your Mac. One Core connector routes project tools to the independent CoS execution service on Linux; CodexPro is not required. [Setup guide / 配置说明](docs/remote-development.md).
 
 <p align="center"><img src="docs/images/readme-hero.svg?v=2" width="960" alt="Turn ChatGPT into Codex-style local coding. Chat On Steroids: Your files. Your terminal. Your ChatGPT plan." /></p>
 

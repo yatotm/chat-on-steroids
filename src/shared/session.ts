@@ -503,6 +503,8 @@ export type SessionEvent =
       messageId: string;
       from: string;
       to: string;
+      /** Prime-family reply address for a cross-family message. */
+      fromRunId?: string;
       message: StoredText;
       delivery: 'sent' | 'delivered';
     })
@@ -620,6 +622,11 @@ export interface SessionSummary {
   nativeQuestion?: { messageId: string; origin: number } | null;
   /** Durable naming authority; absent only on legacy recordings. */
   titleSource?: 'fallback' | 'provider' | 'manual';
+  /**
+   * While the user's own name is shown (`titleSource: 'manual'`), the title the app would show
+   * otherwise, kept current, so clearing the name brings back ChatGPT's present title (#1107).
+   */
+  autoTitle?: { title: string; source: 'fallback' | 'provider' };
   /** Latest proven native picker selection; scoped to its frontend, never worker creation intent. */
   selectedModel?: { conversationId: string; model: string; observedAt: number; reasoningEffort?: ReasoningEffort };
   /** Explicit local project; durable across frontend conversation replacement. */
@@ -656,6 +663,13 @@ export interface SessionSummary {
   toolCalls: number;
   /** Start time of the newest exact attributed tool call, independent of later page noise. */
   lastToolCallAt: number | null;
+  /**
+   * Compact projection of the newest recorded tool action.
+   *
+   * The full tool row remains in session history. This exists so overview surfaces can show
+   * useful worker activity without loading each worker transcript.
+   */
+  lastToolActivity?: Pick<ActivitySummary, 'kind' | 'title'> | null;
   /** Observation time of the newest stable final assistant message. */
   lastAssistantFinalAt?: number | null;
   /**
@@ -760,7 +774,25 @@ export interface SessionChange {
   allTranscripts?: true;
 }
 
+export interface HandoffProvenance {
+  /** ChatGPT frontend that authored the brief. */
+  sourceConversationId: string | null;
+  /** One-based position of that frontend in the durable session lineage, when known. */
+  sourceGeneration: number | null;
+  /** Exact source turn pinned by the continuation transaction, when one existed. */
+  sourceTurnId: string | null;
+  /**
+   * Non-authority fingerprint of the continuation transaction.
+   *
+   * This is derived from the one-time continuation token. Provenance stores the fingerprint
+   * instead of the raw token because handoffs are readable through ordinary session IPC.
+   */
+  continuationId: string | null;
+}
+
 export interface Handoff {
+  /** New writes are v1. Absent means a legacy handoff written before provenance existed. */
+  version?: 1;
   id: string;
   sessionId: string;
   createdAt: number;
@@ -771,6 +803,8 @@ export interface Handoff {
   sourceTokens: number;
   /** Set when the model stopped early or the pack dropped material. */
   notes: string[];
+  /** Immutable source identity for new versioned handoffs. */
+  provenance?: HandoffProvenance;
 }
 
 // ---------------------------------------------------------------- agents
@@ -983,6 +1017,14 @@ export interface AgentMessage {
   id: string;
   from: string;
   to: string;
+  /**
+   * Prime-family address of the sender when a message crosses between existing prime families.
+   *
+   * Agent ids are only unique inside one family, so a bare `from: "prime"` cannot be replied
+   * to across that boundary. This is routing metadata only; it grants no status or worker access
+   * to the receiving prime.
+   */
+  fromRunId?: string;
   time: number;
   text: string;
   /** When it was last written into a tool result. Re-offered until acknowledged. */
@@ -1169,4 +1211,23 @@ export function tokenPressure(estimated: number, advisory: number, limit: number
     limit,
     level: estimated >= limit ? 'huge' : estimated >= advisory ? 'large' : 'ok'
   };
+}
+
+/** One chat found by `sessions:search` (#1107). */
+export interface SessionSearchResult {
+  id: string;
+  title: string;
+  projectId: string | null;
+  /** Where the query's words are in `title`, as ranges into it; absent when none are. */
+  titleMatches?: Array<[number, number]>;
+  /** A line of the chat around the first match, with match ranges into `text`; absent for a title match. */
+  snippet?: { text: string; matches: Array<[number, number]> };
+}
+export interface SessionSearchReply {
+  results: SessionSearchResult[];
+  /** Chats whose words are indexed so far, out of all chats; equal once indexing is done. */
+  indexed: number;
+  total: number;
+  /** More chats match than `results` holds. */
+  limited?: true;
 }

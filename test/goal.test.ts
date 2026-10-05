@@ -900,6 +900,65 @@ describe('the reply', () => {
     expect(view.reply).toBe('');
   });
 
+  it('keeps "the goal is met" as the run outcome for the app window after the page acts on it', async () => {
+    const sessionId = await seed('c-met');
+    globalThis.fetch = (async () => stream([delta('NO_REPLY'), 'data: [DONE]\n'])) as never;
+    goal.startGoalDraft({ sessionId, conversationId: 'c-met', turnId: 'g-1' });
+    const view = await settled('c-met');
+    expect(goal.goalOutcomeFor('c-met'), 'nothing to report before the page acts on it').toBeNull();
+    expect(goal.ackGoalDraft('c-met', view.token)).toBe(true);
+    // The page is done with it, so its own view goes quiet...
+    expect(goal.goalViewFor('c-met')).toBeNull();
+    // ...but the window still learns that this run ended with the goal met.
+    expect(goal.goalOutcomeFor('c-met')).toMatchObject({ stage: 'no-reply', turnId: 'g-1', reply: '' });
+  });
+
+  /**
+   * "The goal is met" needs nothing typed, so it must not wait for a page to come and act on it.
+   * Seen live on Windows (2026-10-05): the chat's tab closed while the model was deciding, its
+   * NO_REPLY was never acknowledged, the app restarted and lost the in-memory draft, and the
+   * turn stayed owed for the ledger's twelve hours, the Goal row spinning "Answer settling".
+   */
+  it('settles the owed turn as soon as the model says the goal is met, even if no page acknowledges it', async () => {
+    const sessionId = await seed('c-met-unacked');
+    await goal.acceptGoalReplyNow({
+      conversationId: 'c-met-unacked', sessionId, replyId: 'assistant-met-unacked', turnId: 'g-met', eventSeq: 3, blocked: false
+    });
+    globalThis.fetch = (async () => stream([delta('NO_REPLY'), 'data: [DONE]\n'])) as never;
+    goal.startGoalDraft({ sessionId, conversationId: 'c-met-unacked', turnId: 'g-met' });
+    expect((await settled('c-met-unacked')).stage).toBe('no-reply');
+
+    expect(goal.goalPendingReplyFor('c-met-unacked')).toBeNull();
+    expect(goal.pendingGoalReplies().map(owed => owed.conversationId)).not.toContain('c-met-unacked');
+    const saved = goal.snapshotGoalReplies();
+    expect(saved.replies).toContainEqual(expect.objectContaining({ replyId: 'assistant-met-unacked', state: 'handled' }));
+    goal.resetGoalStateForTests();
+    goal.restoreGoalReplies(saved);
+    expect(goal.goalPendingReplyFor('c-met-unacked'), 'still settled after a restart').toBeNull();
+  });
+
+  it('keeps the turn owed while a continuation waits to be typed', async () => {
+    const sessionId = await seed('c-typed-owed');
+    await goal.acceptGoalReplyNow({
+      conversationId: 'c-typed-owed', sessionId, replyId: 'assistant-typed-owed', turnId: 'g-typed', eventSeq: 3, blocked: false
+    });
+    globalThis.fetch = (async () => decision('continue', 'what about the tests')) as never;
+    goal.startGoalDraft({ sessionId, conversationId: 'c-typed-owed', turnId: 'g-typed' });
+    expect((await settled('c-typed-owed')).stage).toBe('ready');
+    // Only the page can type it; until it says it did, the turn is still owed.
+    expect(goal.goalPendingReplyFor('c-typed-owed')).toMatchObject({ turnId: 'g-typed' });
+  });
+
+  it('reports no outcome for a typed continuation the page has acted on', async () => {
+    const sessionId = await seed('c-typed');
+    globalThis.fetch = (async () => decision('continue', 'what about the tests')) as never;
+    goal.startGoalDraft({ sessionId, conversationId: 'c-typed', turnId: 'g-1' });
+    const view = await settled('c-typed');
+    expect(view.stage).toBe('ready');
+    expect(goal.ackGoalDraft('c-typed', view.token)).toBe(true);
+    expect(goal.goalOutcomeFor('c-typed')).toBeNull();
+  });
+
   /** Protocol words are never safe composer prose; ambiguity stops instead of self-prompting. */
   it('fails closed when legacy output wraps NO_REPLY in scratchpad prose', async () => {
     const sessionId = await seed('c-mentions');

@@ -1,4 +1,5 @@
 import { registerWorkspaceTerminalIpc } from './workspace-terminal-ipc.js';
+import { CONNECTOR_SUFFIX_MAX, CONNECTOR_SUFFIX_PATTERN } from '../shared/connector-names.js';
 import { setStopNoticeTranslations } from './stuck-notice.js';
 import { setMainTextTranslations } from './main-texts.js';
 import { applyLoginStartup, supportsLoginStartup } from './window-lifecycle.js';
@@ -62,16 +63,25 @@ import { DEFAULT_HANDOFF_LENGTH, HANDOFF_LENGTHS, MAX_HANDOFF_PROMPT_CHARS } fro
 import { applySettings, connect, disconnect, getStatus, onStatusChange } from './connection.js';
 import { effectiveCapabilities, getConfig, updateConfig, MAX_MCP_INSTRUCTIONS_CHARS, browserBridgePortSchema } from './config.js';
 import { UI_LANGUAGES } from '../shared/ui-language.js';
+import { PROJECT_COLORS } from '../shared/projects.js';
 import { bridgePortSelection } from './bridge-ports.js';
 import { clearAllGoalSwitches, draftTaskPlan, listGoalModels, MODEL_PAGE_SIZE, retireGoalDrafts, goalBackendFor, goalSwitchFor, setGoalSwitchNow, setGoalReplyActiveNow, setGoalObjectiveNow } from './goal.js';
 import { forgetExposedSurface } from './mcp/server.js';
 import { runningToolActivity } from './mcp/call-context.js';
+import { onBackgroundExecChange, runningExecProcesses, stopExecProcess } from './codex/ownership.js';
 import { livePreview } from './live-preview.js';
 import { keychainNoticeReady } from './keychain-notice.js';
 import { runDiagnostics } from './diagnostics.js';
+import { readRecentLog, renderDiagnosticsReport, saveDiagnosticsReport, systemFacts } from './diagnostics-report.js';
+import { listSessions } from './session/store.js';
 import { formatLogAsJson, formatLogForClipboard, getLog, logInfo, onLog } from './logger.js';
 import { RESERVED_ROOT_NAMES, uniqueRootName, validateNewRoot, SandboxError, resolvePath } from './sandbox.js';
-import { addProject, addProjectFolder, addRemoteProject, getProject, getSessionProject, hasRemoteProjects, listProjects, projectWorkspace, removeProject, removeProjectFolder, sessionProjectBinding } from './projects.js';
+import { addProject, addRemoteProject, addManagedRemoteProject, migrateRemoteProjects, getProject, getSessionProject, hasRemoteProjects, listProjects, projectWorkspace, removeProject, setProjectColor, sessionProjectBinding } from './projects.js';
+import { connectRemoteProjectSchema } from '../shared/remote-execution.js';
+import { isCoreRemote, isManagedRemote } from '../shared/projects.js';
+import { managedRemoteProjectSchema, saveRemoteHostSchema } from '../shared/remote-hosts.js';
+import { getRemoteHost, listRemoteHosts, onRemoteHostsChanged, saveRemoteHost, refreshRemoteHost, reconnectRemoteHost, disconnectRemoteHost } from './remote-hosts.js';
+import { listSshHosts } from './ssh-config.js';
 import { createProjectEntry, listProjectDirectory, previewProjectFile, projectFileTarget, renameProjectEntry, revalidateProjectFileTarget, saveProjectTextFile } from './project-files.js';
 import { ProjectFileWatchSet } from './project-file-watcher.js';
 import { ProjectGitWatchSet, readProjectGitDiff, readProjectGitSnapshot } from './project-git.js';
@@ -86,9 +96,11 @@ import {
   companionDiagnostics,
   sessionInputActivity,
   recoveryInputAllowed,
-  sessionControlsFor, stopSessionTurn, setSessionAutomation, setSessionObjective, compactSession, cancelSessionCompaction,
+  sessionControlsFor, cancelAssistantRecovery, stopSessionTurn, setSessionAutomation, setSessionObjective, compactSession, cancelSessionCompaction,
   cancelWorkerCommands,
   chatUrl,
+  revealChatInBrowser,
+  pendingCommands,
   onBridgeChange,
   startBridge,
   stopBridge,
@@ -100,13 +112,16 @@ import { extensionDownloadUrl } from './version.js';
 import {
   deleteSession,
   clearImageStorage,
+  clearSessionName,
+  renameSession,
   getSession,
   getImageStorage,
   readHandoff,
   readToolEditReview,
   withSessionMutationFence
 } from './session/store.js';
-import { forgetSession, onSessionChange } from './session/recorder.js';
+import { forgetSession, notifyChanged, onSessionChange } from './session/recorder.js';
+import { searchSessions } from './session/search.js';
 import { readSessionEvents, readSessionList, sessionListCursorSchema } from './session/read-model.js';
 import { exportSessionMarkdown } from './session/markdown-export.js';
 import { blockedChatIds, setChatsBlocked } from './session/blocked-chats.js';
@@ -127,6 +142,10 @@ import {
   MAX_COMMAND_ALLOWLIST_RULE_CHARS,
   validateCommandAllowlistRule
 } from '../shared/command-allowlist.js';
+import { cosBrowserSignedIn, onCosBrowserSignInChange } from './cos-browser/sign-in.js';
+import { loadCosBrowser, syncCosBrowser } from './cos-browser/selection.js';
+import { onConnectorProofChange } from './connector-proof.js';
+import { opensInCosBrowser } from '../shared/cos-browser-sites.js';
 import { openInPreferredBrowser } from './browser.js';
 import { manualDownloadUrl, markInstallOnQuit, onUpdateChange, updateStatus } from './update.js';
 import {
@@ -149,6 +168,10 @@ const capabilityPatch = z.object(
 );
 
 const settingsPatch = z.object({
+  // This computer's connector name suffix; see shared/connector-names.ts. Spaces are collapsed.
+  connectorSuffix: z.string().max(64).transform(value => value.trim().replace(/\s+/g, ' '))
+    .refine(value => value.length <= CONNECTOR_SUFFIX_MAX && CONNECTOR_SUFFIX_PATTERN.test(value),
+      'Use up to 32 letters, digits, spaces, dots, dashes or underscores').optional(),
   capabilities: capabilityPatch,
   readOnly: z.boolean(),
   commandAllowlist: z.object({
@@ -188,6 +211,7 @@ const settingsPatch = z.object({
     mentionCore: z.boolean().optional(),
     language: z.enum(UI_LANGUAGES).optional(),
     browserPreferences: z.object({ overwrite: z.boolean(), durations: z.boolean() }).strict().optional(),
+    cosBrowserTrayHint: z.boolean().optional(),
     finishTool: z.boolean().optional(),
     planBackend: z.enum(['chatgpt', 'api']).optional(),
     finishAction: z.enum(['notify', 'goal']).optional(),
@@ -196,6 +220,7 @@ const settingsPatch = z.object({
     browserBridgePort: browserBridgePortSchema.optional(),
     browserOnly: z.boolean().optional(),
     autoRefreshPlugins: z.boolean().optional(),
+    autoSelectSkills: z.boolean().optional(),
     tabsToKeepOpen: z.number().int().min(1).max(50).optional(),
     minimizeToTray: z.boolean(),
     autoConnect: z.boolean(),
@@ -313,6 +338,9 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
     controlApi = { enabled, allowActions: enabled && allowActions === true };
   }
   return {
+    ...(wanted.connectorSuffix === undefined ? {} : {
+      connectorSuffix: pick(current.connectorSuffix ?? '', base.connectorSuffix ?? '', wanted.connectorSuffix)
+    }),
     mcp: wanted.mcp ? { instructions: pick(current.mcp.instructions, base.mcp?.instructions ?? '', wanted.mcp.instructions) } : current.mcp,
     controlApi,
     capabilities,
@@ -348,6 +376,7 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
       // Not part of the settings form: reported by the window and the extension, carried through.
       language: current.ui.language,
       browserPreferences: current.ui.browserPreferences,
+      cosBrowserTrayHint: current.ui.cosBrowserTrayHint,
       finishTool: pick(current.ui.finishTool, base.ui.finishTool, wanted.ui.finishTool),
       planBackend: pick(current.ui.planBackend, base.ui.planBackend, wanted.ui.planBackend),
       finishAction: pick(current.ui.finishAction, base.ui.finishAction, wanted.ui.finishAction),
@@ -357,6 +386,7 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
         : pick(current.ui.browserBridgePort ?? 'auto', base.ui.browserBridgePort ?? 'auto', wanted.ui.browserBridgePort),
       browserOnly: pick(current.ui.browserOnly, base.ui.browserOnly, wanted.ui.browserOnly),
       autoRefreshPlugins: pick(current.ui.autoRefreshPlugins, base.ui.autoRefreshPlugins, wanted.ui.autoRefreshPlugins),
+      autoSelectSkills: pick(current.ui.autoSelectSkills, base.ui.autoSelectSkills, wanted.ui.autoSelectSkills),
       tabsToKeepOpen: pick(current.ui.tabsToKeepOpen, base.ui.tabsToKeepOpen, wanted.ui.tabsToKeepOpen),
       minimizeToTray: pick(current.ui.minimizeToTray, base.ui.minimizeToTray, wanted.ui.minimizeToTray),
       autoConnect: pick(current.ui.autoConnect, base.ui.autoConnect, wanted.ui.autoConnect),
@@ -455,6 +485,12 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
 }
 
 const sessionIdArg = z.object({ id: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i) });
+/** A chat's own name in the app (#1107): one line, no control characters; null or blank clears it. */
+const sessionNameArg = sessionIdArg.extend({ title: z.string().max(2000).nullable() });
+export function cleanSessionName(title: string | null): string | null {
+  const clean = (title ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120).trim();
+  return clean || null;
+}
 const agentIdArg = z.string().min(1).max(64).regex(/^[0-9a-z-]+$/i);
 
 const renameRoot = z.object({
@@ -478,6 +514,7 @@ async function buildState(): Promise<AppState> {
     config,
     // 项目目录损坏时仍允许打开设置；执行入口继续严格校验。
     hasRemoteProjects: await hasRemoteProjects().catch(() => false),
+    remoteHosts: await listRemoteHosts().catch(() => []),
     status: getStatus(),
     connectorSchemas: Object.fromEntries(
       pluginRefreshPublications().map(({ surface, schemaId }) => [surface, schemaId])
@@ -491,6 +528,7 @@ async function buildState(): Promise<AppState> {
     resolvedBinary: resolvedBinary(config),
     bundledTunnelVersion: bundledVersion(),
     bridge: await bridgeStatus(),
+    cosBrowserSignedIn: cosBrowserSignedIn(),
     update: updateStatus(),
     desktopAccess: getMacOSDesktopAccess()
   };
@@ -643,6 +681,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     // Startup and settings saves use one eligibility rule.
     if (browserExtensionRequired(next)) await startBridge();
     else await stopBridge();
+    if (before.ui.chatBrowser !== next.ui.chatBrowser) await syncCosBrowser();
     if (before.capabilities.screen !== next.capabilities.screen || before.capabilities.control !== next.capabilities.control || before.readOnly !== next.readOnly) wakeBrowserWork('browser-control');
     // Permissions and the second tunnel id both decide whether the optional Desktop
     // connector should be published. Without this, enabling desktop access or pasting its
@@ -801,7 +840,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
         : scope.projectId ? projectWorkspace(scope.projectId) : null;
     };
     const before = await folder();
-    const library = await listSkillLibrary({ projectPath: before?.real ?? null });
+    const library = await listSkillLibrary({ projectPath: before?.real ?? null, refreshCodexPlugins: true });
     if ((await folder())?.real !== before?.real) throw new Error('The project changed while Skills were loading');
     return library;
   });
@@ -812,10 +851,32 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     return project;
   });
   handle('projects:addRemote', async payload => {
-    const { pluginId, path: directory } = z.object({ pluginId: z.string().uuid(), path: z.string().min(2).max(4096) }).strict().parse(payload);
-    const project = await addRemoteProject(pluginId, directory);
+    const project = await addRemoteProject(connectRemoteProjectSchema.parse(payload));
     push('session:changed');
     push('state:changed', await buildState());
+    return project;
+  });
+  handle('ssh:hosts', async () => listSshHosts());
+  handle('remoteHosts:list', async () => listRemoteHosts());
+  handle('remoteHosts:save', async payload => {
+    const input = saveRemoteHostSchema.parse(payload);
+    const source = input.reuseProjectId ? await getProject(input.reuseProjectId) : null;
+    if (input.reuseProjectId && (!source?.remote || isManagedRemote(source.remote)))
+      throw new Error('Choose an existing remote project connection to migrate.');
+    const reused = source?.remote && isCoreRemote(source.remote) && !isManagedRemote(source.remote) ? source.remote : undefined;
+    if (input.id && reused && (await getRemoteHost(input.id)).serverId !== reused.serverId)
+      throw new Error('The selected connection belongs to a different execution service.');
+    const host = await saveRemoteHost(input, reused);
+    if (source) await migrateRemoteProjects(host.id, source);
+    push('session:changed'); push('state:changed', await buildState());
+    return host;
+  });
+  handle('remoteHosts:refresh', async payload => refreshRemoteHost(z.object({ id: z.string().uuid() }).strict().parse(payload).id));
+  handle('remoteHosts:reconnect', async payload => reconnectRemoteHost(z.object({ id: z.string().uuid() }).strict().parse(payload).id));
+  handle('remoteHosts:disconnect', async payload => disconnectRemoteHost(z.object({ id: z.string().uuid() }).strict().parse(payload).id));
+  handle('projects:addManagedRemote', async payload => {
+    const project = await addManagedRemoteProject(managedRemoteProjectSchema.parse(payload));
+    push('session:changed'); push('state:changed', await buildState());
     return project;
   });
   handle('projects:add', async () => {
@@ -834,29 +895,9 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     push('session:changed');
     return project;
   });
-  handle('projects:addFolder', async payload => {
-    const { id } = z.object({ id: z.string().uuid() }).strict().parse(payload);
-    const owner = await getProject(id);
-    if (!owner) throw new Error('Project not found');
-    if (owner.remote) throw new Error('Remote projects cannot contain local folders');
-    const window = getWindow();
-    if (!window) throw new Error('No window');
-    const result = await dialog.showOpenDialog(window, { title: 'Choose an additional project folder', properties: ['openDirectory'] });
-    if (result.canceled || !result.filePaths[0]) return null;
-    const folder = result.filePaths[0];
-    try { await resolvePath(getConfig().roots, folder); }
-    catch (error) {
-      if (!(error instanceof SandboxError)) throw error;
-      const state = await approveRoot(folder);
-      push('state:changed', state);
-    }
-    const project = await addProjectFolder(id, folder);
-    push('session:changed');
-    return project;
-  });
-  handle('projects:removeFolder', async payload => {
-    const { id, path: folder } = z.object({ id: z.string().uuid(), path: z.string().min(1).max(32768) }).strict().parse(payload);
-    const project = await removeProjectFolder(id, folder);
+  handle('projects:color', async payload => {
+    const { id, color } = z.object({ id: z.string().uuid(), color: z.enum(PROJECT_COLORS).nullable() }).strict().parse(payload);
+    const project = await setProjectColor(id, color);
     push('session:changed');
     return project;
   });
@@ -1065,6 +1106,29 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   });
 
   handle('diagnostics:run', async () => runDiagnostics());
+  // "Save diagnostics report": one plain-text file for a bug report, personal details removed
+  // (see diagnostics-report.ts). Revealed after saving so the user reads what they would share.
+  handle('diagnostics:saveReport', async () => {
+    const selfTest = await Promise.race([
+      runDiagnostics().catch(() => null),
+      new Promise<null>(resolve => setTimeout(() => resolve(null), 10_000).unref())
+    ]);
+    const workers = swarmState().agents;
+    const text = renderDiagnosticsReport({
+      app: systemFacts(app), home: app.getPath('home'),
+      bridge: await bridgeStatus(), extension: await companionDiagnostics().catch(() => null),
+      selfTest: selfTest && { summary: selfTest.summary, checks: selfTest.checks.map(({ name, status, detail }) => ({ name, status, detail })) },
+      commands: pendingCommands().map(({ id, what, lastError }) => ({ command: id, what, lastError })),
+      workers: workers.map(({ id, role, state, model, reasoningEffort, createdAt, activatedAt, finishedAt, pending, delivered, conversationId, revivable }) =>
+        ({ worker: id, role, state, model, reasoningEffort, createdAt, activatedAt, finishedAt, pending, delivered, conversationId, revivable })),
+      sessions: await listSessions().catch(() => []),
+      projects: await listProjects().catch(() => []),
+      workerTexts: workers.flatMap(worker => [worker.task ?? '', worker.label ?? '', worker.result ?? '']),
+      log: await readRecentLog(),
+      now: Date.now()
+    });
+    return saveDiagnosticsReport(text, getWindow());
+  });
   handle('desktop:requestAccessibility', async () => {
     await refreshMacOSDesktopAccess({ promptAccessibility: true });
     return buildState();
@@ -1112,9 +1176,40 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   });
 
   handle('link:open', async (payload) => {
-    const { url } = z.object({ url: z.string().max(8192) }).parse(payload);
+    const { url, external } = z.object({ url: z.string().max(8192), external: z.boolean().optional() }).parse(payload);
     if (!ALLOWED_LINKS.has(url) && !safeExternalLink(url)) throw new Error('That link is not allowed');
-    await shell.openExternal(url);
+    // Setup's ChatGPT and OpenAI pages open where the user is already signed in, unless the
+    // user asked for their own browser instead.
+    if (!external && getConfig().ui.chatBrowser === 'cos' && opensInCosBrowser(url)) await openInPreferredBrowser(url, { reveal: true });
+    else await shell.openExternal(url);
+    return true;
+  });
+
+  // Setup's "Open ChatGPT" for Chrome, Edge or Brave: the chosen browser, where the extension is.
+  handle('chatgpt:open', async () => {
+    await openInPreferredBrowser('https://chatgpt.com/', { reveal: true });
+    return true;
+  });
+
+  // Setup's button once ChatGPT is surely signed in: ChatGPT's own sign-out, where it runs. The
+  // status follows from that browser's own answer, as it does for any sign-out.
+  handle('chatgpt:signOut', async () => {
+    await openInPreferredBrowser('https://chatgpt.com/auth/logout', { reveal: true });
+    return true;
+  });
+
+  // Installation does not change the saved execution browser or load the CoS host.
+  handle('browser:setupOpen', async (payload) => {
+    const { browser, page } = z.object({ browser: z.enum(['chrome', 'edge', 'brave']), page: z.enum(['extensions', 'chatgpt']) }).strict().parse(payload);
+    const url = page === 'chatgpt' ? 'https://chatgpt.com/' : `${browser === 'edge' ? 'edge' : browser === 'brave' ? 'brave' : 'chrome'}://extensions/`;
+    await openInPreferredBrowser(url, { browser, reveal: true });
+    return true;
+  });
+
+  // Setup's first step: the CoS browser on screen, on ChatGPT's login when signed out.
+  handle('cosBrowser:show', async () => {
+    if (getConfig().ui.chatBrowser !== 'cos') throw new Error('The CoS browser is not the selected ChatGPT browser');
+    await (await loadCosBrowser()).showSignIn();
     return true;
   });
 
@@ -1197,6 +1292,8 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   handle('browser:preferences', async (payload) => requestBrowserPreferences(payload));
   handle('chatModels:request', async () => startChatModelDiscovery());
   handle('sessions:controls', async (payload) => sessionControlsFor(sessionIdArg.parse(payload).id));
+  // #1032: the user keeps this answer from being reloaded; false once the browser claimed it.
+  handle('sessions:cancelRecovery', async (payload) => cancelAssistantRecovery(sessionIdArg.parse(payload).id));
   handle('sessions:automation', async (payload) => {
     const { id, automation, afterTurn } = sessionIdArg.extend({ automation: z.enum(['off', 'goal', 'loop']), afterTurn: z.boolean().optional() }).parse(payload);
     return setSessionAutomation(id, automation, afterTurn);
@@ -1232,6 +1329,20 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     const { conversationIds } = z.object({ conversationIds: z.array(z.string().min(1).max(200)).max(16) }).parse(payload);
     return runningToolActivity(conversationIds);
   });
+  handle('sessions:runningProcesses', async (payload) => {
+    const { sessionId } = z.object({
+      sessionId: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i)
+    }).parse(payload);
+    return runningExecProcesses(sessionId);
+  });
+  handle('sessions:stopProcess', async (payload) => {
+    const { sessionId, processId, incarnation } = z.object({
+      sessionId: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i),
+      processId: z.number().int().min(1_000).max(99_999),
+      incarnation: z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+    }).parse(payload);
+    return stopExecProcess(sessionId, processId, incarnation);
+  });
   // The newest sentence a working chat shows before ChatGPT publishes it (#942).
   // The window armed its Keychain notice; the first Keychain read may start.
   handle('keychain:noticeReady', async () => keychainNoticeReady());
@@ -1263,7 +1374,9 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     if (!conversationId || !/^[0-9a-z-]{8,64}$/i.test(conversationId)) {
       throw new Error('This session has no valid ChatGPT conversation');
     }
-    await openInPreferredBrowser(chatUrl(conversationId));
+    // The extension's own browser first: the OS may pick another browser or account (#882).
+    // An explicit user action: only the CoS browser uses `reveal`, to bring its window forward.
+    if (!(await revealChatInBrowser(conversationId))) await openInPreferredBrowser(chatUrl(conversationId), { reveal: true });
     return true;
   });
 
@@ -1355,6 +1468,20 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     return trustedChatIds();
   });
 
+  // Search chats by title and by what was said in them (#1107).
+  handle('sessions:search', async (payload) => {
+    const { query } = z.object({ query: z.string().max(200) }).parse(payload);
+    return searchSessions(query);
+  });
+  handle('sessions:rename', async (payload) => {
+    const { id, title } = sessionNameArg.parse(payload);
+    if (!await getSession(id)) throw new Error('Session not found');
+    const name = cleanSessionName(title);
+    if (name) await renameSession(id, name, 'manual');
+    else await clearSessionName(id);
+    notifyChanged(id);
+    return true;
+  });
   handle('sessions:delete', async (payload) => {
     const { id } = sessionIdArg.parse(payload);
     if (deletingSessionIds.has(id)) throw new Error('This session is already being deleted');
@@ -1568,6 +1695,8 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   };
   onStatusChange(pushState);
   onBridgeChange(pushState);
+  onCosBrowserSignInChange(pushState);
+  onConnectorProofChange(pushState);
   registerPluginIpc(handle, getWindow, pushState);
   // Draft stages belong to session controls; state:changed only refreshes settings.
   onGoalChange(() => push('session:changed'));
@@ -1589,7 +1718,10 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     if (!await startBridge()) throw new Error('The browser bridge could not start');
     if (allowOpen) {
       await wakeBrowserUrl(`https://chatgpt.com/?cos-model-catalog=${nonce}`, true, true);
-      push('setup:toolApprovalNotice');
+      // The approval prompt it describes comes with ChatGPT's first Core tool call, which needs a Core
+      // tunnel. On a fresh install, discovery opened ChatGPT before any of that existed and the
+      // reminder read "One last step" at step 0 of 6; Setup's last card keeps it until then.
+      if (getConfig().tunnel.tunnelId.trim()) push('setup:toolApprovalNotice');
     }
   } });
   onUpdateChange(pushState);
@@ -1597,5 +1729,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   onLog((entry) => push('log:entry', entry));
   // Recorder pushes name their exact transcript owners; payload-less pushes are catalog/control only.
   onSessionChange(change => push('session:changed', change));
+  onBackgroundExecChange(() => push('sessions:backgroundExecChanged'));
+  onRemoteHostsChanged(pushState);
   onSwarmChange(() => push('swarm:changed', swarmState()));
 }

@@ -1,4 +1,5 @@
 import { offerToolInput, acknowledgeToolInput, TOOL_INPUT_HEADER } from '../session/input.js';
+import { noteConnectorUse } from '../connector-proof.js';
 import { pluginManager } from '../plugins/manager.js';
 import { WINDOWS_COMPUTER_STATE_INPUT_METHODS } from '../../shared/windows-computer.js';
 /**
@@ -29,9 +30,10 @@ import { McpServer, type ServerContext } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { Capabilities, Root } from '../../shared/types.js';
 import { CAPABILITY_LABELS, WRITE_CAPABILITIES } from '../../shared/types.js';
-import { FsOpError, formatBytes, type FileInfo } from '../fsops.js';
+import { FsOpError } from '../fsops.js';
 import { logInfo, logWarn } from '../logger.js';
 import { toolSchema } from './tool-declarations.js';
+import { fail } from './execution-common.js';
 import {
   SandboxError,
   isAbsoluteVirtualPath,
@@ -41,7 +43,9 @@ import {
 } from '../sandbox.js';
 import { currentWorkspace, forgetMissingWorkspace, learnWorkspace, setCurrentWorkspace } from '../workspace.js';
 import { getSessionProject, hasRemoteProjects, sessionProjectBinding } from '../projects.js';
+import { remoteBackground } from '../remote-workspace.js';
 import { firstTaskRoot, resolveLinkedSkillAlias } from '../skill-access.js';
+import { isUserSkillVirtualPath, resolveUserSkillPath } from '../user-skills.js';
 import { ExecError } from '../exec.js';
 import { ComputerError } from '../computer/index.js';
 import { getConfig } from '../config.js';
@@ -116,12 +120,11 @@ import {
   conversationAttachment,
   findSessionByConversation,
   getSession,
-  readOverflowText,
   requestBelongsToActiveTurn,
   requestTurnOwnershipCutoff
 } from '../session/store.js';
 import { sessionFinishDeadline } from '../session/finish.js';
-import type { StoredText, ToolOutcome } from '../../shared/session.js';
+import type { ToolOutcome } from '../../shared/session.js';
 
 /** The page's exact proof of a request id, by which a running call counts for its chat. */
 const requestOwner = (requestId: string): string | null => requestCorrelation(requestId)?.conversationId ?? null;
@@ -132,6 +135,17 @@ const UNTRUSTED_WORKER_NOTICE =
   'A tool call from a worker whose owning prime is not currently allowed was refused. In the chat list, hover the owning prime row in the sidebar and choose Trust (✓) if it is untrusted, or Release there if it is blocked.';
 const UNPROVEN_WORKER_NOTICE =
   'A tool call from an app-created worker was refused because no unique owning prime is currently proven. Return to the owning prime in the chat list; once its row is known, hover it in the sidebar and choose Trust (✓), or Release there if it is blocked, then retry after the worker is attached or recovered there.';
+const WORKER_CONNECTION_PROFILE_REFUSAL =
+  'WORKER_CONNECTION_PROFILE_MISMATCH: this worker belongs to a different Chat On Steroids Setup profile. ' +
+  'No local tool was run. Return to the owning prime and switch back to the connection that created this worker family; ' +
+  'cross-profile worker routing is not automatic.';
+
+function workerConnectionProfileRefusal(caller: CallCaller): string | null {
+  const owner = caller.conversationId ? workerPrimeOwner(caller.conversationId) : null;
+  return owner?.owned && owner.setupProfileId && caller.setupProfileId &&
+    owner.setupProfileId !== caller.setupProfileId ? WORKER_CONNECTION_PROFILE_REFUSAL : null;
+}
+
 const untrustedNoticeEpisodes = new Map<string, true>();
 const UNTRUSTED_NOTICE_MAX = 128;
 
@@ -189,6 +203,8 @@ async function recordUntrustedRefusalNotice(context: CallContext): Promise<void>
 
 export interface ToolContext {
   exposedFinishTool?: boolean;
+  /** Stable Setup-profile provenance captured by the MCP endpoint generation. */
+  setupProfileId?: string;
   roots: Root[];
   /** Capabilities currently allowed by the live settings. */
   caps: Capabilities;
@@ -233,8 +249,7 @@ export type ToolContent =
 
 export type ToolResult = { content: ToolContent[]; structuredContent?: Record<string, unknown>; isError?: boolean };
 
-export const ok = (text: string): ToolResult => ({ content: [{ type: 'text', text }] });
-export const fail = (text: string): ToolResult => ({ content: [{ type: 'text', text }], isError: true });
+export { ok, fail, pathArg, lineNumberArg, formatFileInfo } from './execution-common.js';
 
 // Typed local refusals only: arbitrary tool/plugin text cannot arm a recovery notice.
 const identityRefusals = new WeakSet<ToolResult>();
@@ -489,6 +504,15 @@ async function withBackgroundExecRecovery(
   const used = result.content.reduce((bytes, part) => bytes + (part.type === 'text' ? Buffer.byteLength(part.text, 'utf8') : 0), 0);
   const budget = Math.min(12_000, DEFAULT_MAX_OUTPUT_TOKENS * 4 - used) - 64;
   if (budget < 1_024) return result;
+  let project;
+  try { project = caller.sessionId && await hasRemoteProjects() ? await sessionProjectBinding(caller.sessionId) : null; }
+  catch { logWarn('Background output remains retained because its project could not be resolved.'); return result; }
+  if (project?.remote) {
+    try {
+      const text = await remoteBackground(context, 'offer', budget, undefined, () => assertRemoteCallerLive(context));
+      return text ? { ...result, content: [...result.content, { type: 'text', text: `\n--- Background command results ---\n${text}` }] } : result;
+    } catch { logWarn('Remote background output remains retained by its execution service.'); return result; }
+  }
   const output = await offerBackgroundExecOutput(principal, publication, budget);
   // The page is the priority. Running-terminal reminders can wait for a later response.
   const text = output ?? backgroundExecRecoveryNotices(principal, publication).join('\n');
@@ -576,10 +600,14 @@ function withInbox(
   const messages = scoped?.messages ?? [];
   if (messages.length === 0) return result;
   const lines = messages
-    .map(
-      (message) =>
-        `• ${message.from}${message.runId ? ` [run_id=${message.runId}]` : ''}${message.offers > 1 ? ' (delivery retry)' : ''}: ${message.text}`
-    )
+    .map((message) => {
+      const route = message.fromRunId
+        ? ` [source_run_id=${message.fromRunId}]${message.runId ? ` [received_on_run_id=${message.runId}]` : ''}`
+        : message.runId
+          ? ` [run_id=${message.runId}]`
+          : '';
+      return `• ${message.from}${route}${message.offers > 1 ? ' (delivery retry)' : ''}: ${message.text}`;
+    })
     .join('\n');
   return {
     ...result,
@@ -608,7 +636,8 @@ export async function dispatch(
   requestId: string | null,
   surface: SurfaceId,
   run: () => Promise<ToolResult>,
-  parent?: CallContext
+  parent?: CallContext,
+  setupProfileId: string | null = null
 ): Promise<ToolResult> {
   // The context is built here, one layer out from where the work happens, because the
   // compaction barrier asks about the whole request and not just the handler. A call is
@@ -623,7 +652,9 @@ export async function dispatch(
     transportKey,
     agent: null,
     allowUnattributed: getConfig().multiAgent.allowUnattributedCalls,
-    caller: parent ? { ...parent.caller } : { transportKey, requestId, conversationId: null, sessionId: null },
+    caller: parent
+      ? { ...parent.caller }
+      : { transportKey, requestId, conversationId: null, sessionId: null, setupProfileId },
     outcome: null,
     evidence: emptyEvidence()
   };
@@ -672,6 +703,7 @@ async function dispatchTracked(
   // answered, and "was this connector ever actually used from ChatGPT" is a per-connector
   // question the setup screen has to answer honestly.
   surfaceToolCallAt.set(surface, Date.now());
+  noteConnectorUse(surface, 'tool');
   const isFinish = isFinishCall(name, args);
   const startedAt = context.startedAt;
   const allowUnattributed = context.allowUnattributed === true;
@@ -692,8 +724,8 @@ async function dispatchTracked(
   // mate while a swarm is active. Use the full exact-id window, not the shorter prime window:
   // the live worker failure that motivated IDENTITY_EVIDENCE_MS arrived ~8 seconds late.
   const identitySensitive = needsWorkspaceIdentity(name, args);
-  const localProjectTool = surface === 'core' && ['read', 'view_image', 'find', 'apply_patch', 'exec_command', 'write_stdin'].includes(name);
-  const remoteScope = (localProjectTool || surface === 'plugins') && await hasRemoteProjects();
+  const localProjectTool = surface === 'core' && ['read', 'view_image', 'find', 'apply_patch', 'save_image', 'exec_command', 'write_stdin'].includes(name);
+  const remoteScope = localProjectTool && await hasRemoteProjects();
   // update_plan and session_finish consume this exact session, even outside a swarm. Resolve it
   // before the shared blocked/superseded checks rather than guessing from selection.
   // Observation and its dependent input must resolve the same caller before either
@@ -777,9 +809,12 @@ async function dispatchTracked(
   // Preserve the pre-strict fast path exactly: when strict mode is off, Block is a synchronous
   // exact-chat lookup and ordinary calls do not acquire extra microtask yields. Interactive PTYs
   // are timing-sensitive enough that needless awaits can change which terminal frame a poll sees.
-  const conversationPolicyRefusal = strictChatAllowlistEnabled()
+  // Connection provenance is an admission fence, not just a handler error: a refused call
+  // must not revive its worker or consume/receive input owned by the other connection.
+  const conversationPolicyRefusal = (strictChatAllowlistEnabled()
     ? await conversationAccessRefusal(context.caller.conversationId)
-    : isChatBlocked(context.caller.conversationId) ? BLOCKED_CHAT_REFUSAL : null;
+    : isChatBlocked(context.caller.conversationId) ? BLOCKED_CHAT_REFUSAL : null) ??
+    workerConnectionProfileRefusal(context.caller);
   let silentFinishAuthorized = false;
   // Two things about liveness, both before the agent is resolved so that the answer this
   // call gets is the state this call itself established.
@@ -922,7 +957,7 @@ async function dispatchTracked(
   // Refuse and let the model retry once page evidence is healthy instead.
   // The arrival of this exact call acknowledges earlier injected input before the
   // handler reads the queue. New queued input is still offered only with its result.
-  if (!nested) await acknowledgeToolInput(context.caller.sessionId, context.caller.conversationId, requestId, startedAt)
+  if (!nested && !workerConnectionProfileRefusal(context.caller)) await acknowledgeToolInput(context.caller.sessionId, context.caller.conversationId, requestId, startedAt)
     .catch(() => logWarn('Prior user input receipt could not be saved; its existing claim is preserved'));
   // Permission can change while the liveness/recovery bookkeeping above awaits disk or browser
   // evidence. A prior refusal is monotonic, while a new revoke must take effect before any
@@ -935,7 +970,13 @@ async function dispatchTracked(
     const explicitPoll = name === 'write_stdin' && args && typeof args === 'object'
       ? (args as { session_id?: number }).session_id : undefined;
     const principal = executionPrincipal(requestId, context.caller.sessionId, allowUnattributed);
-    await acknowledgeBackgroundExecOutput(principal, startedAt, explicitPoll);
+    try {
+      const project = context.caller.sessionId && await hasRemoteProjects() ? await sessionProjectBinding(context.caller.sessionId) : null;
+      if (project?.remote) {
+        const remotePoll = name === 'write_stdin' && args && typeof args === 'object' ? (args as { session_id?: unknown }).session_id : undefined;
+        await remoteBackground(context, 'ack', 0, remotePoll, () => assertRemoteCallerLive(context));
+      } else await acknowledgeBackgroundExecOutput(principal, startedAt, explicitPoll);
+    } catch { logWarn('Background output receipt was not acknowledged; its retained output is unchanged.'); }
   }
   let admissionRefusal = preAckPolicyRefusal;
   if (!admissionRefusal && strictChatAllowlistEnabled()) {
@@ -955,10 +996,6 @@ async function dispatchTracked(
   const invokeHandler = async (): Promise<ToolResult> => {
     if (remoteScope && !context.caller.sessionId)
       return failIdentity('CALLER_IDENTITY_REQUIRED: Remote projects are configured. Wait for exact conversation identity before choosing a local or remote execution target. No tool was dispatched.');
-    if (localProjectTool && remoteScope && context.caller.sessionId) {
-      const project = await sessionProjectBinding(context.caller.sessionId);
-      if (project?.remote) return fail('REMOTE_PROJECT: This conversation works on the development server. Use its CodexPro tools on Chat On Steroids Plugins; Core filesystem and terminal tools operate on the app computer and are refused.');
-    }
     handlerRan = true;
     return run();
   };
@@ -1019,9 +1056,10 @@ async function dispatchTracked(
   await reconcileAgentRequestOwners().catch(error => {
     logWarn(`Worker ownership recovery deferred after tool completion: ${error instanceof Error ? error.message : String(error)}`);
   });
-  const deliveryPolicyRefusal = strictChatAllowlistEnabled()
+  const deliveryPolicyRefusal = (strictChatAllowlistEnabled()
     ? await conversationAccessRefusal(context.caller.conversationId)
-    : isChatBlocked(context.caller.conversationId) ? BLOCKED_CHAT_REFUSAL : null;
+    : isChatBlocked(context.caller.conversationId) ? BLOCKED_CHAT_REFUSAL : null) ??
+    workerConnectionProfileRefusal(context.caller);
   const deliveryFenced = Boolean(conversationPolicyRefusal) || compacting || supersededConversation || Boolean(silentCeilingWorker) ||
     Boolean(deliveryPolicyRefusal) ||
     compactingConversation(context.caller.conversationId) !== null || Boolean(context.caller.conversationId &&
@@ -1251,15 +1289,20 @@ async function liveWorkspace(): Promise<{ workspace: { virtual: string; real: st
 export async function resolveIn(
   roots: Parameters<typeof resolvePath>[0],
   requested: string,
-  options: { allowMissing?: boolean; base?: string | null } = {}
+  options: { allowMissing?: boolean; base?: string | null; access?: 'read' } = {}
 ): Promise<Resolved> {
+  // The user's own Skill folders are served only to read tools, and never become a workspace.
+  if (isUserSkillVirtualPath(requested)) {
+    if (options.access !== 'read') throw new SandboxError(`${requested} is a read-only Skill folder. Copy the Skill into an approved folder to change it.`);
+    return (await resolveUserSkillPath(requested))!;
+  }
   // An explicit adapter-supplied base beats the workspace; otherwise the workspace is the base.
   // Either way the joining happens inside `resolvePath`, ahead of validation,
   // so a `..` in the caller's text still meets `checkSegment` instead of being normalised
   // away first. Doing that join here is how a relative patch path could climb out of the
   // workspace: `posix.normalize('/root/a/../../elsewhere')` is a perfectly clean-looking
   // `/elsewhere`, and nothing downstream can tell it apart from a path that was always that.
-  const workspace = await validatedWorkspace();
+  const workspace = options.base === undefined ? await validatedWorkspace() : null;
   const base = options.base !== undefined ? options.base : (workspace?.virtual ?? null);
   const resolveOptions = {
     ...(options.allowMissing === undefined ? {} : { allowMissing: options.allowMissing }),
@@ -1313,8 +1356,6 @@ export async function resolveCwd(ctx: ToolContext, virtualPath: string | undefin
 
 // ------------------------------------------------------------------ shared args
 
-export const pathArg = z.string().min(1).max(4096);
-export const lineNumberArg = z.number().int().min(1).max(100_000_000);
 export const windowIdArg = z.number().int().min(1).max(4_294_967_295);
 export const imageCoordinateArg = z.number().int().min(-100_000).max(100_000);
 // Zod's plain object parser strips unknown keys even though its generated JSON Schema says
@@ -1438,8 +1479,15 @@ export function createRegistrar(server: McpServer | null, ctx: ToolContext, surf
         inputSchema: toolSchema(config.inputSchema),
         ...(config.outputSchema ? { outputSchema: toolSchema(config.outputSchema) } : {})
       }, ((args: never, mcpCtx?: McpCallContext) =>
-        dispatch(name, args, mcpCtx?.sessionId ?? null, requestIdOf(mcpCtx), surface, () =>
-          handler(args)
+        dispatch(
+          name,
+          args,
+          mcpCtx?.sessionId ?? null,
+          requestIdOf(mcpCtx),
+          surface,
+          () => handler(args),
+          undefined,
+          ctx.setupProfileId ?? null
         )) as never);
     },
     guarded(cap, name, fn) {
@@ -1466,17 +1514,6 @@ export function createRegistrar(server: McpServer | null, ctx: ToolContext, surf
 }
 
 // ------------------------------------------------------------------ formatters
-
-/**
- * Largest brief a handoff save will accept.
- *
- * Generous on purpose. A brief that hits this is a symptom — the compaction of a very
- * long session — and refusing it there would throw away the one artefact the whole flow
- * exists to produce. The bound is only to keep a runaway generation from being written
- * to disk unbounded; at roughly four characters per token this is comfortably past any
- * single ChatGPT answer.
- */
-export const MAX_HANDOFF_CHARS = 400_000;
 
 /**
  * How long a prime-role `agents` call waits for the calling chat to show its own block.
@@ -1518,26 +1555,6 @@ export const UNATTRIBUTED_DESKTOP_EVIDENCE_MS = evidenceWindow(250);
  */
 export const SPAWN_EVIDENCE_MS = evidenceWindow(30_000);
 
-/**
- * Recovers the complete text behind a stored field.
- *
- * A long tool argument or result is bounded inline in the log and written whole beside
- * it; this reads the whole one back so recovery means the exact payload rather than
- * its first eight thousand characters. `complete` is false only when even the overflow
- * copy could not be written, and the caller says so instead of implying otherwise.
- */
-export async function expandStored(
-  sessionId: string,
-  stored: StoredText
-): Promise<{ text: string; complete: boolean }> {
-  if (!stored.truncated) return { text: stored.text, complete: true };
-  if (stored.assetId) {
-    const full = await readOverflowText(sessionId, stored.assetId);
-    if (full !== null) return { text: full, complete: true };
-  }
-  return { text: stored.text, complete: false };
-}
-
 /** Splits on blank lines so a part never ends mid-sentence unless a block is huge. */
 export function chunkText(text: string, size: number): string[] {
   if (text.length <= size) return [text];
@@ -1561,18 +1578,13 @@ export function chunkText(text: string, size: number): string[] {
   return parts.length > 0 ? parts : [''];
 }
 
-/** The per-path header `read` prints. This is what `file_info` used to be. */
-export function formatFileInfo(info: FileInfo): string {
-  const lines = [
-    `path: ${info.virtualPath}`,
-    `type: ${info.type}`,
-    `size: ${formatBytes(info.bytes)}`,
-    `modified: ${info.modified}`,
-    `created: ${info.created}`
-  ];
-  if (info.readOnly) lines.push('readonly: true');
-  if (info.binary !== null) lines.push(`binary: ${info.binary}`);
-  if (info.lines !== null) lines.push(`lines: ${info.lines}`);
-  if (info.sha256) lines.push(`sha256: ${info.sha256}`);
-  return lines.join('\n');
+/** 私有连接准备需要 await；发出远程操作前重新核对同一组会话权限。 */
+export async function assertRemoteCallerLive(context: CallContext): Promise<void> {
+  const { conversationId, sessionId } = context.caller;
+  if (!conversationId || !sessionId || await conversationAttachment(conversationId, sessionId) !== 'current')
+    throw new Error('REMOTE_CALLER_CHANGED: The original conversation no longer owns this session. No remote operation was dispatched.');
+  if ((strictChatAllowlistEnabled() && await conversationAccessRefusal(conversationId)) || isChatBlocked(conversationId) ||
+      compactingConversation(conversationId) !== null || retiredWorkerForConversation(conversationId) ||
+      dormantWorkerNotice(conversationId) || endedWorkerNotice(conversationId) || silentCeilingWorkerNotice(conversationId))
+    throw new Error('REMOTE_CALLER_DISABLED: This conversation no longer has execution access. No remote operation was dispatched.');
 }

@@ -2,6 +2,8 @@ import { ui, t } from './i18n.js';
 import type { AppState } from '../shared/types.js';
 import type { SettingsPatch } from '../preload/index.js';
 import type { PluginSnapshot, PluginView, PluginCatalogEntry, PluginSource } from '../shared/plugins.js';
+import { pluginExecutionHost } from '../shared/plugins.js';
+import { connectorConfigured, connectorCreated } from '../shared/connector-setup.js';
 import { $, disclosureChevron, el, run, toast } from './dom.js';
 
 let snapshot: PluginSnapshot = { plugins: [], catalog: [], schemaRevision: 0 };
@@ -50,28 +52,45 @@ async function mutate(work: ReturnType<typeof window.api.pluginsSnapshot>, notif
   const own = ++epoch; const result = await run(work);
   if (!result) return false;
   if (own === epoch) { snapshot = result; renderInstalled(); }
-  if (notify) toast(t("Plugin settings saved. Refresh the Chat On Steroids Plugins connector in ChatGPT to update its tools."));
+  if (notify) toast(pluginsConfigured()
+    ? t("Plugin settings saved. Refresh the {0} connector in ChatGPT to update its tools.", [pluginsConnectorName()])
+    : t("Plugin settings saved. Enable the optional Plugins connector when you want to use these tools in ChatGPT."));
   return true;
+}
+/** This computer's Plugins connector name, which carries its suffix when one is set. */
+function pluginsConnectorName(): string {
+  return appState?.status.surfaces.find(item => item.id === 'plugins')?.connectorName ?? 'Chat On Steroids Plugins';
+}
+function pluginsConfigured(): boolean {
+  return !!appState && connectorConfigured(appState.status.surfaces.find(item => item.id === 'plugins') ?? { id: 'plugins', state: 'off' }, appState.config.tunnel);
+}
+function executionDescription(source: PluginSource): string {
+  return pluginExecutionHost(source) === 'local'
+    ? t('Runs on this computer · does not follow the project')
+    : t('Runs on its MCP server · does not follow the project');
 }
 export async function refreshPlugins(): Promise<void> { await mutate(window.api.pluginsSnapshot(), false); }
 export function applyPluginsState(next: AppState): void {
   appState = next;
   const surface = next.status.surfaces.find((item) => item.id === 'plugins');
   const status = $('pluginsConnectionStatus');
-  const contacted = surface?.state === 'live' && !!surface.lastRequestAt;
-  const configured = !!next.config.tunnel.pluginsTunnelId?.trim() || surface?.state === 'live';
+  const contacted = !!surface && connectorCreated(surface);
+  const configured = pluginsConfigured();
   $('pluginsSetupTitle').closest('.plugin-connection')!.classList.toggle('is-configured', configured);
-  ui($('pluginsSetupTitle'), 'textContent', () => configured ? t("Your Plugins connector") : t("Set up plugins before your first use"));
+  ui($('pluginsSetupTitle'), 'textContent', () => configured ? t("Your Plugins connector") : t("Optional third-party plugins"));
   ui($('pluginsSetupHint'), 'textContent', () => configured
     ? t("Your enabled plugins share one connector in ChatGPT. Manage its connection here.")
-    : t("Add the Chat On Steroids Plugins connector in ChatGPT once so it can use your installed plugins."));
-  ui($('pluginsSetupLink'), 'textContent', () => configured ? t("Plugin setup") : t("Set up plugins"));
-  $('pluginsSetupLink').classList.toggle('btn-solid', !configured);
-  ui(status, 'textContent', () => surface?.state === 'live'
+    : t("Local and remote project files and commands use Core. To use the third-party tools below in ChatGPT, configure {0} separately.", [pluginsConnectorName()]));
+  ui($('pluginsSetupLink'), 'textContent', () => configured ? t("Plugin setup") : t("Enable third-party plugins"));
+  ui($('pluginsRefreshName'), 'textContent', pluginsConnectorName);
+  $('pluginsSetupLink').classList.remove('btn-solid');
+  ui(status, 'textContent', () => !configured ? t("Optional · not enabled") : surface?.state === 'live'
     ? contacted ? t("Connected to ChatGPT") : t("Connector online · waiting for ChatGPT")
-    : configured ? t("Plugins connector offline") : t("Setup required · connect your plugins"));
+    : surface?.state === 'error' ? t('Plugins connector error') : surface?.state === 'starting' ? t('Connecting…') : t("Plugins connector offline"));
   status.dataset.live = String(surface?.state === 'live');
-  ui(status, 'title', () => t(surface?.detail ?? ''));
+  status.dataset.error = String(configured && surface?.state === 'error');
+  ui(status, 'title', () => configured ? t(surface?.detail ?? '') : '');
+  $('pluginsRefreshGuide').hidden = !configured;
   const setupStatus = document.getElementById('pluginSetupStatus');
   if (setupStatus) ui(setupStatus, 'textContent', () => surface?.state === 'live'
     ? t("{0} tools available · {1}", [surface.tools.length, surface.lastRequestAt ? t("Connected to ChatGPT") : t("Ready to add in ChatGPT")])
@@ -123,7 +142,7 @@ function showConnection(): void {
 }
 function renderInstalled(): void {
   const list = $('pluginsInstalled');
-  list.replaceChildren(); ui($('pluginsCount'), 'textContent', () => t("{0} installed", [snapshot.plugins.length]));
+  list.replaceChildren(); ui($('pluginsCount'), 'textContent', () => String(snapshot.plugins.length));
   const query = $<HTMLInputElement>('pluginsSearch').value.trim().toLowerCase();
   const matches = (name: string, description = '') => `${name} ${description}`.toLowerCase().includes(query);
   if (!snapshot.plugins.length) {
@@ -139,12 +158,12 @@ function renderInstalled(): void {
     title.append(el('h2', '', plugin.name));
     ui(open, 'aria-label', () => t("Open {0}", [plugin.name]));
     const status = () => plugin.status === 'error' ? t("Needs attention") : plugin.status === 'needs-auth' ? t("Sign in needed") : plugin.status === 'authenticating' ? t("Signing in…") : plugin.status === 'ready' && plugin.tools.length ? t("Ready") : plugin.status === 'ready' ? t("Connected · no tools") : plugin.status === 'connecting' ? t("Connecting…") : plugin.status === 'disabled' ? t("Disabled") : t("Check connection");
-    const count = plugin.tools.filter(tool => tool.enabled).length;
+    const available = plugin.enabled && plugin.status === 'ready' ? plugin.tools.filter(tool => tool.enabled && tool.published !== false).length : 0;
     const foot = el('div', 'plugin-card-foot');
     foot.append(el('span', `pill${plugin.status === 'ready' && plugin.tools.length ? ' is-live' : plugin.status === 'error' ? ' is-error' : ''}`, status));
     if (plugin.error) foot.append(el('span', 'plugin-card-error', plugin.error));
-    foot.append(el('span', 'plugin-tool-count', () => t(count === 1 ? '{0} tool enabled' : '{0} tools enabled', [count])));
-    title.append(foot); open.append(art(recipe?.icon ?? plugin.catalogId ?? 'custom'), title);
+    foot.append(el('span', 'plugin-tool-count', () => t('{0} tools available · {1} discovered', [available, plugin.tools.length])));
+    title.append(el('p', 'muted plugin-runtime', () => executionDescription(plugin.source)), foot); open.append(art(recipe?.icon ?? plugin.catalogId ?? 'custom'), title);
     const menu = document.createElement('details'); menu.className = 'plugin-menu';
     const summary = el('summary', '', '•••'); ui(summary, 'aria-label', () => t("Actions for {0}", [plugin.name]));
     const actions = el('div', 'plugin-menu-actions');
@@ -210,7 +229,8 @@ function showPlugin(plugin: PluginView): void {
   const hero = el('div', 'plugin-detail-hero');
   const intro = el('div', 'plugin-detail-intro');
   const configure = button(() => t("Configure Plugin"), () => showConfigure(plugin), true); configure.classList.add('plugin-configure');
-  intro.append(el('p', '', () => recipe ? t(recipe.description) : t("Your own MCP server, available in your conversations.")), configure);
+  intro.append(el('p', '', () => recipe ? t(recipe.description) : t("Your own MCP server, available in your conversations.")),
+    el('p', 'muted', () => executionDescription(plugin.source)), configure);
   hero.append(art(recipe?.icon ?? plugin.catalogId ?? 'custom'), intro); body.append(hero);
   const tools = el('section', 'plugin-detail-tools'); tools.dataset.pluginDetail = plugin.id; renderPluginTools(tools, plugin); body.append(tools);
   const about = document.createElement('details'); about.className = 'plugin-about'; about.append(disclosureSummary(() => t("About this plugin")));
@@ -261,7 +281,8 @@ function showRecipe(recipe: PluginCatalogEntry): void {
   const steps = el('ol', 'plugin-steps'); for (const step of recipe.instructions) steps.append(el('li', '', () => t(step))); setup.append(steps, button(() => t("Open project & setup guide"), async () => { await run(window.api.openLink(recipe.homepage)); })); body.append(setup);
   const values = new Map<string, HTMLInputElement>();
   for (const item of recipe.fields) { const input = field(body, item.label, '', item.secret, item.placeholder); input.required = !!item.required; values.set(item.key, input); }
-  const remote = recipe.source.kind === 'remote';
+  body.append(el('p', 'muted', () => executionDescription(recipe.source)));
+  const remote = pluginExecutionHost(recipe.source) === 'endpoint';
   body.append(el('p', 'hint', () => remote
     ? t("{0}. Connect your account through the provider. Its plan and usage limits apply.", [recipe.license])
     : t("License: {0}. Installation downloads and runs third-party code as your OS user. “Ready” requires a successful connection and tool discovery.", [recipe.license])));

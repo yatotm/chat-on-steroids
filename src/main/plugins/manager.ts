@@ -10,6 +10,7 @@ import { readDurable, writeDurableNow } from '../durable.js';
 import { setEnvValue } from '../env.js';
 import { redactCredentialText } from '../redaction.js';
 import type { PluginConfigPatch, PluginInstallRequest, PluginSnapshot, PluginView } from '../../shared/plugins.js';
+import { pluginExecutionHost } from '../../shared/plugins.js';
 import { installSource, pluginEnvironment, resolveGithub, stopInstallers, type InstalledLaunch } from './installer.js';
 import { terminateProcessTree } from '../exec.js';
 import { pluginCatalog, reviewedPluginLicense } from './catalog.js';
@@ -105,7 +106,8 @@ export class PluginManager {
       ? stored.filter(p => this.validRecord(p)).map(p => {
         const { tools: _legacyTools, ...record } = p as RecordEntry & { tools?: unknown };
         const catalog = this.validCatalog(record.catalog);
-        return { ...record, catalog, status: record.enabled ? 'connecting' : 'disabled' };
+        // 错误属于一次连接尝试，缓存清单和启停意图才跨启动保留。
+        return { ...record, catalog, error: undefined, status: record.enabled ? 'connecting' : 'disabled' };
       })
       : [];
     this.changed();
@@ -489,6 +491,7 @@ export class PluginManager {
     const live = this.live.get(row.id);
     this.live.delete(row.id);
     row.status = !row.enabled ? 'disabled' : ['error', 'needs-auth'].includes(row.status) ? row.status : 'installed';
+    if (!row.enabled) row.error = undefined;
     // Revocation happens before process/transport retirement can yield.
     this.exposureCache = null;
     if (live) {
@@ -628,7 +631,7 @@ export class PluginManager {
       const secrets = await this.credentials(row);
       signal.throwIfAborted();
       if (this.closing || !row.enabled || !this.records.includes(row)) return;
-      if (row.source.kind === 'remote') {
+      if (pluginExecutionHost(row.source) === 'endpoint') {
         const url = this.remoteUrl(row.source.url);
         if (row.source.auth === 'oauth') {
           if (row.credentialKeys.length) throw new Error('OAuth plugins use Sign in instead of static credential headers.');

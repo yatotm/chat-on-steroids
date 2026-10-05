@@ -11,6 +11,11 @@ export type PluginSource = {
   auth?: 'oauth';
   path?: string;
 };
+
+/** 插件安装源决定执行宿主，不继承当前项目的 Core 文件执行位置。启动与展示共用此判定。 */
+export function pluginExecutionHost(source: PluginSource): 'local' | 'endpoint' {
+  return source.kind === 'remote' ? 'endpoint' : 'local';
+}
 export interface PluginConfigPatch {
   config?: Record<string, string>;
   credentials?: Record<string, string>;

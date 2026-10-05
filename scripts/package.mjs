@@ -35,6 +35,8 @@ run(node, ['scripts/make-icon.mjs']);
 // extension both read this one file to tell which extension build a browser is running.
 run(node, ['scripts/write-extension-stamp.mjs']);
 run(node, [path.join('node_modules', 'electron-vite', 'bin', 'electron-vite.js'), 'build']);
+// 安装包和 Linux 服务必须来自同一份源码，不能把上次测试留下的执行服务带进新版本。
+run(node, ['scripts/build-executor.mjs']);
 
 for (const arch of arches) {
   const targetArgs = ['--platform', platform, '--arch', arch];

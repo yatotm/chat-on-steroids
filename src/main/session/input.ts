@@ -11,7 +11,7 @@ import { randomUUID } from 'node:crypto';
 import { userTitle } from './title.js';
 import { readDurable, writeDurableNow, writeDurableSoon } from '../durable.js';
 import { getSession, findSessionByConversation, createSession, deleteSession, rebindSession, conversationWasSuperseded, readRecentEvents, listUsageSessions, turnHasMcpCall, questionHasMcpCall, sessionDirectoryMissing, readCompletedFinal, readLatestUserMessage } from './store.js';
-import { assignSessionProject, validateProject } from '../projects.js';
+import { assignSessionProject, validateProject, getSessionProject, projectWorkspace, getProject, sessionProjectBinding } from '../projects.js';
 import { isChatBlocked } from './blocked-chats.js';
 import { wakeBrowserWork } from '../browser-wake.js';
 import { logInfo, logWarn } from '../logger.js';
@@ -24,6 +24,10 @@ import { attachmentSchema, validateInputAttachments, normalizeInputAttachments }
 import { MAX_CHATGPT_MESSAGE_CHARS } from '../../shared/user-prompt.js';
 import type { PromptLimits } from './prompt.js';
 import { recoveryMessage, recoveryBusyMs } from '../../shared/recovery.js';
+import { invokedSkills } from '../../shared/skill-invocation.js';
+import { SKILL_ID_PATTERN } from '../../shared/skills.js';
+import { autoSelectManagedSkills } from '../skill-routing.js';
+import { asksForImage } from './image-request.js';
 
 export const inputArgs = z.object({
   projectId: z.string().uuid().nullable().optional(),
@@ -53,6 +57,8 @@ const entrySchema = inputArgs.extend({
   opening: z.literal(true).optional(),
   /** An explicit retry can keep its unbound local chat instead of reserving another. */
   requestedSessionId: inputArgs.shape.sessionId.optional(),
+  /** Frozen automatic routing decision. Empty means routing ran and deliberately chose none. */
+  autoSkills: z.array(z.object({ id: z.string().regex(SKILL_ID_PATTERN), revision: z.string().regex(/^[0-9a-f]{64}$/i) }).strict()).max(1).optional(),
   /** Frozen image projection; authored attachment IDs remain the replay identity. */
   toolImages: inputArgs.shape.images,
   /** One after-turn pickup earned by confirmed silence or settled Thinking failed. */
@@ -471,8 +477,12 @@ async function expireQueued(current: InputEntry[]): Promise<InputEntry[]> {
     // Only an ordinary browser attempt has an unclaimed startup deadline. Tool
     // intent survives a later terminal observation/restart; legacy bound-chat
     // rows are ambiguous and cannot safely be reclassified from today's activity.
+    // A message the app itself holds ("Message queued. Finish Setup to send: …", or after a failed
+    // browser start) was never offered to a browser. It stays queued with its reason and Retry;
+    // failing it here lost it and blamed the browser instead.
     if (row.state === 'queued' && row.mode === 'auto' && !row.opening && !row.finishOwner && !row.silenceBoundary &&
         (row.transportIntent === 'browser' || (!row.transportIntent && !row.sessionId)) &&
+        !row.error?.startsWith('Message queued. ') &&
         Date.now() - Math.max(row.createdAt, row.dueAt) >= 60_000)
       return { ...row, state: 'failed', error: 'Not sent: the browser did not pick up this message within 60 seconds.' };
     // Preparation can expire before Send. Once authorized, this exact claim owns
@@ -702,6 +712,14 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
         if (session?.projectId !== input.projectId) throw new Error('Message project does not match the session');
       }
     }
+    const authoredOrdinary = (input.authoredSource ?? 'text') === 'text' && input.mode !== 'finish' &&
+      !finishOwner && !input.stages?.length;
+    if (getConfig().ui.autoSelectSkills === true && authoredOrdinary && invokedSkills(input.text).length === 0) {
+      const project = input.sessionId ? await sessionProjectBinding(input.sessionId) : input.projectId ? await getProject(input.projectId) : null;
+      const folder = project?.remote ? null : input.sessionId ? await getSessionProject(input.sessionId)
+        : input.projectId ? await projectWorkspace(input.projectId) : null;
+      entry.autoSkills = await autoSelectManagedSkills(input.text, { projectPath: folder?.real ?? null });
+    }
     if (retryOpening) { entry.opening = true; entry.requestedSessionId = input.sessionId; }
     entry.conversationId = await target(entry);
     if (!input.sessionId) {
@@ -879,7 +897,8 @@ export function editQueuedInput(id: string, text: string, afterTurn?: boolean): 
     const row = current.find(entry => entry.id === id && entry.state === 'queued' && queuedFollowup(entry) && !entry.recovery);
     if (!row) return false;
     if (current.filter(entry => !terminal(entry)).reduce((sum, entry) => sum + Buffer.byteLength(entry === row ? value : entry.text), 0) > 1024000) throw new Error('Queued messages exceed the text limit');
-    await commit(current.map(entry => entry === row ? { ...row, text: value, authoredSource: 'text', ...(afterTurn === undefined ? {} : { afterTurn }), deliveryText: undefined } : entry));
+    await commit(current.map(entry => entry === row ? { ...row, text: value, authoredSource: 'text',
+      ...(afterTurn === undefined ? {} : { afterTurn }), deliveryText: undefined, autoSkills: undefined } : entry));
     return true;
   });
 }
@@ -942,7 +961,10 @@ export function noteInputStartupError(id: string, error: string | null): Promise
     // browser delivery. A failed project write must not be hidden by a wake result.
     try { await materializeOpening(row); }
     catch (failure) { error = 'Local chat setup failed: ' + (failure as Error).message; }
-    const next = { ...row, error: error ? error.slice(0, 200) : undefined };
+    // Releasing the app's own hold makes the message due now: the browser's 60-second pickup
+    // window starts here, not when the message was first sent and held.
+    const released = !error && !!row.error?.startsWith('Message queued. ');
+    const next = { ...row, error: error ? error.slice(0, 200) : undefined, ...(released ? { dueAt: Math.max(row.dueAt, Date.now()) } : {}) };
     await commit(current.map(entry => entry === row ? next : entry));
     return { ...next };
   });
@@ -1396,8 +1418,30 @@ export function claimBrowserInput(id: string, owner: string, conversationId: str
     if (!requiresAuthorization && completedTurnId && entry.sessionId && conversationId)
       await consumeGoalReplyForInputNow(conversationId, entry.sessionId, completedTurnId);
     logInfo(`input ${id}: browser claimed after ${Math.max(0, Date.now() - entry.createdAt)} ms`);
-    return { ...combinedInput(claimed, companion), ...selection, text: claimed.deliveryText ?? claimed.text };
+    const withoutMention = await imageRequestWithoutMention(entry, session, companion);
+    if (withoutMention) logInfo(`input ${id}: asks for an image, so it goes out without the Core mention`);
+    return { ...combinedInput(claimed, companion), ...selection, text: claimed.deliveryText ?? claimed.text,
+      ...(withoutMention ? { coreMention: false as const } : {}) };
   });
+}
+/**
+ * The person's own message asking ChatGPT for a picture goes out without the Core mention: ChatGPT
+ * switches its image tool off for a message that mentions an app (see image-request.ts). Generated
+ * messages (Goal, Loop, recovery, workers, the Goal helper) keep the mention as before.
+ */
+async function imageRequestWithoutMention(entry: InputEntry, session: SessionSummary | null, companion?: InputEntry): Promise<boolean> {
+  // A combined message also carries the next queued instruction, which may need the app.
+  if (companion || entry.purpose === 'decision' || entry.recovery || entry.finishOwner || (entry.authoredSource ?? 'text') !== 'text') return false;
+  if (session?.origin?.kind === 'worker' || session?.origin?.kind === 'helper') return false;
+  const attachedImage = (entry.images?.length ?? 0) > 0 || (entry.attachments ?? []).some(file => file.mimeType.startsWith('image/'));
+  // Right after ChatGPT made a picture, "make it brighter" changes that picture.
+  let afterImage = false;
+  if (session) {
+    const recent = await readRecentEvents(session.id, 64, { kinds: ['user_message', 'native_image'] }).catch(() => []);
+    const lastQuestion = recent.findLastIndex(event => event.kind === 'user_message');
+    afterImage = lastQuestion >= 0 && recent.slice(lastQuestion + 1).some(event => event.kind === 'native_image' && event.providerStatus !== 'in_progress');
+  }
+  return asksForImage(entry.text, { attachedImage, afterImage });
 }
 /** Initial provider binding uses the same reserved session as local admission. */
 async function bindOpening(entry: InputEntry, conversationId: string): Promise<boolean> {
