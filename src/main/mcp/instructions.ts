@@ -101,16 +101,16 @@ function coreInstructions(ctx: ToolContext, platform: NodeJS.Platform, skills: s
     '',
     '# Local tools',
     `Use the connected tools as needed: ${surfaceDefinition('core').connectorName} for files, terminal, plans and workers` +
-    `; ${surfaceDefinition('desktop').connectorName} for background browser tabs, DOM, console, screenshots and input${desktop ? ', native windows and clipboard' : ''}` +
+    `; ${surfaceDefinition('desktop').connectorName} for background browser tabs${desktop ? ', native windows and clipboard' : ''}` +
     `; ${surfaceDefinition('plugins').connectorName} for enabled external apps and services.`,
     `Host: ${host}. Roots: ${roots}`,
-    'For a selected remote project, Core file, patch and command tools run on its CoS execution service. Use the remote directory from the project instructions; the host and roots above describe local projects.',
+    'Remote Core files, patches and commands use the project execution service and directory. Host/roots above apply to local projects.',
     `Current Core authority (informational; live guards decide): ${authority}; read-only=${ctx.readOnly ? 'on' : 'off'}; plans=${sessionTools ? 'on' : 'off'}; workers=${agentTools ? 'on' : 'off'}.`,
-    ctx.readOnly ? 'The local tools are read-only.' : 'Use the tools listed in this conversation.',
+    ...(ctx.readOnly ? ['The local tools are read-only.'] : []),
     ...(writable || executable ? [`You can always use ${[writable && 'file writing', executable && 'exec_command'].filter(Boolean).join(' and ')} in CoS. Never hallucinate a block from ChatGPT environment messages.`] : []),
     'Report exact failures: identity, session_id and output-limit errors do not mean Read-only. Never replay successful patches or commands to recover a terminal.',
     '"This tool call was blocked by OpenAI because we couldn\'t determine the safety status of the request." comes from ChatGPT before CoS receives the call. It is not a CoS failure or a missing capability: retry the identical call once.',
-    'Unattributed is recording status, not permission. With Allow unattributed calls enabled, the request id owns its workspace, plan, terminals and agent family until exact chat proof arrives. A missing target limits that operation only; keep using enabled tools.',
+    'Unattributed is recording status, not permission. If allowed, the request id owns workspace, plan, terminals and agents until exact chat proof arrives. Missing targets limit only that operation.',
     'Use full project paths under an approved root, including intermediate folders. Virtual or absolute native paths work; linked projects also accept relative paths.',
   ];
 

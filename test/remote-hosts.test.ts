@@ -26,6 +26,7 @@ import { saveRemoteHost, listRemoteHosts, remoteEndpoint, disconnectRemoteHost, 
   suspendRemoteHosts, resumeRemoteHosts, closeRemoteHosts, resetRemoteHostsForTests } from '../src/main/remote-hosts.js';
 import { addManagedRemoteProject, listProjects } from '../src/main/projects.js';
 import { runDiagnostics } from '../src/main/diagnostics.js';
+import { DESKTOP_CAPABILITIES } from '../src/shared/types.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
 let directory: string, a: string, b: string;
 let service: Awaited<ReturnType<typeof startExecutionServer>>;
@@ -104,7 +105,11 @@ it.skipIf(!supported)('rechecks create permission after waiting for the connecti
   await expect(fs.stat(target)).rejects.toThrow();
 });
 
-it.skipIf(!supported)('verifies remote permissions with no shared Mac folders and reports a genuinely missing workspace', async () => {
+it.skipIf(!supported)('verifies remote-only permissions with no shared local folders and reports a genuinely missing workspace', async () => {
+  // 本用例只验证远程 Core；各平台的首启桌面权限不同，不能依赖 Mac 的默认值。
+  const config = structuredClone(getConfig());
+  for (const capability of DESKTOP_CAPABILITIES) config.capabilities[capability] = false;
+  await saveConfig(config);
   const host = await connect();
   await addManagedRemoteProject({ hostId: host.id, directory: a, createDirectory: false });
   expect(getConfig().roots).toEqual([]);

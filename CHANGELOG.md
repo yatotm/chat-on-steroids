@@ -9,6 +9,12 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.2.3] — 完成远程开发版本的跨平台发布
+
+包含下方 2.2.2 候选版的所有功能。修正权限诊断回归测试对 macOS 默认权限的依赖，使 Linux 与 Mac 在相同的 Core-only 权限配置下验证。2.2.2 未完成正式发布，原标签保留。
+
+压缩 Core 工具说明中的重复文字，使 Windows 的命令声明和初始化说明回到既有大小预算内；安全规则、工具参数及执行逻辑保持不变。
+
 ## [2.2.2] — SSH 开发机连接与独立远程 Core
 
 同步上游 main 至 `a8161d6`，保留内置浏览器、聊天搜索与重命名、图片保存、Skills 和会话修复。

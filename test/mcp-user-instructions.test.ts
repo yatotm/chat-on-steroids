@@ -71,6 +71,12 @@ afterEach(() => {
 });
 
 describe('the user’s own connector instructions', () => {
+  it.each(['win32', 'darwin', 'linux'] as const)('keeps read/command instructions within budget on %s', platform => {
+    // 在任意开发机也检查其他平台的说明，避免直到发布矩阵才发现 Windows 超限。
+    const caps = Object.fromEntries(CAPABILITIES.map(name => [name, name === 'read' || name === 'command'])) as Capabilities;
+    const text = serverInstructions({ ...ctx, caps, roots: [{ name: 'workspace', path: dir }] }, 'core', platform);
+    expect(text.length, `${platform} Core instructions`).toBeLessThan(18_000);
+  });
   it.each([
     [true, true, false, 'file writing and exec_command'],
     [true, false, false, 'file writing'],
