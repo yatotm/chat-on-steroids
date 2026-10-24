@@ -3,11 +3,14 @@
 // These checks render the production renderer in isolated windows and fixtures; none touches the
 // installed app, its data or ChatGPT. They are not part of `npm test`, which is why they rotted
 // unnoticed before. Run after `npm run build`:  npm run verify:ui [-- name-filter]
+// A check that loads the build (out/) fails at once, with the reason, when there is no build or
+// it is older than src/; it used to wait out its timeout, or pass against old code.
 import { spawn } from 'node:child_process';
-import { readdirSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
+import { buildProblem, needsBuild } from './ui-build-state.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const electron = createRequire(import.meta.url)('electron');
@@ -34,15 +37,30 @@ const results = [];
 // macOS runners print Electron Helper XPC/sandbox complaints on every check. They are never the
 // reason, and as the last lines of a silent failure they used to hide it completely.
 const noise = /sandbox_extension|task_policy|js2c|XPC error|com\.apple\.|Connection invalid/;
+// A check's own result line is JSON whose keys can read like a reason ("actualPty"); it is never one.
+const resultLine = /^\s*[{[]/;
+// Windows reports a crash as an NTSTATUS such as 3221225477; in hex (0xC0000005) it can be looked up.
+const exitStatus = code => code === 'timeout' ? 'timed out'
+  : typeof code === 'number' ? `exited with ${code}${code > 0xffff ? ` (0x${(code >>> 0).toString(16).toUpperCase()})` : ''}` : String(code);
 const reasonFor = outcome => {
   const lines = outcome.output.split('\n').filter(line => line.trim() && !noise.test(line));
-  const reason = lines.filter(line => /Error|assert|Timeout|timed out|expected|actual/i.test(line)).slice(0, 6);
+  const reason = lines.filter(line => !resultLine.test(line) && /Error|assert|Timeout|timed out|expected|actual/i.test(line)).slice(0, 6);
   const shown = reason.length ? reason : lines.slice(-8);
-  return (shown.length ? shown : [outcome.code === 'timeout' ? 'timed out with no output' : `exited with ${outcome.code} and no output`])
+  // A check that printed its full result and still failed died on the way out; only the status says so.
+  return [...shown, shown.length ? exitStatus(outcome.code) : `${exitStatus(outcome.code)} and no output`]
     .map(line => `      ${line.slice(0, 800)}`).join('\n');
 };
 for (const name of scripts) {
   if (skip.has(name)) { console.log(`SKIP  ${name}  (needs a real GPU and display timing; run it locally)`); continue; }
+  if (needsBuild(readFileSync(path.join(root, 'scripts', name), 'utf8'))) {
+    // Looked at again before each such check: src/ can change while an earlier check runs.
+    const problem = buildProblem(root);
+    if (problem) {
+      results.push({ name, ok: false, seconds: 0 });
+      console.log(`FAIL  ${name}  (0s)\n      it loads the built app, but ${problem}`);
+      continue;
+    }
+  }
   // The app starts in the system language on a first start. Checks assert English text, so pin the
   // locale; otherwise they fail on any machine whose system language the app also speaks.
   const how = special[name] ?? { command: electron, args: ['--lang=en-US'] };
@@ -51,10 +69,13 @@ for (const name of scripts) {
   const run = () => new Promise(resolve => {
     const child = spawn(how.command, [path.join('scripts', name), ...how.args], { cwd: root, env, windowsHide: true });
     let output = '';
-    const keep = chunk => { output = (output + chunk).slice(-4000); };
+    // A check that throws inside its async body and then quits in a finally block exits 0: its
+    // failure only shows as an unhandled rejection. Two checks passed that way for weeks (#1144).
+    let unhandled = false;
+    const keep = chunk => { unhandled ||= /UnhandledPromiseRejection/.test(String(chunk)); output = (output + chunk).slice(-4000); };
     child.stdout.on('data', keep); child.stderr.on('data', keep);
     const timer = setTimeout(() => { child.kill('SIGKILL'); resolve({ code: 'timeout', output }); }, TIMEOUT_MS);
-    child.on('close', code => { clearTimeout(timer); resolve({ code, output }); });
+    child.on('close', (code, signal) => { clearTimeout(timer); resolve({ code: code === 0 && unhandled ? 'unhandled rejection' : code ?? `signal ${signal}`, output }); });
   });
   let outcome = await run();
   const first = outcome;

@@ -45,6 +45,8 @@ describe('asksForImage', () => {
     '고양이 그림을 그려줘',
     '바다 이미지 만들어줘',
     '/clear-writing Create an image of a quiet library',
+    'Create a picture of version 2.5 of our mascot, a fox',
+    'Draw a cat. Then save it as cat.final.png',
     'Create a logo and save it to the project folder',
     'Erstelle ein Bild von einer Katze und speichere es im Ordner',
     'Draw a cartoon of a python snake',
@@ -93,10 +95,44 @@ describe('asksForImage', () => {
     expect(asksForImage(text)).toBe(false);
   });
 
+  // #1701 (2026-10-20): a game designer asked for art in words the rules did not know, so the app
+  // kept its mention and ChatGPT answered that its image tool was not available in this session.
+  it.each([
+    'Use the native tool to generate a sprite of the main character.',
+    'Use your native image generation tool to create concept art for the forest level.',
+    'Generate concept art for the forest level.',
+    'Generate a sprite sheet for the player walking animation.',
+    'Make pixel art of a treasure chest.',
+    'Create a character design for the hero, a fox knight.',
+    'Use the image generator to make the boss look scarier.',
+    'Erstelle mit dem Bildgenerator eine Burg im Nebel.'
+  ])('reads game art and a named image tool as a request: %s', text => {
+    expect(asksForImage(text)).toBe(true);
+  });
+
+  it.each([
+    'Why is the image generation tool not available in this session?',
+    'Load the sprite sheet in src/game/player.ts and play the walk animation.',
+    'Fix the sprite flicker when the player jumps.',
+    'Write a function that packs these sprites into one atlas.',
+    'Add a test for the concept art gallery page.',
+    'Rename sprite_sheet.png to player.png'
+  ])('keeps work about sprites and the image tool with the mention: %s', text => {
+    expect(asksForImage(text)).toBe(false);
+  });
+
   it('reads a short follow-up after ChatGPT made an image as an edit, but not work or files', () => {
-    for (const text of ['make it brighter', 'Change the background to blue', 'Add a hat to the cat', 'mach es dunkler', 'cámbialo a rojo', '把背景改成蓝色'])
+    for (const text of ['make it brighter', 'Change the background to blue', 'Add a hat to the cat', 'mach es dunkler', 'cámbialo a rojo', '把背景改成蓝色',
+      'make it brighter and save it as v2.png', 'Generate another image like that one'])
       expect(asksForImage(text, { afterImage: true }), text).toBe(true);
-    for (const text of ['now run the tests', 'fix the build', 'Add a test for the parser', 'save it to the folder', 'thanks, that works'])
+    for (const text of ['now run the tests', 'fix the build', 'Add a test for the parser', 'save it to the folder', 'thanks, that works',
+      // Saving the picture just made is file work for the app (live 2026-10-05: this went out without the mention).
+      'Use the save_image tool of the "Chat On Steroids Core" connector exactly once to save the image you just generated as boat.png in the shared project folder. Then reply with only the tool result.',
+      'save the image you just generated as boat.png', 'Save the picture you made into the project folder',
+      'Speichere das Bild, das du gerade erstellt hast, im Projektordner', 'Guarda la imagen que creaste en la carpeta del proyecto',
+      // A "." inside a file name split this into a sentence that read "saves the latest image of" (live 2026-10-05).
+      'Call the save_image tool of the "Chat On Steroids Core" connector exactly once with ONLY the path argument /chatgpt_homelab/cos-qa-boat-final.png and no image argument (it then saves the latest image of this chat). Reply with only the tool result.',
+      'It saves the latest image of this chat into boat.final.png', 'Use view_image on the picture you made'])
       expect(asksForImage(text, { afterImage: true }), text).toBe(false);
     // Without an image just made, the same words are no image request.
     expect(asksForImage('make it brighter')).toBe(false);

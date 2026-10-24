@@ -75,7 +75,7 @@ it.each([false, true])('never borrows a command-owned opening for model discover
     expect(h.create).not.toHaveBeenCalled();
   }
 });
-it.each(['generating', 'draft', 'attachments', 'input_busy', 'composer_hidden'])('explicit refresh uses one helper without touching a %s user tab', async reason => {
+it.each(['generating', 'draft', 'attachments', 'input_busy', 'composer_hidden', 'picker_unreadable'])('explicit refresh uses one helper without touching a %s user tab', async reason => {
   const h = await worker([]);
   const userTab = { id: 8, url: `https://chatgpt.com/c/${secondId}` }; h.tabs.push(userTab);
   h.sendMessage.mockResolvedValue({ ready: false, reason } as never);
@@ -179,6 +179,25 @@ it.each(['empty', 'draft', 'navigated', 'rejected', 'transport', 'pinned', 'pinn
   expect(h.remove).toHaveBeenCalledTimes(mode === 'empty' ? 1 : 0);
   if (mode === 'empty') expect(h.sendMessage).toHaveBeenCalledWith(8, { type: 'clf-tab-close-check', conversationId: null, failedCommand: { id: firstId, client: 'worker-client' } }, { documentId: source.documentId });
 });
+// 2026-10-10: a failed Compact & resume Project entry left its source tab (?clf=<id>&clf_project=1)
+// open every time, because only a chat-less tab could be retired.
+it.each(['helper', 'unmarked', 'other-command'])('terminal Project-entry failure retires only its own marked source tab (%s)', async mode => {
+  const h = await worker([]);
+  const source = { tab: 8, documentId: 'failed-entry', navigationEpoch: 1 };
+  const marker = mode === 'unmarked' ? '' : `?clf=${mode === 'other-command' ? 'someone-else' : firstId}&clf_project=1`;
+  h.tabs.push({ id: 8, url: `https://chatgpt.com/g/g-p-11111111222233334444555555555555-homelab/c/${secondId}${marker}` });
+  await h.authorizeDocument({ tab: { id: 8 }, documentId: source.documentId, frameId: 0, url: h.tabs[0]!.url }, { navigationEpoch: 1 });
+  h.fetch.mockImplementation(async input => ({ ok: true, status: 200,
+    json: async () => new URL(input).pathname === '/hello'
+      ? { app: 'chat-on-steroids', bridge: BRIDGE_PROTOCOL, compatible: true, paired: true }
+      : { ok: true, outcome: 'terminal-failure', committed: false } }));
+  h.sendMessage.mockImplementation(async (_tabId, message): Promise<any> =>
+    message.type === 'clf-tab-close-check' ? { safe: true, conversationId: secondId, navigationEpoch: 1 } : { ok: true });
+  await (h as any).ackCommand(firstId, 'failed', 'project entry', null, null, 'resume-client', source);
+  expect(h.remove).toHaveBeenCalledTimes(mode === 'helper' ? 1 : 0);
+  if (mode === 'helper') expect(h.sendMessage).toHaveBeenCalledWith(8, { type: 'clf-tab-close-check', conversationId: secondId,
+    failedCommand: { id: firstId, client: 'resume-client' } }, { documentId: source.documentId });
+});
 it('executes a due refresh before an unrelated input readiness probe settles', async () => {
   const h = await worker([{ id: firstId, conversationId: null }]);
   h.tabs.push({ id: 8, url: `https://chatgpt.com/c/${secondId}` }, { id: 9, url: 'https://chatgpt.com/' });
@@ -231,7 +250,7 @@ it('carries the direct-turn offer only to the elected existing conversation', as
 });
 
 type Tab = { id: number; url?: string; pendingUrl?: string; windowId?: number; active?: boolean; pinned?: boolean };
-async function worker(inputs: Array<{ id: string; conversationId: string | null; directTurn?: { id: string; startedAt: number }; supersededConversationId?: string }>, modelCatalogRequest?: { nonce: string; expiresAt: number }, priorLocal: Record<string, unknown> = {}, priorSession: Record<string, unknown> = {}, rendered?: Set<number>) {
+async function worker(inputs: Array<{ id: string; conversationId: string | null; directTurn?: { id: string; startedAt: number }; supersededConversationId?: string; project?: string; branch?: { conversationId: string; messageId: string } }>, modelCatalogRequest?: { nonce: string; expiresAt: number }, priorLocal: Record<string, unknown> = {}, priorSession: Record<string, unknown> = {}, rendered?: Set<number>) {
   const tabs: Tab[] = [];
   const event = { addListener: () => {} };
   const tabUpdated = { addListener: vi.fn() };
@@ -268,7 +287,7 @@ async function worker(inputs: Array<{ id: string; conversationId: string | null;
     json: async () => new URL(input).pathname === '/hello'
       ? { app: 'chat-on-steroids', bridge: BRIDGE_PROTOCOL, compatible: true, paired: true }
       : { ok: true, inputs, background: true, modelCatalogRequest,
-        ...(rendered ? { inputOpeningIds: inputs.map(input => input.id), nonDiscardableConversations: inputs.map(input => input.conversationId).filter(Boolean) } : {}) }
+        ...(rendered ? { inputOpeningIds: inputs.map(input => input.id), commandIds: [], nonDiscardableConversations: inputs.map(input => input.conversationId).filter(Boolean) } : {}) }
   }));
   const scripting = { executeScript: vi.fn(async ({ target, func }: any): Promise<any[]> => {
     const documentId = (saved.tabDocuments as Record<string, string> | undefined)?.[target.tabId];
@@ -289,13 +308,13 @@ async function worker(inputs: Array<{ id: string; conversationId: string | null;
     fetch, URL, URLSearchParams, AbortController, setTimeout, clearTimeout, TextEncoder, console
   });
   vm.runInContext(activeTabsSource, context);
-  vm.runInContext(`${source}\nglobalThis.testMaintenance = { load, maintain, releaseTab, serializeTab, noteTabConversation, createChatTab, authorizeDocument, ackDesktopInput, drainCommandAcks, inspectRequestedModels, desktopInput: HANDLERS.desktop_input, catalog: HANDLERS.model_catalog, events: HANDLERS.events, bind: HANDLERS.bind, correlate: HANDLERS.correlate, applyRequestedBrowserPreferences };`, context);
+  vm.runInContext(`${source}\nglobalThis.testMaintenance = { load, maintain, releaseTab, serializeTab, noteTabConversation, createChatTab, authorizeDocument, ackDesktopInput, drainCommandAcks, inspectRequestedModels, desktopInput: HANDLERS.desktop_input, catalog: HANDLERS.model_catalog, events: HANDLERS.events, bind: HANDLERS.bind, closed: HANDLERS.closed, loadFailure: HANDLERS.load_failure, correlate: HANDLERS.correlate, applyRequestedBrowserPreferences };`, context);
   const api = context.testMaintenance as { releaseTab(...args: any[]): Promise<any>; serializeTab(tab: number, operation: () => Promise<any>): Promise<any>; noteTabConversation(source: any, conversationId: string): Promise<any>; applyRequestedBrowserPreferences(request: object): Promise<void>; authorizeDocument(sender: unknown, message: unknown): Promise<any>; catalog(message: unknown, sender: unknown, source: unknown): Promise<any>; load(): Promise<void>; maintain(): Promise<void>; createChatTab(url: string, background: boolean): Promise<Tab> };
   await api.load();
   Object.assign(api, { query });
   const updated = (id: number, change: object) => tabUpdated.addListener.mock.calls[0]![0](id, change, tabs.find(tab => tab.id === id));
   vm.runInContext('Object.assign(testMaintenance, { offerStopTurns, noteTabConversation, ackCommand })', context);
-  return { ...api, scripting, updated, update, inspectModels: (context.testMaintenance as any).inspectRequestedModels as (request: unknown, background: boolean) => Promise<void>, ackDesktopInput: (context.testMaintenance as any).ackDesktopInput as (...args: string[]) => Promise<any>, drainCommandAcks: (context.testMaintenance as any).drainCommandAcks as () => Promise<any>, desktopInput: (context.testMaintenance as any).desktopInput as (...args: any[]) => Promise<any>, events: (context.testMaintenance as any).events as (message: any, sender: any, source: any) => Promise<any>, bind: (context.testMaintenance as any).bind as (message: any, sender: any, source: any) => Promise<any>, correlate: (context.testMaintenance as any).correlate as (message: any, sender: any, source: any) => Promise<any>, create, sendMessage, tabs, fetch, windows, remove, reload, local, localSaved, saved };
+  return { ...api, scripting, updated, update, inspectModels: (context.testMaintenance as any).inspectRequestedModels as (request: unknown, background: boolean) => Promise<void>, ackDesktopInput: (context.testMaintenance as any).ackDesktopInput as (...args: string[]) => Promise<any>, drainCommandAcks: (context.testMaintenance as any).drainCommandAcks as () => Promise<any>, desktopInput: (context.testMaintenance as any).desktopInput as (...args: any[]) => Promise<any>, events: (context.testMaintenance as any).events as (message: any, sender: any, source: any) => Promise<any>, bind: (context.testMaintenance as any).bind as (message: any, sender: any, source: any) => Promise<any>, correlate: (context.testMaintenance as any).correlate as (message: any, sender: any, source: any) => Promise<any>, closed: (context.testMaintenance as any).closed as (message: any, sender: any, source: any) => Promise<any>, loadFailure: (context.testMaintenance as any).loadFailure as (message: any, sender: any, source: any) => Promise<any>, create, sendMessage, tabs, fetch, windows, remove, reload, local, localSaved, saved };
 }
 
 describe('one browser maintenance flight per desktop outbox publication', () => {
@@ -354,6 +373,109 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
       expect(h.fetch.mock.calls.filter(([url]) => new URL(url).pathname === '/closed')).toHaveLength(1);
       expect(h.create).not.toHaveBeenCalled();
     } finally { vi.useRealTimers(); }
+  });
+
+  it('opens the native Project helper for the first pending request, past one whose page is gone (#1176)', async () => {
+    const h = await worker([]);
+    const original = h.fetch.getMockImplementation()!;
+    h.fetch.mockImplementation(async (url, init) => {
+      const reply = await original(url, init);
+      if (new URL(url).pathname !== '/status') return reply;
+      return { ...reply, json: async () => ({ ...(await reply.json() as object), projectCreateRequests: [
+        { id: firstId, projectId: secondId, name: 'held-by-a-closed-page', state: 'claimed' },
+        { id: secondId, projectId: firstId, name: 'my-app', state: 'requested' }] }) };
+    });
+    await h.maintain();
+    for (let i = 0; i < 10; i++) await new Promise(resolve => setTimeout(resolve, 0));
+    expect(h.create).toHaveBeenCalledWith(expect.objectContaining({ url: `https://chatgpt.com/?cos-project-create=${secondId}`, active: true }));
+    expect(h.create.mock.calls.some(([options]) => String(options.url).includes(firstId))).toBe(false);
+  });
+
+  it.each(['complete', 'loading'] as const)('reports a linked Project ChatGPT no longer opens when its tab ends on the home page (%s)', async status => {
+    const project = `g-p-${'e'.repeat(32)}`;
+    const h = await worker([{ id: firstId, conversationId: null, project }], undefined, { inputOpenings: { [firstId]: { tab: 7, stage: 'ready', project } } });
+    h.tabs.push({ id: 7, url: 'https://chatgpt.com/', status } as never);
+    await h.maintain();
+    const gone = h.fetch.mock.calls.filter(([url]) => new URL(url).pathname === '/project-create')
+      .map(([, init]) => JSON.parse(String(init?.body)));
+    expect(gone).toEqual(status === 'complete' ? [{ action: 'gone', inputId: firstId, chatgptId: project }] : []);
+    expect(h.create).not.toHaveBeenCalled();
+  });
+
+  it("opens a fresh tab for the Project a retry created, without blaming it for the earlier one's landing", async () => {
+    const earlier = `g-p-${'e'.repeat(32)}`, project = `g-p-${'f'.repeat(32)}`;
+    const h = await worker([{ id: firstId, conversationId: null, project }], undefined, { inputOpenings: { [firstId]: { tab: 7, stage: 'ready', project: earlier } } });
+    h.tabs.push({ id: 7, url: 'https://chatgpt.com/', status: 'complete' } as never);
+    await h.maintain();
+    expect(h.fetch.mock.calls.some(([url]) => new URL(url).pathname === '/project-create')).toBe(false);
+    expect(h.create).toHaveBeenCalledWith(expect.objectContaining({ url: `https://chatgpt.com/g/${project}/project?cos-input=${firstId}#cos-input=${firstId}` }));
+  });
+
+  describe('branch in new chat (#482)', () => {
+    const source = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const branch = { conversationId: source, messageId: '2b06482d-0dc6-4847-bf7a-2e1a0f671e89' };
+    const offers = (h: Awaited<ReturnType<typeof worker>>) => h.sendMessage.mock.calls
+      .filter(([, message]) => message.type === 'clf-desktop-input').map(([tab, message]) => ({ ...message, tab }));
+
+    it('opens the source chat for the branch, never by borrowing a home tab', async () => {
+      const h = await worker([{ id: firstId, conversationId: null, branch }]);
+      const home = { id: 7, url: 'https://chatgpt.com/' };
+      h.tabs.push(home);
+      await h.authorizeDocument({ tab: home, documentId: 'idle-home', frameId: 0, url: home.url }, { navigationEpoch: 1 });
+      h.sendMessage.mockImplementation(async (_id, message): Promise<any> =>
+        message.type === 'clf-input-reuse-state' ? { safe: true, navigationEpoch: 1 } : { ok: true });
+      await h.maintain();
+      expect(h.sendMessage.mock.calls.some(([id, message]) => id === 7 && message.type === 'clf-prepare-desktop-input')).toBe(false);
+      expect(h.create).toHaveBeenCalledWith(expect.objectContaining({ url: `https://chatgpt.com/c/${source}?cos-input=${firstId}#cos-input=${firstId}` }));
+    });
+
+    it('offers the branch point to its tab, and again once that tab shows ChatGPT\'s local draft', async () => {
+      const h = await worker([{ id: firstId, conversationId: null, branch }], undefined, { inputOpenings: { [firstId]: { tab: 7, stage: 'ready' } } });
+      h.tabs.push({ id: 7, url: `https://chatgpt.com/c/${source}?cos-input=${firstId}#cos-input=${firstId}`, status: 'complete' } as never);
+      await h.maintain();
+      expect(offers(h)).toEqual([expect.objectContaining({ tab: 7, id: firstId, conversationId: null, branch })]);
+      h.sendMessage.mockClear();
+      h.tabs[0] = { id: 7, url: 'https://chatgpt.com/c/local-chatgpt:4754b9e6-4fd8-4c76-87b2-731ee7a8cde0', status: 'complete' } as never;
+      await h.maintain();
+      expect(offers(h)).toEqual([expect.objectContaining({ tab: 7, id: firstId, conversationId: null, branch })]);
+      expect(h.create).not.toHaveBeenCalled();
+    });
+
+    it.each([[7, true], [8, false]] as const)('lets only the elected tab claim from a draft whose marker ChatGPT dropped (tab %s)', async (tabId, allowed) => {
+      // Live 2.1.41 (VM): ChatGPT rewrote the draft's URL after its own navigation, without the marker.
+      const h = await worker([{ id: firstId, conversationId: null, branch }], undefined, { inputOpenings: { [firstId]: { tab: 7, stage: 'ready' } } });
+      const url = 'https://chatgpt.com/c/local-chatgpt%3A18dba412-03e9-4b2d-a284-6ac4d6d4e5ac';
+      h.tabs.push({ id: tabId, url } as never);
+      const sender = { tab: { id: tabId }, documentId: 'draft', frameId: 0, url };
+      const owner = await h.authorizeDocument(sender, { navigationEpoch: 1 });
+      h.fetch.mockClear();
+      const reply = await h.desktopInput({ id: firstId, conversationId: null, requiresAuthorization: true }, sender, owner);
+      const claimed = h.fetch.mock.calls.some(([target]) => new URL(target).pathname === '/input/claim');
+      expect(claimed).toBe(allowed);
+      if (!allowed) expect(reply).toEqual({ ok: false });
+    });
+
+    it("never takes another tab's local draft for this branch", async () => {
+      const h = await worker([{ id: firstId, conversationId: null, branch }], undefined, { inputOpenings: { [firstId]: { tab: 7, stage: 'ready' } } });
+      h.tabs.push({ id: 8, url: 'https://chatgpt.com/c/local-chatgpt:4754b9e6-4fd8-4c76-87b2-731ee7a8cde0', status: 'complete' } as never);
+      await h.maintain();
+      expect(offers(h)).toEqual([]);
+      expect(h.create).not.toHaveBeenCalled();
+    });
+  });
+
+  it("opens a new chat of a linked project on its native Project's page, never by borrowing a home tab (#1176)", async () => {
+    const project = `g-p-${'e'.repeat(32)}`;
+    const h = await worker([{ id: firstId, conversationId: null, project }]);
+    const home = { id: 7, url: 'https://chatgpt.com/' };
+    h.tabs.push(home);
+    await h.authorizeDocument({ tab: home, documentId: 'idle-home', frameId: 0, url: home.url }, { navigationEpoch: 1 });
+    h.sendMessage.mockImplementation(async (_id, message): Promise<any> =>
+      message.type === 'clf-input-reuse-state' ? { safe: true, navigationEpoch: 1 } : { ok: true });
+    await h.maintain();
+    expect(h.sendMessage.mock.calls.some(([id, message]) => id === 7 && message.type === 'clf-prepare-desktop-input')).toBe(false);
+    expect(h.create).toHaveBeenCalledWith(expect.objectContaining({
+      url: `https://chatgpt.com/g/${project}/project?cos-input=${firstId}#cos-input=${firstId}` }));
   });
 
   it.each(['home', 'catalog'])('protects a hidden %s before preparing and offering its first input', async surface => {
@@ -430,6 +552,70 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     } else expect(observed).toEqual([true, false]);
     expect(h.create).not.toHaveBeenCalled();
     expect(h.update.mock.calls.some(([, patch]) => patch.active)).toBe(false);
+  });
+
+  it.each(['page-report', 'user-later'] as const)('tells the app that borrowing an idle chat\'s tab was its own doing (%s)', async variant => {
+    // #1086: a new chat took an idle app-owned chat's tab. The page then reported that chat as
+    // closed, the app read it as the user closing it on purpose, and paused its recovery for good.
+    const h = await worker([{ id: firstId, conversationId: null }]);
+    const tab = { id: 7, url: `https://chatgpt.com/c/${secondId}`, active: false };
+    h.tabs.push(tab);
+    const sender = { tab, documentId: 'reused-document', frameId: 0, url: tab.url };
+    const source = await h.authorizeDocument(sender, { navigationEpoch: 1 });
+    const originalFetch = h.fetch.getMockImplementation()!;
+    h.fetch.mockImplementation(async (url, init) => {
+      const response = await originalFetch(url, init);
+      return new URL(url).pathname === '/status'
+        ? { ...response, json: async () => ({ ...await response.json() as object, reusableConversations: [secondId] }) } : response;
+    });
+    h.sendMessage.mockImplementation(async (_id, message): Promise<any> => {
+      if (message.type === 'clf-input-reuse-state') return { safe: true, navigationEpoch: 1 };
+      if (message.type === 'clf-prepare-desktop-input') {
+        // The page moves to a new chat in the same document and reports the old one as left.
+        await h.closed({ conversationId: secondId }, sender, source);
+        tab.url = `https://chatgpt.com/?cos-input=${firstId}`;
+        return { ready: true };
+      }
+      return { ok: true };
+    });
+    await h.maintain();
+    const closes = () => h.fetch.mock.calls.filter(([url]) => new URL(url).pathname === '/closed')
+      .map(([, init]) => JSON.parse(String(init!.body)));
+    expect(closes()).toEqual([{ conversationId: secondId, manual: false }]);
+    if (variant === 'user-later') {
+      // The record is spent: a later departure of the same chat is the user's again.
+      tab.url = `https://chatgpt.com/c/${secondId}`;
+      const back = await h.authorizeDocument({ ...sender, url: tab.url, documentId: 'reused-document' }, { navigationEpoch: 3 });
+      await h.closed({ conversationId: secondId }, { ...sender, url: tab.url }, back);
+      expect(closes().at(-1)).toEqual({ conversationId: secondId, manual: true });
+    }
+  });
+
+  it.each([true, false])('does not take a chat leaving ChatGPT\'s "could not be loaded" page for the user closing it (reported: %s)', async reported => {
+    // #1086: Retry on ChatGPT's load-failure surface (pressed by the page's own recovery or by the
+    // user) took the tab to the home page, and the app paused the chat's recovery as if closed.
+    const h = await worker([]);
+    const tab = { id: 7, url: `https://chatgpt.com/c/${secondId}`, active: false };
+    h.tabs.push(tab);
+    const sender = { tab, documentId: 'failed-document', frameId: 0, url: tab.url };
+    const source = await h.authorizeDocument(sender, { navigationEpoch: 1 });
+    await h.noteTabConversation(source, secondId);
+    if (reported) expect(await h.loadFailure({ conversationId: secondId }, sender, source)).toEqual({ ok: true });
+    await h.closed({ conversationId: secondId }, sender, source);
+    const closes = h.fetch.mock.calls.filter(([url]) => new URL(url).pathname === '/closed')
+      .map(([, init]) => JSON.parse(String(init!.body)));
+    expect(closes).toEqual([{ conversationId: secondId, manual: !reported }]);
+  });
+
+  it('accepts a load-failure report only for the chat its own document shows', async () => {
+    const h = await worker([]);
+    const tab = { id: 7, url: `https://chatgpt.com/c/${secondId}`, active: false };
+    h.tabs.push(tab);
+    const sender = { tab, documentId: 'failed-document', frameId: 0, url: tab.url };
+    const source = await h.authorizeDocument(sender, { navigationEpoch: 1 });
+    await h.noteTabConversation(source, secondId);
+    expect(await h.loadFailure({ conversationId: firstId }, sender, source)).toEqual({ ok: false });
+    expect(await h.loadFailure({ conversationId: 'not-a-chat' }, sender, source)).toEqual({ ok: false });
   });
 
   it.each(['returned', 'absent', 'foreign', 'original-present'] as const)('resumes a pending exact-chat input only in an already returned tab (%s)', async state => {
@@ -629,6 +815,54 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     else expect(h.remove).not.toHaveBeenCalled();
     expect(h.create).not.toHaveBeenCalled();
   });
+  it.each(['untouched', 'typed-into', 'pinned', 'became-a-chat'])('closes the tab of a first message cancelled before Send (%s)', async mode => {
+    // 2.1.40 release round: cancelling a new chat's first message left the tab the app had opened
+    // for it on ChatGPT's empty start page for good. Only that exact, untouched page closes.
+    const h = await worker([{ id: firstId, conversationId: null, opening: true, close: true } as any]);
+    const url = mode === 'became-a-chat' ? `https://chatgpt.com/c/${secondId}?cos-input=${firstId}` : `https://chatgpt.com/?cos-input=${firstId}`;
+    h.tabs.push({ id: 7, url, pinned: mode === 'pinned' });
+    await h.authorizeDocument({ tab: { id: 7 }, documentId: 'opening', frameId: 0, url }, { navigationEpoch: 1 });
+    h.sendMessage.mockImplementation(async (_tab, message: any) =>
+      (message.type === 'clf-close-cancelled-opening' ? { safe: mode !== 'typed-into' } : { ok: true }) as never);
+    await h.maintain();
+    if (mode === 'untouched') expect(h.remove).toHaveBeenCalledWith(7);
+    else expect(h.remove).not.toHaveBeenCalled();
+    expect(h.create).not.toHaveBeenCalled();
+  });
+  it.each(['left-over', 'recent', 'active', 'listed', 'typed-into', 'no-list'])('closes a start page the app opened for a message it no longer lists (%s)', async mode => {
+    // 2.1.41 bug hunt: a new chat's opening tab outlived its message (claimed, then the chosen browser
+    // changed and the app restarted) and sat on ChatGPT's start page for 13 hours. The cancel path's
+    // close entry never came. A marked, untouched start page the app no longer lists now closes.
+    const inputs = mode === 'listed' ? [{ id: firstId, conversationId: null }] : [];
+    const h = await worker(inputs, undefined, {}, {}, mode === 'no-list' ? undefined : new Set<number>());
+    const url = `https://chatgpt.com/?cos-input=${firstId}#cos-input=${firstId}`;
+    h.tabs.push({ id: 7, url, active: mode === 'active', lastAccessed: Date.now() - (mode === 'recent' ? 60_000 : 13 * 3_600_000) } as any);
+    await h.authorizeDocument({ tab: { id: 7 }, documentId: 'opening', frameId: 0, url }, { navigationEpoch: 1 });
+    h.sendMessage.mockImplementation(async (_tab, message: any) =>
+      (message.type === 'clf-close-cancelled-opening' ? { safe: mode !== 'typed-into' } : { ok: true, ready: true }) as never);
+    await h.maintain();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    if (mode === 'left-over') expect(h.remove).toHaveBeenCalledWith(7);
+    else expect(h.remove).not.toHaveBeenCalledWith(7);
+    expect(h.create).not.toHaveBeenCalled();
+  });
+  it.each(['left-over', 'live', 'typed-into'])('closes the start page of a worker or handoff the app no longer lists (%s)', async mode => {
+    // 2.1.41 bug hunt: a worker that failed before its first message (memory-starved VM) left its
+    // `?clf=` start page open after the run had parked.
+    const h = await worker([], undefined, {}, {}, new Set<number>());
+    if (mode === 'live') h.fetch.mockImplementation(async (input: string) => ({ ok: true, status: 200, json: async () => new URL(input).pathname === '/hello'
+      ? { app: 'chat-on-steroids', bridge: BRIDGE_PROTOCOL, compatible: true, paired: true }
+      : { ok: true, inputs: [], background: true, inputOpeningIds: [], commandIds: ['df36e44ae2a5446f'] } }));
+    const url = 'https://chatgpt.com/?clf=df36e44ae2a5446f#clf=df36e44ae2a5446f';
+    h.tabs.push({ id: 7, url, lastAccessed: Date.now() - 10 * 60_000 } as any);
+    await h.authorizeDocument({ tab: { id: 7 }, documentId: 'worker', frameId: 0, url }, { navigationEpoch: 1 });
+    h.sendMessage.mockImplementation(async (_tab, message: any) =>
+      (message.type === 'clf-close-cancelled-opening' ? { safe: mode !== 'typed-into' && message.command === 'df36e44ae2a5446f' } : { ok: true, ready: true }) as never);
+    await h.maintain();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    if (mode === 'left-over') expect(h.remove).toHaveBeenCalledWith(7);
+    else expect(h.remove).not.toHaveBeenCalledWith(7);
+  });
   it('never opens a helper for passive model observation, including repeated maintenance', async () => {
     const h = await worker([]);
     const request = { nonce: firstId, expiresAt: Date.now() + 60000, allowOpen: false };
@@ -706,6 +940,15 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     await h.maintain();
     expect(h.remove.mock.calls).toEqual([[7]]);
     expect(h.create).not.toHaveBeenCalled();
+  });
+  it('closes a sent temporary helper that ChatGPT moved to its own chat', async () => {
+    // After Send the helper lives at /c/<id>?temporary-chat=true and no longer carries cos-input.
+    const h = await worker([{ id: firstId, conversationId: secondId, owner: '7:planner:1', lifetime: 'temporary-planner', close: true, retire: true } as any]);
+    h.tabs.push({ id: 7, url: `https://chatgpt.com/c/${secondId}?temporary-chat=true` });
+    await h.authorizeDocument({ tab: { id: 7 }, documentId: 'planner', frameId: 0, url: h.tabs[0]!.url }, { navigationEpoch: 1 });
+    h.sendMessage.mockImplementation(async (_id, message) => message.type === 'clf-close-temporary-planner' ? { safe: true } as never : { ok: true });
+    await h.maintain();
+    expect(h.remove.mock.calls).toEqual([[7]]);
   });
   it.each(['draft', 'navigation'])('keeps a retiring helper when %s prevents safe closure', async reason => {
     const work = { id: secondId, conversationId: null };
@@ -801,6 +1044,19 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     await h.maintain();
     expect([...rendered]).toEqual([]);
     expect(h.create).not.toHaveBeenCalled();
+  });
+  // #1086 (2.1.41, Windows VM): a worker tab got its rendering lease only at the next status pass, up
+  // to 40 s after it opened. Until then the hidden, throttled page loaded, chose its model and waited for
+  // ChatGPT's composer so slowly that workers missed their start deadline. Its page asks for the lease
+  // the moment it registers.
+  it('renders a command tab as soon as its page registers, without waiting for the next pass', async () => {
+    const rendered = new Set<number>(), marker = `https://chatgpt.com/?clf=${firstId}`;
+    const h = await worker([], undefined, {}, { discardProtectedTabs: { 7: { commandId: firstId, at: Date.now(), url: marker, conversationId: null } } }, rendered);
+    const tab = { id: 7, url: marker }; h.tabs.push(tab);
+    h.fetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: true, app: 'chat-on-steroids',
+      bridge: BRIDGE_PROTOCOL, compatible: true, paired: true, commandIds: [firstId], inputs: [], nonDiscardableConversations: [] }) });
+    await h.authorizeDocument({ tab, documentId: 'first', frameId: 0, url: marker }, { navigationEpoch: 1 });
+    await vi.waitFor(() => expect([...rendered]).toEqual([7]));
   });
   it('releases command rendering after document replacement and hands a bound worker to ordinary live activity', async () => {
     const rendered = new Set<number>(), marker = `https://chatgpt.com/?clf=${firstId}`;

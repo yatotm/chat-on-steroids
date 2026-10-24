@@ -27,7 +27,9 @@ describe('portable browser-backed feature parity', () => {
         strictChatAllowlist: false,
         recoverAgentTabs: false,
         waitForSubAgents: false,
-        endSleepingWorkerProcesses: false
+        autoWorktrees: false,
+        endSleepingWorkerProcesses: false,
+        archiveWorkerChats: false
       });
       expect(browserExtensionRequired(config)).toBe(true);
     }
@@ -72,6 +74,7 @@ describe('portable browser-backed feature parity', () => {
       'update_plan',
       'agents',
       'session_finish',
+      'usage',
       'exec'
     ]);
     expect(surfaceIsUseful('core', config.capabilities, 'darwin')).toBe(true);

@@ -1,3 +1,4 @@
+import { isCoreRemote } from '../src/shared/projects.js';
 import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -11,7 +12,7 @@ vi.mock('../src/main/secrets.js', () => ({
 import { defaultConfig, effectiveCapabilities, getConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { initDurableStore, readDurable, writeDurableNow, flushDurable, resetDurableForTests } from '../src/main/durable.js';
 import { initSessionStore, createSession, rebindSession, bindSessionProject, resetSessionStoreForTests, readRecentEvents, appendEvent } from '../src/main/session/store.js';
-import { addProject, addRemoteProject, assignSessionProject, listProjects, projectWorkspace, inheritSessionProject, sessionProjectBinding } from '../src/main/projects.js';
+import { addProject, addRemoteProject, assignSessionProject, listProjects, projectWorkspace, inheritSessionProject, sessionProjectBinding, setProjectSecretsShieldOff } from '../src/main/projects.js';
 import { callRemoteCore, validateRemoteProject } from '../src/main/remote-workspace.js';
 import { prepareSessionPrompt } from '../src/main/session/prompt.js';
 import { enqueueInput, resetInputForTests } from '../src/main/session/input.js';
@@ -48,6 +49,43 @@ afterEach(async () => {
   await removeTempDir(directory);
 });
 const add = (directory: string) => addRemoteProject({ url: executor!.url, token: executor!.token, directory });
+
+it.skipIf(!supported).each([false, true])('applies the project secrets shield to remote background output (disabled: %s)', async disabled => {
+  const project = await add(a);
+  if (disabled) await setProjectSecretsShieldOff(project.id, true);
+  const actor = await owner(project.id, 'remote-shield');
+  const secret = 'sk-proj-' + 'mN8Q2r'.repeat(10);
+  await call(actor.requestId, 'exec_command', { cmd: `sleep 0.6; printf 'remote-shield-marker\\nOPENAI_API_KEY=${secret}\\n'`, yield_time_ms: 250 });
+  let output = '';
+  await vi.waitFor(async () => {
+    output = JSON.stringify(await call(actor.requestId, 'read', { paths: ['.'] }));
+    expect(output).toContain('remote-shield-marker');
+  }, { timeout: 5000 });
+  expect(output.includes(secret)).toBe(disabled);
+});
+
+it.skipIf(!supported)('preserves project settings and its native ChatGPT link when reconnecting an executor', async () => {
+  const project = await add(a);
+  if (!project.remote || !isCoreRemote(project.remote)) throw new Error('Expected executor project');
+  const chatgpt = { state: 'linked' as const, id: `g-p-${'a'.repeat(32)}`, updatedAt: Date.now() };
+  await writeDurableNow('projects', [{ ...project, secretsShieldOff: true, chatgpt }]);
+  const reconnected = await addRemoteProject({ url: executor!.url, token: executor!.token, directory: a,
+    replace: { projectId: project.id, path: project.path, binding: project.remote } });
+  expect(reconnected).toMatchObject({ id: project.id, secretsShieldOff: true, chatgpt });
+});
+
+it.skipIf(!supported)('keeps executor and SSH project identities separate in one catalog', async () => {
+  const project = await add(a);
+  const ssh = { id: randomUUID(), name: 'SSH folder', path: `dev:${a}`, remote: { host: 'dev', path: a }, createdAt: Date.now() };
+  await writeDurableNow('projects', [project, ssh]);
+  expect(await listProjects()).toEqual([project, ssh]);
+  await fs.writeFile(path.join(a, 'transport.txt'), 'executor-owned');
+  const actor = await owner(project.id, 'mixed-transports');
+  const result = await call(actor.requestId, 'read', { paths: ['transport.txt'] });
+  expect(result.isError).not.toBe(true);
+  expect(JSON.stringify(result)).toContain('executor-owned');
+  expect(() => validateRemoteProject(ssh)).toThrow();
+});
 async function owner(projectId: string, conversationId: string) {
   const session = await createSession({ title: 'Remote Core test', conversationId });
   await assignSessionProject(session.id, projectId);
@@ -220,7 +258,7 @@ it.skipIf(!supported)('revokes a prepared target when reconnection commits durin
   const pending = callRemoteCore(project, actor.session.id, 'exec_command', { cmd: 'touch stale-binding' }, async () => { enter(); await gate; });
   await entered;
   await addRemoteProject({ url: executor!.url, token: executor!.token, directory: a,
-    replace: { projectId: project.id, path: project.path, binding: project.remote! } });
+    replace: { projectId: project.id, path: project.path, binding: (() => { if (!project.remote || !isCoreRemote(project.remote)) throw new Error('Expected executor project'); return project.remote; })() } });
   release();
   const result = await pending;
   expect(result.isError).toBe(true);

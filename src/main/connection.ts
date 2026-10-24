@@ -6,18 +6,20 @@
  * Optional tunnel failures stay on their own Settings cards and cannot fail Core.
  */
 
+import { loadKeptPort, loadSurfaceTokens, rememberSurfaceTokens } from './mcp/persistent-paths.js';
 import { connectorProof } from './connector-proof.js';
-import type { ConnectionStatus, SurfaceStatus, TunnelSettings } from '../shared/types.js';
+import type { ConnectionState, ConnectionStatus, SurfaceStatus, TunnelSettings } from '../shared/types.js';
 import { requiresApprovedFilesystemRoot } from '../shared/capabilities.js';
 import { prewarmComputerHelper } from './computer/index.js';
 import { effectiveCapabilities, getConfig } from './config.js';
 import { logError, logInfo, logWarn } from './logger.js';
 import { lastRequestAt, startMcpServer, tunnelProbeHeaders, type McpEndpoint } from './mcp/server.js';
 import { lastToolCallAt } from './mcp/tools.js';
-import { SURFACE_LIST, surfaceDefinition, surfaceIsUseful, desktopToolNames, type SurfaceId } from './mcp/surfaces.js';
+import { SURFACE_LIST, configuredConnectorName, liveConnectorName, surfaceIsUseful, desktopToolNames, type SurfaceId } from './mcp/surfaces.js';
 import { getSecret } from './secrets.js';
 import { setupApiKeySlot } from '../shared/setup-profile.js';
 import { startTunnel, TunnelError, type TunnelHandle } from './tunnel/index.js';
+import { tunnelRouteSettlingUntil } from './tunnel/route-settle.js';
 import { desktopAutomationSupported } from './platform.js';
 import { publishPluginSurface, unpublishPluginSurface, pluginRefreshPublications } from './plugin-refresh.js';
 import { pluginManager } from './plugins/manager.js';
@@ -33,7 +35,11 @@ let pendingTeardown: Promise<void> | null = null;
 let tunnel: TunnelHandle | null = null;
 /** Independent optional tunnel lifetimes on the OpenAI path. */
 type OptionalSurface = 'desktop' | 'plugins';
-const optionalTunnels = new Map<OptionalSurface, { handle: TunnelHandle | null; tunnelId: string }>();
+const optionalTunnels = new Map<OptionalSurface, {
+  handle: TunnelHandle | null;
+  tunnelId: string;
+  lossReporter: ConnectionLossReporter;
+}>();
 const optionalSurfaces: OptionalSurface[] = ['desktop', 'plugins'];
 const optionalTunnelId = (settings: TunnelSettings, id: OptionalSurface): string =>
   (id === 'desktop' ? settings.desktopTunnelId : settings.pluginsTunnelId) ?? '';
@@ -109,6 +115,89 @@ let connectionGeneration = 0;
  */
 let shutdownRequested = false;
 
+let notifyConnectionLoss: ((surface: SurfaceId) => boolean | void) | null = null;
+const CONNECTION_LOSS_GRACE_MS = 30_000;
+const connectionLossReporters = new Set<ConnectionLossReporter>();
+let connectionLossNoticesSuspended = false;
+
+interface ConnectionLossReporter {
+  report(state: ConnectionState): void;
+  suspend(): void;
+  resume(): void;
+  retire(): void;
+}
+
+/** The main process owns desktop presentation; connection reports stay independent of Electron. */
+export function setConnectionLossNotifier(notifier: typeof notifyConnectionLoss): void {
+  notifyConnectionLoss = notifier;
+}
+
+/** One delayed notice budget per tunnel lifetime, driven only by its generation-fenced reports. */
+function connectionLossReporter(surface: SurfaceId): ConnectionLossReporter {
+  let armed = false;
+  let outage = false;
+  let retired = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const cancelTimer = (): void => {
+    if (timer === null) return;
+    clearTimeout(timer);
+    timer = null;
+  };
+  const schedule = (): void => {
+    if (retired || connectionLossNoticesSuspended || !armed || !outage || timer !== null) return;
+    timer = setTimeout(() => {
+      timer = null;
+      if (retired || connectionLossNoticesSuspended || !armed || !outage) return;
+      // Consume even if focused, unsupported or refused: never defer/repeat the same outage.
+      armed = false;
+      try { notifyConnectionLoss?.(surface); } catch { /* A notice cannot change tunnel health. */ }
+    }, CONNECTION_LOSS_GRACE_MS);
+  };
+
+  const reporter: ConnectionLossReporter = {
+    report: state => {
+      if (retired) return;
+      if (state === 'connected') {
+        outage = false;
+        cancelTimer();
+        armed = true;
+        return;
+      }
+      // Unknown health/retry reports do not prove recovery or erase an established outage.
+      if (!armed || (state !== 'offline' && state !== 'auth-failed' && state !== 'tunnel-unavailable')) return;
+      outage = true;
+      schedule();
+    },
+    suspend: () => cancelTimer(),
+    resume: () => schedule(),
+    retire: () => {
+      if (retired) return;
+      retired = true;
+      cancelTimer();
+      connectionLossReporters.delete(reporter);
+    }
+  };
+  connectionLossReporters.add(reporter);
+  return reporter;
+}
+
+function retireConnectionLossReporters(): void {
+  for (const reporter of [...connectionLossReporters]) reporter.retire();
+}
+
+/** Sleep never counts toward an outage grace period. Electron calls this on powerMonitor suspend. */
+export function suspendConnectionLossNotices(): void {
+  connectionLossNoticesSuspended = true;
+  for (const reporter of connectionLossReporters) reporter.suspend();
+}
+
+/** An outage that survived sleep gets a fresh full grace window after resume. */
+export function resumeConnectionLossNotices(): void {
+  connectionLossNoticesSuspended = false;
+  for (const reporter of connectionLossReporters) reporter.resume();
+}
+
 function enqueueLifecycle(operation: () => Promise<void>): Promise<void> {
   const run = lifecycleQueue.then(operation, operation);
   lifecycleQueue = run.catch(() => {});
@@ -125,6 +214,7 @@ export function getStatus(): ConnectionStatus {
     ...status,
     lastRequestAt: lastRequestAt(),
     lastToolCallAt: lastToolCallAt(),
+    routeSettlingUntil: tunnelRouteSettlingUntil(),
     surfaces: describeSurfaces()
   };
 }
@@ -161,7 +251,8 @@ function describeSurfaces(): SurfaceStatus[] {
     const previous = status.surfaces.find((entry) => entry.id === surface.id);
     return {
       id: surface.id,
-      connectorName: surfaceDefinition(surface.id).connectorName,
+      connectorName: configuredConnectorName(surface.id),
+      chatgptName: liveConnectorName(surface.id) !== configuredConnectorName(surface.id) ? liveConnectorName(surface.id) : null,
       description: surface.description,
       cardSummary: surface.cardSummary,
       optional: !surface.required,
@@ -277,8 +368,8 @@ function siblingPublicUrl(publicUrl: string | null, localUrl: string | null): st
   }
 }
 
-async function connectImpl(): Promise<void> {
-  if (shutdownRequested || pendingDisconnect) return;
+async function connectImpl(current: () => boolean = () => true): Promise<void> {
+  if (shutdownRequested || pendingDisconnect || !current()) return;
   // Offline counts as running: the tunnel is alive and retrying on its own.
   if (
     status.state === 'connected' ||
@@ -292,7 +383,7 @@ async function connectImpl(): Promise<void> {
   // disconnectImpl can itself await a live endpoint/tunnel. Final shutdown may be requested
   // while that stop is in progress; never mint a fresh generation afterwards and thereby undo
   // the synchronous invalidation performed by shutdownConnection().
-  if (shutdownRequested || pendingDisconnect) return;
+  if (shutdownRequested || pendingDisconnect || !current()) return;
   const generation = ++connectionGeneration;
 
   const config = getConfig();
@@ -314,8 +405,14 @@ async function connectImpl(): Promise<void> {
     }
   }
 
+  let starting = true;
+  const startupCurrent = () => !starting || current();
   try {
     setStatus({ state: 'starting-server', detail: 'Starting the local server…', publicUrl: null });
+    // Opt-in stable URLs for a tunnel of the user's own (#924): the stored tokens, else fresh ones.
+    const keepUrls = getConfig().mcp?.persistentUrls === true;
+    const kept = keepUrls ? await loadSurfaceTokens().catch(() => ({})) : {};
+    const keptPort = keepUrls ? await loadKeptPort().catch(() => null) : null;
     const startedEndpoint = await startMcpServer(() => {
       const live = getConfig();
       return {
@@ -325,9 +422,17 @@ async function connectImpl(): Promise<void> {
         readOnly: live.readOnly,
         privacyScreenshots: live.ui.privacyScreenshots
       };
-    });
+    }, kept, keptPort ? { port: keptPort } : {});
+    if (keepUrls && !(await rememberSurfaceTokens(startedEndpoint.urls))) {
+      logWarn('connector URLs: secure storage is unavailable, so they change at the next start');
+    }
     if (shutdownRequested) {
       await startedEndpoint.stop({ forceAfterMs: 30_000 }).catch(() => {});
+      return;
+    }
+    if (!current()) {
+      await startedEndpoint.stop();
+      await disconnectImpl();
       return;
     }
     endpoint = startedEndpoint;
@@ -335,16 +440,18 @@ async function connectImpl(): Promise<void> {
       await disconnectImpl();
       return;
     }
-    setStatus({ localUrl: endpoint.url, surfaces: describeSurfaces() });
+    setStatus({ localUrl: endpoint.url, keptPortMoved: keptPort && endpoint.port !== keptPort ? { from: keptPort, to: endpoint.port } : null,
+      surfaces: describeSurfaces() });
     if (desktopAutomationSupported() && (caps.screen || caps.control)) void prewarmComputerHelper();
     updateSurface('core', { state: 'starting', detail: 'Connecting…' });
 
     const apiKey = await getSecret(setupApiKeySlot(config.tunnel.profileId));
-    if (shutdownRequested || generation !== connectionGeneration) {
+    if (shutdownRequested || generation !== connectionGeneration || !current()) {
       await disconnectImpl();
       return;
     }
     activeCoreTransport = coreTransport(config.tunnel);
+    const reportLoss = connectionLossReporter('core');
     const startedTunnel = await startTunnel({
       localUrl: endpoint.url,
       settings: config.tunnel,
@@ -352,10 +459,11 @@ async function connectImpl(): Promise<void> {
       discoveryHeaders: tunnelProbeHeaders(),
       label: 'core',
       report: (report) => {
-        if (generation !== connectionGeneration) return;
+        if (generation !== connectionGeneration || !startupCurrent()) return;
         setStatus({
           state: report.state,
           detail: report.detail,
+          offlineCause: report.state === 'offline' ? report.offlineCause ?? null : null,
           lastRequestAt: lastRequestAt(),
           ...(report.publicUrl === undefined ? {} : { publicUrl: report.publicUrl }),
           ...(report.handshakeAt === undefined ? {} : { handshakeAt: report.handshakeAt }),
@@ -379,6 +487,8 @@ async function connectImpl(): Promise<void> {
             });
           }
         }
+        // A shared-origin transport has one tunnel/outage; optional cards are its projections.
+        if (generation === connectionGeneration) reportLoss.report(report.state);
       }
     });
     if (shutdownRequested) {
@@ -389,15 +499,19 @@ async function connectImpl(): Promise<void> {
       return;
     }
     tunnel = startedTunnel;
-    if (generation !== connectionGeneration) {
+    if (generation !== connectionGeneration || !current()) {
       await disconnectImpl();
       return;
     }
 
     warnOnSharedTunnelIds(config.tunnel);
-    for (const id of optionalSurfaces) await startOptionalTunnel(id, generation, config.tunnel, apiKey);
+    for (const id of optionalSurfaces) {
+      if (!current()) { await disconnectImpl(); return; }
+      await startOptionalTunnel(id, generation, config.tunnel, apiKey, startupCurrent);
+    }
+    if (!current()) await disconnectImpl();
   } catch (err) {
-    if (shutdownRequested || generation !== connectionGeneration) {
+    if (shutdownRequested || generation !== connectionGeneration || !current()) {
       await disconnectImpl();
       return;
     }
@@ -408,6 +522,10 @@ async function connectImpl(): Promise<void> {
       state: err instanceof TunnelError ? 'tunnel-unavailable' : 'disconnected',
       detail: message
     });
+  } finally {
+    // Once startup commits, ordinary health belongs to the connection generation. An
+    // unrelated later config save must not disable that established report stream.
+    starting = false;
   }
 }
 
@@ -418,9 +536,10 @@ async function startOptionalTunnel(
   id: OptionalSurface,
   generation: number,
   settings: TunnelSettings,
-  apiKey: string | null
+  apiKey: string | null,
+  current: () => boolean = () => true
 ): Promise<void> {
-  if (shutdownRequested || pendingDisconnect || generation !== connectionGeneration) return;
+  if (shutdownRequested || pendingDisconnect || generation !== connectionGeneration || !current()) return;
   if (settings.kind !== 'openai') return;
   const surface = status.surfaces.find((entry) => entry.id === id);
   if (!surface?.available || !endpoint) return;
@@ -434,7 +553,8 @@ async function startOptionalTunnel(
   }
 
   updateSurface(id, { state: 'starting', detail: 'Connecting…' });
-  const lifetime = { handle: null as TunnelHandle | null, tunnelId };
+  const lossReporter = connectionLossReporter(id);
+  const lifetime = { handle: null as TunnelHandle | null, tunnelId, lossReporter };
   optionalTunnels.set(id, lifetime);
   try {
     const started = await startTunnel({
@@ -444,12 +564,13 @@ async function startOptionalTunnel(
       discoveryHeaders: tunnelProbeHeaders(),
       label: id,
       report: (report) => {
-        if (generation !== connectionGeneration || optionalTunnels.get(id) !== lifetime) return;
+        if (generation !== connectionGeneration || optionalTunnels.get(id) !== lifetime || !current()) return;
         updateSurface(id, {
           state: surfaceStateForConnection(report.state),
           detail: report.detail,
           ...(report.publicUrl === undefined ? {} : { publicUrl: report.publicUrl })
         });
+        if (generation === connectionGeneration && optionalTunnels.get(id) === lifetime) lossReporter.report(report.state);
       }
     });
     if (shutdownRequested) {
@@ -462,7 +583,8 @@ async function startOptionalTunnel(
     lifetime.handle = started;
   } catch (err) {
     if (optionalTunnels.get(id) === lifetime) optionalTunnels.delete(id);
-    if (shutdownRequested || generation !== connectionGeneration) {
+    lossReporter.retire();
+    if (shutdownRequested || generation !== connectionGeneration || !current()) {
       return;
     }
     const message = err instanceof TunnelError ? err.message : (err as Error).message;
@@ -476,6 +598,7 @@ async function stopOptionalTunnel(id: OptionalSurface, detail: string): Promise<
   const current = optionalTunnels.get(id);
   if (!current) return;
   optionalTunnels.delete(id);
+  current.lossReporter.retire();
   await current.handle?.stop().catch(() => {});
   logInfo(`${id} connector unpublished`);
   updateSurface(id, { state: 'off', detail, publicUrl: null });
@@ -543,6 +666,7 @@ function disconnectImpl(endpointForceAfterMs?: number): Promise<void> {
 async function disconnectResources(endpointForceAfterMs?: number): Promise<void> {
   for (const surface of SURFACE_LIST) unpublishPluginSurface(surface.id);
   // Invalidate callbacks first; stopping a child can itself cause exit/health events.
+  retireConnectionLossReporters();
   connectionGeneration += 1;
   if (status.state !== 'disconnected') {
     setStatus({ state: 'disconnecting', detail: 'Disconnecting; waiting for accepted requests to finish…' });
@@ -576,20 +700,27 @@ async function disconnectResources(endpointForceAfterMs?: number): Promise<void>
     detail: '',
     publicUrl: null,
     localUrl: null,
+    keptPortMoved: null,
     handshakeAt: null,
     health: null,
     surfaces: describeSurfaces()
   });
 }
 
-export function connect(): Promise<void> {
+/** Keeps the running connector URLs from now on (the option was just turned on); false if it could not. */
+export async function rememberRunningSurfaceTokens(): Promise<boolean> {
+  return endpoint ? rememberSurfaceTokens(endpoint.urls) : true;
+}
+
+export function connect(current?: () => boolean): Promise<void> {
   if (shutdownRequested) return Promise.resolve();
-  return enqueueLifecycle(connectImpl);
+  return enqueueLifecycle(() => connectImpl(current));
 }
 
 export function disconnect(): Promise<void> {
   if (pendingDisconnect) return pendingDisconnect;
   connectionGeneration += 1;
+  retireConnectionLossReporters();
   logInfo('disconnect requested');
   setStatus({ state: 'disconnecting', detail: 'Disconnecting; waiting for accepted requests to finish…' });
   pendingDisconnect = enqueueLifecycle(disconnectImpl).finally(() => { pendingDisconnect = null; });
@@ -606,6 +737,7 @@ export function shutdownConnection(): Promise<void> {
   // Ordinary disconnect does not set this flag, so Settings can still disconnect/reconnect.
   shutdownRequested = true;
   connectionGeneration += 1;
+  retireConnectionLossReporters();
   // Do not enqueue the force deadline behind the ordinary drain it must bound.
   void drainingEndpoint?.stop({ forceAfterMs: 30_000 }).catch(() => {});
   // Quit is terminal: it must not inherit an unfinished startup/keychain wait.

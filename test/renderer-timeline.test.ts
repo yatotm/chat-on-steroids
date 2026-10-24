@@ -1,17 +1,20 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { JSDOM } from 'jsdom';
-import { afterEach, expect, it, vi } from 'vitest';
+import { Lexer } from 'marked';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_GOAL_SYSTEM_PROMPT } from '../src/shared/goal.js';
+import { defaultAppearance } from '../src/shared/appearance.js';
 import { prependUserPrompt } from '../src/shared/user-prompt.js';
 import type { Handoff, SessionEvent, SessionSummary } from '../src/shared/session.js';
+import { BOOKMARK_EXCERPT_MAX } from '../src/shared/session.js';
 import type { InputArgs, InputEntry } from '../src/main/session/input.js';
 import type { LocalProject } from '../src/shared/projects.js';
 vi.mock('../src/renderer/workspace-terminal.js', () => ({ createWorkspaceTerminal: () => ({
   update: vi.fn(), show: vi.fn(), hide: vi.fn(), hasTabs: () => false,
   tabs: () => [], newTab: () => null, selectTab: vi.fn(), closeTab: vi.fn()
 }) }));
-vi.mock('../src/renderer/pet.js', () => ({ initPet: () => () => {} }));
+vi.mock('../src/renderer/pet.js', () => ({ initPet: () => Object.assign(() => {}, { toggle: () => {}, isVisible: () => false }) }));
 vi.mock('../src/renderer/file-code-editor.js', () => ({
   createProjectDiffViewer: async ({ parent, baseText, currentText }: { parent: HTMLElement; baseText: string; currentText: string }) => {
     const view = parent.ownerDocument.createElement('pre');
@@ -20,7 +23,7 @@ vi.mock('../src/renderer/file-code-editor.js', () => ({
     return { destroy: () => view.remove(), language: 'TypeScript' };
   }
 }));
-import { positionOf, projectTimeline } from '../src/shared/chronology.js';
+import { positionOf, projectTimeline, residenceOf } from '../src/shared/chronology.js';
 
 /**
  * The session timeline as the user reads it while a chat is running.
@@ -165,7 +168,7 @@ async function settleHistoryFrame(w: Pick<Window, 'requestAnimationFrame'>): Pro
   await settle();
 }
 
-async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers: Array<{ id: string; sourceSessionId: string }> = [], projects: LocalProject[] = [], options: { origin?: SessionSummary["origin"]; developerMode?: boolean; playfulStatus?: boolean; followOutput?: boolean; sessions?: SessionSummary[]; pro?: boolean; astra?: boolean; reserveOpenings?: boolean; handoff?: Handoff | null; deferProcessStop?: boolean; defaultChatModel?: string; noModels?: boolean } = {}) {
+async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers: Array<{ id: string; sourceSessionId: string }> = [], projects: LocalProject[] = [], options: { origin?: SessionSummary["origin"]; developerMode?: boolean; playfulStatus?: boolean; announceTurns?: boolean; followOutput?: boolean; followUp?: 'steer' | 'queue'; enterSends?: boolean; sessions?: SessionSummary[]; pro?: boolean; astra?: boolean; reserveOpenings?: boolean; handoff?: Handoff | null; deferProcessStop?: boolean; defaultChatModel?: string; noModels?: boolean; approvalCard?: () => unknown; answerApproval?: (id: string, cardId: string, choice: string) => unknown; summary?: Partial<SessionSummary>; holdInputs?: Promise<void>; storage?: Record<string, string>; inbox?: boolean } = {}) {
   const html = await fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'index.html'), 'utf8');
   dom = new JSDOM(html, { url: 'https://local.test/', pretendToBeVisual: true });
   const w = dom.window;
@@ -185,6 +188,8 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
     HTMLButtonElement: w.HTMLButtonElement
   });
   if (!(w.HTMLElement.prototype as any).scrollIntoView) (w.HTMLElement.prototype as any).scrollIntoView = () => {};
+  // What an earlier run of the app left in this window's storage.
+  for (const [key, value] of Object.entries(options.storage ?? {})) w.localStorage.setItem(key, value);
 
   const config = {
     roots: [{ name: 'repo', path: 'C:\\repo' }],
@@ -196,8 +201,9 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
     },
     commandAllowlist: { enabled: false, mode: 'allow' as const, rules: [] as string[] },
     tunnel: { kind: 'openai', tunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', desktopTunnelId: '', binaryPath: '' },
-    ui: { minimizeToTray: true, autoConnect: false, privacyScreenshots: false, theme: 'light', developerMode: options.developerMode ?? false, playfulStatus: options.playfulStatus ?? false, ...(options.followOutput === undefined ? {} : { followOutput: options.followOutput }),
-      ...(options.defaultChatModel ? { defaultChatModel: options.defaultChatModel, defaultChatReasoning: 'high' } : {}) },
+    ui: { minimizeToTray: true, autoConnect: false, privacyScreenshots: false, theme: 'light', developerMode: options.developerMode ?? false, playfulStatus: options.playfulStatus ?? false, ...(options.announceTurns === undefined ? {} : { announceTurns: options.announceTurns }), ...(options.followOutput === undefined ? {} : { followOutput: options.followOutput }), ...(options.followUp === undefined ? {} : { followUp: options.followUp }), ...(options.enterSends === undefined ? {} : { enterSends: options.enterSends }),
+      ...(options.defaultChatModel ? { defaultChatModel: options.defaultChatModel, defaultChatReasoning: 'high' } : {}),
+      ...(options.inbox ? { appearance: { ...defaultAppearance(), sidebarLayout: 'inbox' as const } } : {}) },
     sessions: { record: true, retainDays: 30, advisoryTokens: 300000, limitTokens: 400000 },
     compaction: { auto: true, autoTokens: 300000 },
     multiAgent: { enabled: false, maxWorkers: 2, allowUnattributedCalls: false, recoverAgentTabs: true },
@@ -214,6 +220,7 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
     update: { current: '2.0.3', latest: null, stage: 'idle', error: null, checkedAt: null }
   };
   const ok = (data: any) => Promise.resolve({ ok: true, data });
+  const bootOptions = options;
   const live = { events: [...events], inputs: [] as InputEntry[], sent: [] as InputArgs[], automation: 'off', controlCalls: [] as Array<{ id: string; action: string }>, compacting: false, finishHeld: true };
   let sessionListener: (change?: unknown) => void = () => undefined;
   let writeSessionListener: (id: string) => void = () => undefined;
@@ -231,6 +238,7 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
       setSessionAutomation: (id: string, action: string) => { live.controlCalls.push({ id, action }); live.automation = action; return ok({}); },
       compactSession: (id: string) => { live.controlCalls.push({ id, action: 'compact' }); live.compacting = true; return ok({}); },
       cancelSessionCompaction: (id: string) => { live.controlCalls.push({ id, action: 'cancel' }); live.compacting = false; return ok({}); },
+      resumeFromHandoff: (id: string, handoffId: string) => { live.controlCalls.push({ id, action: `resume:${handoffId}` }); return ok({}); },
       getLog: () => ok([]),
       getSwarm: () => ok({ running: false, runId: null, agents: [], maxWorkers: 2, pendingReports: 0 }),
       onStateChanged: () => () => undefined,
@@ -247,7 +255,7 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
         return () => undefined;
       },
       listSessions: () => {
-        const sessions = options.sessions ?? [{ ...summary(live.events), ...(options.origin ? { origin: options.origin } : {}), ...(projects[0] ? { projectId: projects[0].id } : {}) }];
+        const sessions = options.sessions ?? [{ ...summary(live.events), ...options.summary, ...(options.origin ? { origin: options.origin } : {}), ...(projects[0] ? { projectId: projects[0].id } : {}) }];
         const known = new Set(sessions.map(row => row.id));
         const openings = live.inputs.filter(row => row.opening && row.sessionId && !known.has(row.sessionId)).map(row => ({
           ...summary(live.events), id: row.sessionId!, title: row.text, conversationId: null, chatIds: []
@@ -256,7 +264,8 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
       },
       listProjects: () => ok(projects),
       // IPC snapshots cannot share the backend's mutable array with the renderer.
-      listInputs: () => ok(structuredClone(live.inputs)),
+      // `holdInputs`: the outbox read answers only once it resolves, like a slow first read after launch.
+      listInputs: () => options.holdInputs ? options.holdInputs.then(() => ok(structuredClone(live.inputs))) : ok(structuredClone(live.inputs)),
       cancelInput: vi.fn((id: string) => {
         const entry = live.inputs.find(row => row.id === id);
         if (!entry) return ok(false);
@@ -275,7 +284,9 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
         backgroundProcessListener = listener;
         return () => undefined;
       },
-      livePreview: () => ok(null), listPausedHelpers: () => ok(pausedHelpers),
+      approvalCard: () => ok(options.approvalCard?.() ?? null),
+      answerApproval: (id: string, cardId: string, choice: string) => ok(options.answerApproval?.(id, cardId, choice) ?? { ok: true }),
+      turnTraces: () => ok({}), listPausedHelpers: () => ok(pausedHelpers),
       retryHelper: (id: string, sourceSessionId: string) => {
         live.controlCalls.push({ id: sourceSessionId, action: `retry:${id}` });
         pausedHelpers = pausedHelpers.filter(row => row.id !== id);
@@ -297,16 +308,20 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
       },
       getSession: (_id: string, options?: { from?: number; before?: number; after?: number; limit?: number }) => {
         const from = options?.from ?? 0;
+        // Pages as the store does: by residence (a turn's final answer beside its end). The CI
+        // fail-first run executes this file against code without residenceOf; position is its fallback there.
+        const residence = residenceOf ?? positionOf;
         const eligible = live.events.filter((event) => event.seq >= from &&
-          (options?.before === undefined || positionOf(event) < options.before) &&
-          (options?.after === undefined || positionOf(event) > options.after))
-          .sort((a, b) => options?.from !== undefined ? a.seq - b.seq : positionOf(a) - positionOf(b));
+          (options?.before === undefined || residence(event) < options.before) &&
+          (options?.after === undefined || residence(event) > options.after))
+          .sort((a, b) => options?.from !== undefined ? a.seq - b.seq : residence(a) - residence(b));
         const limit = options?.limit ?? 30;
         const page = options?.after !== undefined || options?.from !== undefined
           ? eligible.slice(0, limit) : eligible.slice(-limit);
         const opening = live.inputs.find(row => row.opening && row.sessionId === _id);
         return ok({
-          summary: opening ? { ...summary(live.events), id: _id, title: opening.text, conversationId: null, chatIds: [] } : summary(live.events),
+          summary: opening ? { ...summary(live.events), id: _id, title: opening.text, conversationId: null, chatIds: [] }
+            : { ...summary(live.events), ...bootOptions.summary, ...(bootOptions.sessions?.find(row => row.id === _id) ?? {}) },
           events: page,
           total: live.events.length,
           nextFrom: page.reduce((max, e) => Math.max(max, e.seq + 1), from)
@@ -351,6 +366,13 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
     }
   };
 }
+
+it('ignores a pointer release when the timeline owns no pointer press', async () => {
+  const { w } = await boot([]);
+  const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+  w.dispatchEvent(new w.MouseEvent('pointerup'));
+  expect(error).not.toHaveBeenCalled();
+});
 
 it('makes parent and worker session selectors keyboard-focusable and activates them with Enter/Space', async () => {
   const parent: SessionSummary = { ...summary([]), id: 'parent-session', title: 'Parent', conversationId: 'parent-chat', chatIds: ['parent-chat'] };
@@ -573,6 +595,40 @@ it.each(['compaction', 'blocked', 'worker'])('retires %s control status when lea
   expect(status.textContent).toBe('');
   release({ ok: true, data: controls }); await settle();
   expect(status.textContent).not.toBe('');
+});
+
+it('localizes only the exact app-authored Goal helper stop note at draw time', async () => {
+  const source = 'The helper says the goal is met, but this has not been checked. No follow-up was sent. Review the chat and continue if work remains.';
+  const rows = [
+    { progressId: 'goal-helper-stop:turn-1', source: 'app' as const, value: source },
+    { progressId: 'unrelated:turn-1', source: 'app' as const, value: source },
+    { progressId: 'goal-helper-stop:turn-2', source: 'app' as const, value: source + ' Historical detail.' },
+    { progressId: 'goal-helper-stop:turn-3', source: 'extension' as const, value: source }
+  ];
+  const { w } = await boot(rows.map((row, at) => ({
+    seq: at + 1, time: T0 + at, source: row.source, kind: 'progress' as const,
+    progressId: row.progressId, message: text(row.value)
+  })));
+  const { setLanguage, t } = await import('../src/renderer/i18n.js');
+  setLanguage('de');
+  const notes = [...w.document.querySelectorAll('.ev-progress .meta')];
+  expect(notes.map(note => note.textContent)).toEqual([t(source), source, rows[2]!.value, source]);
+  expect(notes[0]!.textContent).not.toBe(source);
+  setLanguage('en');
+  expect(notes.map(note => note.textContent)).toEqual(rows.map(row => row.value));
+});
+
+it('asks for the selected chat\'s background tab once per switch (#1249)', async () => {
+  const first = summary([]), second = { ...summary([]), id: '2026-09-02-test0002', title: 'Other session' };
+  const { w } = await boot([], true, [], [], { sessions: [first, second] });
+  const api = (w as any).api;
+  const followed: string[] = [];
+  api.followSessionTab = async (id: string) => { followed.push(id); return { ok: true, data: true }; };
+  const row = (id: string) => w.document.querySelector<HTMLElement>(`#sessionList [data-id="${id}"]`)!;
+  row(second.id).click();
+  row(second.id).click();
+  row(first.id).click();
+  expect(followed).toEqual([second.id, first.id]);
 });
 
 it('clears control projections on an existing-session switch and fences A to B to A responses', async () => {
@@ -847,6 +903,21 @@ it('identifies automatic Continue without user-task editing or reordering and ke
   expect(w.document.querySelectorAll('#finishQueue [aria-label="Edit queued task"]')).toHaveLength(2);
 });
 
+// #1402: the app's own fresh-turn continue is no one's typed message. Waiting, it shows as the
+// message it is; dropped, it raises no delivery notice, because the app tries again by itself.
+it('shows a fresh-turn continue while it waits and raises no notice when it is dropped', async () => {
+  const { w, live, append } = await boot([]);
+  const rotation: InputEntry = { id: 'fresh-turn', sessionId: summary([]).id, text: 'Continue the task from where you are.', mode: 'auto',
+    dueAt: 0, model: null, reasoningEffort: null, state: 'queued', owner: null, createdAt: 0, conversationId: 'chat-b', purpose: 'rotation' };
+  live.inputs.push(rotation);
+  await append([]);
+  expect(w.document.querySelector('#inputQueue [data-input-id="fresh-turn"]')?.textContent).toContain('Continue the task');
+  live.inputs[0] = { ...rotation, state: 'cancelled', error: 'Not sent: browser preparation timed out. This attempt was cancelled.' };
+  await append([]);
+  expect(w.document.querySelector('#inputQueue [data-input-id="fresh-turn"]')).toBeNull();
+  expect(w.document.getElementById('inputQueue')!.textContent).not.toContain('Not sent');
+});
+
 it('keeps a transport-deferred immediate upload visible with cancellation instead of an invalid task editor', async () => {
   const { w, live, append } = await boot([]);
   live.inputs.push({ id: 'native-correction', sessionId: summary([]).id, text: 'Waiting upload', mode: 'after-turn', requestedMode: 'auto',
@@ -924,6 +995,26 @@ it.each(['cancelled', 'browser'])('retires the editor when Save learns the queue
   expect(live.inputs[0]?.text).toBe('Original');
   if (state === 'cancelled') expect(w.document.querySelector('#finishQueue [data-input-id="retired-edit"]')).toBeNull();
   else expect(w.document.querySelector('#finishQueue [data-input-id="retired-edit"]')).not.toBeNull();
+  // The edit the user typed is not lost: an empty composer takes it, and a notice says why.
+  expect(w.document.querySelector<HTMLTextAreaElement>('#chatInput')!.value).toBe('Late edit');
+  expect(w.document.querySelector('.toast')?.textContent).toContain('your edit is in the composer');
+});
+
+it('keeps the composer\'s own draft when a late queued edit cannot be saved', async () => {
+  const { w, live, append } = await boot([]);
+  live.inputs.push({ id: 'late-edit', sessionId: summary([]).id, text: 'Original', mode: 'after-turn', dueAt: 0,
+    model: null, reasoningEffort: null, state: 'queued', owner: null, createdAt: 0, conversationId: 'chat-b' });
+  await append([]);
+  const composer = w.document.querySelector<HTMLTextAreaElement>('#chatInput')!;
+  composer.value = 'My next message'; composer.dispatchEvent(new w.Event('input', { bubbles: true }));
+  (w.document.querySelector('[aria-label="Edit queued task"]') as HTMLButtonElement).click();
+  const field = w.document.querySelector<HTMLTextAreaElement>('#finishQueue textarea')!;
+  field.value = 'Late edit';
+  (w as any).api.editQueuedInput = async () => { live.inputs[0]!.state = 'browser'; return { ok: true, data: false }; };
+  (field.nextElementSibling as HTMLButtonElement).click(); await settle();
+  expect(composer.value).toBe('My next message');
+  expect(w.document.querySelector('.toast')?.textContent).toContain('before your edit was saved');
+  expect(w.document.querySelector('.toast')?.textContent).not.toContain('in the composer');
 });
 
 it('retires a queued editor synchronously on New Chat and ignores its delayed save after returning', async () => {
@@ -1039,6 +1130,69 @@ it.each([false, true])('keeps retained image previews at the canonical row acros
   (w.document.querySelector('#sessionList [data-id]') as HTMLElement).click(); await settle();
   expect(w.document.querySelector('#timeline')!.textContent).not.toContain(row.text);
   expect(w.document.querySelector('#inputQueue')!.textContent).not.toContain(row.text);
+});
+
+describe("a new chat's first message held for its project's ChatGPT Project", () => {
+  const project: LocalProject = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-000000000777', name: 'Website', path: '/work/website', createdAt: T0,
+    chatgpt: { state: 'requested', requestId: 'cccccccc-bbbb-4ccc-8ddd-000000000777', updatedAt: T0 } };
+  const failed = { ...project, chatgpt: { state: 'failed', requestId: 'cccccccc-bbbb-4ccc-8ddd-000000000777', error: 'x', updatedAt: T0 } } as LocalProject;
+  // Removed from the sidebar before its ChatGPT Project existed: nothing creates it any more and
+  // there is no menu to retry from, so the message says how it can still go out. Adding the folder
+  // again restores the project and its pending ChatGPT Project.
+  const removed = "This chat's project was removed from the sidebar. Add its folder again to send this message, or cancel it.";
+  it.each([
+    ['being created', project, 'Creating this project in ChatGPT…'],
+    ['that could not be created', failed, "This project's ChatGPT Project isn't available. Retry it from the project's menu."],
+    ['removed while it was being created', { ...project, ungrouped: true }, removed],
+    ['removed after it could not be created', { ...failed, ungrouped: true }, removed]
+  ] as const)('says why it waits for a project %s', async (_case, row, expected) => {
+    const { w, live, append } = await boot([], false, [], [row as LocalProject], { summary: { conversationId: null, projectId: project.id } });
+    // The chat sits in its project while the project is in the sidebar, under Chats once it is removed.
+    w.document.querySelector<HTMLElement>('.project-group .project-heading')?.click(); await settle();
+    w.document.querySelector<HTMLElement>('.sess[data-id]')!.click(); await settle();
+    const chat = await import('../src/renderer/chat.js');
+    const state = (await (w as any).api.getState()).data;
+    chat.chatApply({ ...state, bridge: { ...state.bridge, present: true } });
+    live.inputs.push({ id: 'first-message', sessionId: summary(live.events).id, state: 'queued', owner: 'page', text: 'Hi',
+      mode: 'auto', model: null, reasoningEffort: null, dueAt: T0, createdAt: T0, conversationId: null, projectId: project.id });
+    await append([]);
+    await vi.waitFor(() => expect(w.document.querySelector('#inputQueue .pending-message')?.textContent ?? '').toContain(expected), { timeout: 5000 });
+  });
+});
+
+it('says why a queued message waits: no extension, or a running tool call', async () => {
+  const asked = Date.now() - 12_000;
+  const { w, live, append } = await boot([
+    { seq: 1, time: asked - 100, source: 'extension', kind: 'turn_start', turnId: 'held-turn' },
+    { kind: 'user_message', seq: 2, origin: 2, time: asked, source: 'extension', turnId: 'held-turn', messageId: 'q-now', message: text('Run the tests') }
+  ]);
+  const api = (w as any).api;
+  const chat = await import('../src/renderer/chat.js');
+  const state = (await api.getState()).data;
+  const present = (on: boolean) => chat.chatApply({ ...state, bridge: { ...state.bridge, present: on } });
+  const queued: InputEntry = { id: 'queued-one', sessionId: summary(live.events).id, state: 'queued', owner: 'page', text: 'After the tests',
+    mode: 'auto', model: null, reasoningEffort: null, dueAt: T0, createdAt: T0, conversationId: 'chat-a' };
+  const status = () => w.document.querySelector('#inputQueue .pending-message')!.textContent ?? '';
+  live.inputs.push(queued);
+  // No extension connected: nothing can leave yet.
+  present(false); await append([]);
+  expect(status()).toContain('Waiting for the browser extension to connect');
+  expect(w.document.querySelector('#inputQueue .pending-message')!.classList.contains('is-waiting')).toBe(true);
+  // Connected, with one of this chat's tool calls running: the message waits for it (#1231).
+  api.runningTools = () => Promise.resolve({ ok: true, data: [{ title: 'Running npm test', kind: 'run', since: Date.now() - 5_000 }] });
+  present(true); await append([]); await append([]);
+  expect(status()).toContain('Waiting for the running tool call to finish');
+  // A mid-turn send does not wait for calls, so it claims no such reason.
+  live.inputs[0] = { ...queued, directTurn: { id: 'held-turn', startedAt: asked } };
+  await append([]); await append([]);
+  expect(status()).not.toContain('Waiting for the running tool call');
+  // The call ended: back to the plain clock, with Queued as its label.
+  live.inputs[0] = queued;
+  api.runningTools = () => Promise.resolve({ ok: true, data: [] });
+  await append([]); await append([]);
+  expect(status()).not.toContain('Waiting for');
+  expect(w.document.querySelector('#inputQueue .pending-message-status')!.getAttribute('aria-label')).toBe('Queued');
+  expect(w.document.querySelector('#inputQueue .pending-message')!.classList.contains('is-waiting')).toBe(false);
 });
 
 it.each([false, true])('hands a delivered bubble to exact native history without a blank or duplicate (historyFirst=%s)', async historyFirst => {
@@ -1165,7 +1319,23 @@ it('keeps generated-image metadata visible when recording storage is full', asyn
   expect(row.querySelector('.generated-image-frame')).toBeTruthy();
   expect(row.querySelector('img')).toBeNull();
   expect(row.querySelector('.generated-image-frame')?.classList.contains('is-unavailable')).toBe(true);
-  expect(row.querySelector('button')?.textContent).toBe('Free image storage');
+  expect(row.querySelector('button')?.textContent).toBe('Free storage');
+});
+
+it.each([
+  ['oversized', 'exceeds the recording limit', false],
+  ['not_loaded', 'Image preview unavailable', false],
+  ['removed', 'removed from local storage', true]
+] as const)('offers Free storage only where storage is the reason (%s)', async (previewError, says, offers) => {
+  // VM, 2026-10-20: a picture the page could not shrink showed Free storage, which cannot help.
+  const app = await boot([]);
+  await app.append([{ seq: 1, time: T0, source: 'extension', kind: 'native_image',
+    messageId: '5150f756-bf2d-45fa-ac0f-45010b2239fb', providerAssetId: `file_${previewError}_fixture`,
+    providerRole: 'tool', providerChannel: 'final', providerStatus: 'finished_successfully',
+    width: 1448, height: 1086, previewStatus: 'unavailable', previewError }]);
+  const row = app.w.document.querySelector('.said.native-image')!;
+  expect(row.textContent).toContain(says);
+  expect(!!row.querySelector('button')).toBe(offers);
 });
 
 it('does not group images across an intervening authored message or another turn', async () => {
@@ -1324,6 +1494,108 @@ it('loads recorded tool images on expansion and hides truncated binary envelopes
   expect(tool.querySelector('img')?.getAttribute('src')).toBe('data:image/png;base64,YQ==');
 });
 
+// #1190: project headings come from the whole project list, chats from the newest page of all
+// history. A project whose chats are all older looked empty, and expanding it did nothing.
+async function olderProjectFixture(projectPages?: SessionSummary[][]) {
+  const project = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'Older workspace', path: '/fixture', createdAt: 1 };
+  const recent = { ...summary([]), id: 'recent-unfiled', projectId: undefined, updatedAt: T0 + 400 };
+  const worker = { ...summary([]), id: 'older-worker', projectId: project.id, updatedAt: T0 + 3,
+    origin: { kind: 'worker' as const, fromSessionId: 'older-parent', agentId: 'worker-1', task: 'Inspect' } };
+  const parent = { ...summary([]), id: 'older-parent', conversationId: 'older-chat', projectId: project.id, updatedAt: T0 + 2 };
+  const unused = { ...summary([]), id: 'oldest-unfiled', projectId: undefined, updatedAt: T0 + 1 };
+  // The newest page of everything shows no chat of the project; the project's own pages do.
+  const all = [[recent], [unused]];
+  const own = projectPages ?? [[worker], [parent]];
+  const { w, append } = await boot([], false, [], [project], { sessions: [recent] });
+  const list = vi.fn(async (options: any) => {
+    const pages = options?.projectId === project.id ? own : all;
+    const index = options?.cursor ? pages.findIndex(rows => rows.at(-1)?.id === options.cursor.id) + 1 : 0;
+    const rows = pages[index] ?? [];
+    return { ok: true, data: { sessions: rows, total: 4, nextCursor: index < pages.length - 1 ? { updatedAt: rows.at(-1)!.updatedAt, id: rows.at(-1)!.id } : null,
+      activeId: null, pressure: [], blocked: [] } };
+  });
+  (w as any).api.listSessions = list;
+  await append([]); list.mockClear();
+  const heading = () => w.document.querySelector('.project-heading') as HTMLElement;
+  const projectCalls = () => list.mock.calls.map(([options]) => options).filter(options => options?.projectId);
+  return { w, list, heading, parent, worker, own, project, append, projectCalls };
+}
+
+it("shows a project's older chats when it is expanded, asking for that project's pages only", async () => {
+  const f = await olderProjectFixture(); f.heading().click(); await settle();
+  expect(f.w.document.querySelector('.project-group [data-id="older-parent"]')).not.toBeNull();
+  // A page of workers alone shows no chat, so the next page of the project follows.
+  expect(f.projectCalls()).toEqual([
+    { projectId: f.project.id, limit: 60 },
+    { projectId: f.project.id, limit: 60, cursor: { updatedAt: f.worker.updatedAt, id: f.worker.id } }
+  ]);
+  // The rest of the history is not paged for it, no chat is selected, and the project stays open.
+  expect(f.list.mock.calls.every(([options]) => !!options?.projectId)).toBe(true);
+  expect(f.w.document.querySelector('[data-id="oldest-unfiled"]')).toBeNull();
+  expect(f.w.document.querySelector('.sess.is-sel')).toBeNull();
+  expect((f.w.document.querySelector('.project-group') as HTMLDetailsElement).open).toBe(true);
+});
+
+it("keeps a project's older chats through the sidebar's next refresh", async () => {
+  const f = await olderProjectFixture(); f.heading().click(); await settle();
+  await f.append([]); await settle();
+  expect(f.w.document.querySelector('.project-group [data-id="older-parent"]')).not.toBeNull();
+  // Asked once: the refresh and another expand do not read the project again.
+  f.heading().click(); f.heading().click(); await settle();
+  expect(f.projectCalls()).toHaveLength(2);
+});
+
+it('stops reading a project when it is collapsed while a page is on its way', async () => {
+  const f = await olderProjectFixture();
+  let resolve!: (value: any) => void;
+  f.list.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+  f.heading().click(); await settle();
+  expect(f.projectCalls()).toHaveLength(1);
+  f.heading().click();
+  resolve({ ok: true, data: { sessions: f.own[0], total: 4, nextCursor: { updatedAt: f.worker.updatedAt, id: f.worker.id }, activeId: null, pressure: [], blocked: [] } });
+  await settle();
+  expect(f.projectCalls()).toHaveLength(1);
+  expect((f.w.document.querySelector('.project-group') as HTMLDetailsElement).open).toBe(false);
+  // Expanding again continues where it stopped.
+  f.heading().click(); await settle();
+  expect(f.projectCalls()).toHaveLength(2);
+  expect(f.w.document.querySelector('.project-group [data-id="older-parent"]')).not.toBeNull();
+});
+
+it('does not loop when a project page cannot be read, and tries again on the next expand', async () => {
+  const f = await olderProjectFixture();
+  f.list.mockResolvedValueOnce({ ok: false, error: 'Fixture read failure' } as any);
+  f.heading().click(); await settle();
+  expect(f.projectCalls()).toHaveLength(1);
+  expect(f.w.document.querySelector('.project-group [data-id="older-parent"]')).toBeNull();
+  f.heading().click(); f.heading().click(); await settle();
+  expect(f.w.document.querySelector('.project-group [data-id="older-parent"]')).not.toBeNull();
+});
+
+it('asks an empty project once', async () => {
+  const f = await olderProjectFixture([[]]);
+  f.heading().click(); await settle();
+  f.heading().click(); f.heading().click(); await settle();
+  expect(f.projectCalls()).toEqual([{ projectId: f.project.id, limit: 60 }]);
+  expect(f.w.document.querySelectorAll('.project-group .sess')).toHaveLength(0);
+});
+
+it('continues with the project\'s older pages from "Show more"', async () => {
+  const task = (index: number): SessionSummary => ({ ...summary([]), id: `project-task-${index}`, conversationId: `chat-${index}`, title: `Task ${index}`,
+    projectId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', updatedAt: T0 + 100 - index });
+  const f = await olderProjectFixture([[0, 1, 2, 3, 4].map(task), [5, 6].map(task)]);
+  f.heading().click(); await settle();
+  const shown = () => [...f.w.document.querySelectorAll<HTMLElement>('.project-group .sess')].map(row => row.dataset.id);
+  expect(shown()).toHaveLength(5);
+  // Everything loaded is on screen, and the project has more: the button reads on from there.
+  const more = f.w.document.querySelector('.project-show-more') as HTMLElement;
+  expect(more).not.toBeNull();
+  more.click(); await settle();
+  expect(f.projectCalls()).toHaveLength(2);
+  expect(shown()).toEqual([0, 1, 2, 3, 4, 5, 6].map(index => `project-task-${index}`));
+  expect(f.w.document.querySelector('.project-show-more')).toBeNull();
+});
+
 it('pages project tasks as complete parent/worker groups and keeps the selected task visible after reordering', async () => {
   const project = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'Paged', path: '/paged', createdAt: 1 };
   const tasks = Array.from({ length: 8 }, (_, index) => ({ ...summary([]), id: `project-task-${index}`, conversationId: `chat-${index}`, title: `Task ${index}`, projectId: project.id }));
@@ -1348,6 +1620,51 @@ it('pages project tasks as complete parent/worker groups and keeps the selected 
   expect(section().querySelector('.project-show-more')).toBeNull();
   await append([]);
   expect(section().querySelectorAll(':scope > .sess')).toHaveLength(8);
+});
+it('does not allocate hidden project chat rows on each activity refresh', async () => {
+  const project = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'Busy project', path: '/project', createdAt: 1 };
+  const tasks = Array.from({ length: 240 }, (_, index): SessionSummary => ({
+    ...summary([]), id: `task-${index}`, conversationId: `chat-${index}`,
+    title: `Task ${index}`, projectId: project.id
+  }));
+  const { w, append } = await boot([], false, [], [project], { sessions: tasks });
+  expect(w.document.querySelectorAll('.project-group .sess')).toHaveLength(5);
+
+  // Count even detached nodes: simply inspecting the live sidebar misses the hundreds of
+  // rows allocated and discarded before the five visible project tasks are appended.
+  const created: Element[] = [];
+  const create = w.document.createElement.bind(w.document);
+  const spy = vi.spyOn(w.document, 'createElement').mockImplementation(((tag: string, options?: ElementCreationOptions) => {
+    const node = create(tag, options);
+    created.push(node);
+    return node;
+  }) as typeof w.document.createElement);
+  try { await append([]); }
+  finally { spy.mockRestore(); }
+
+  const sessionRows = created.filter(node => node.classList.contains('sess'));
+  expect(w.document.querySelectorAll('.project-group .sess')).toHaveLength(5);
+  expect(sessionRows).toHaveLength(5);
+});
+it('groups many projects without scanning the whole session list for each project', async () => {
+  let projectIdReads = 0;
+  const ids = Array.from({ length: 24 }, (_, index) => `00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}`);
+  const projects: LocalProject[] = ids.map((id, index) => {
+    const project = { id, name: `Project ${index}`, path: `/project-${index}`, createdAt: 1 };
+    Object.defineProperty(project, 'id', { enumerable: true, get: () => { projectIdReads++; return id; } });
+    return project;
+  });
+  const tasks = Array.from({ length: 240 }, (_, index): SessionSummary => ({
+    ...summary([]), id: `session-${index}`, conversationId: `chat-${index}`,
+    projectId: ids[index % ids.length]!
+  }));
+  const { w, append } = await boot([], false, [], projects, { sessions: tasks });
+  expect(w.document.querySelectorAll('.project-group')).toHaveLength(24);
+  projectIdReads = 0;
+  await append([]);
+  // One lookup table per paint is fine; P complete scans of N rows followed by
+  // projects.find() for every comparison multiplies CPU work while the UI is busy.
+  expect(projectIdReads).toBeLessThan(tasks.length * 12);
 });
 it('shows five project chats initially and reveals eight more per click', async () => {
   const project = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'Paged', path: '/paged', createdAt: 1 };
@@ -1519,7 +1836,7 @@ it.each([false, true])('removes a project group in one click, keeps its chats an
   const api = (w as any).api;
   const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
   (w.document.querySelector('.worker-toggle') as HTMLButtonElement).click();
-  (w.document.querySelector(`[data-new-project="${project.id}"]`) as HTMLButtonElement).click();
+  (w.document.querySelector(`.project-heading > [data-new-project="${project.id}"]`) as HTMLButtonElement).click();
   input.value = 'Keep my draft';
   input.dispatchEvent(new w.Event('input', { bubbles: true }));
   if (selectedSkill) {
@@ -1534,7 +1851,7 @@ it.each([false, true])('removes a project group in one click, keeps its chats an
   (w.document.getElementById('chatRefresh') as HTMLButtonElement).click();
   await settle();
   api.removeProject = vi.fn(async () => ({ ok: true, data: { ...project, ungrouped: true } }));
-  (w.document.querySelector('.project-remove') as HTMLButtonElement).click();
+  projectMenu(w, project.id); menuItem(w, 'remove').click();
   await settle();
   expect(api.removeProject).toHaveBeenCalledExactlyOnceWith(project.id);
   expect(w.document.querySelector(`[data-project-id="${project.id}"]`)).toBeNull();
@@ -1552,14 +1869,78 @@ it.each([false, true])('removes a project group in one click, keeps its chats an
   expect(live.sent[0]).toMatchObject({ sessionId: null, projectId: null, text: selectedSkill ? '/review\nKeep my draft' : 'Keep my draft' });
 });
 
-it('keeps the project visible when its removal fails', async () => {
+/** Opens a project's "⋯" menu; its items live in the document body, outside the repainted sidebar. */
+function projectMenu(w: any, id: string): HTMLButtonElement {
+  const button = w.document.querySelector(`.project-group[data-project-id="${id}"] .project-menu`) as HTMLButtonElement;
+  button.click();
+  return button;
+}
+const menuItem = (w: any, action: string): HTMLButtonElement => w.document.querySelector(`.row-menu [data-row-action="${action}"]`) as HTMLButtonElement;
+/** Opens the project's Color submenu and returns the choice for `color` ('none' clears it). */
+function colorChoice(w: any, id: string, color: string): HTMLButtonElement {
+  projectMenu(w, id);
+  menuItem(w, 'color').click();
+  return menuItem(w, `color-${color}`);
+}
+
+it('keeps the project visible when its removal fails, and lets the removal be tried again', async () => {
   const project = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'Keep', path: '/keep', createdAt: 1 };
   const { w } = await boot([], false, [], [project]);
-  (w as any).api.removeProject = async () => ({ ok: false, error: 'Could not save' });
-  (w.document.querySelector('.project-remove') as HTMLButtonElement).click();
+  (w as any).api.removeProject = vi.fn(async () => ({ ok: false, error: 'Could not save' }));
+  projectMenu(w, project.id); menuItem(w, 'remove').click();
   await settle();
   expect(w.document.querySelector('.project-group')).not.toBeNull();
-  expect((w.document.querySelector('.project-remove') as HTMLButtonElement).disabled).toBe(false);
+  projectMenu(w, project.id);
+  expect(menuItem(w, 'remove').disabled).toBe(false);
+  menuItem(w, 'remove').click(); await settle();
+  expect((w as any).api.removeProject).toHaveBeenCalledTimes(2);
+});
+
+it('offers a new chat beside a project\'s menu, and its color as a submenu and removal inside it', async () => {
+  const project = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'Workspace', path: 'C:\\workspace\\primary', createdAt: 1 };
+  const { w } = await boot([], false, [], [project]);
+  const group = w.document.querySelector<HTMLElement>(`.project-group[data-project-id="${project.id}"]`)!;
+  // Two buttons on the row: the primary new chat, then one "⋯"; a right click opens the same menu.
+  expect([...group.querySelector('.project-heading')!.querySelectorAll('button')].map(b => b.className)).toEqual(['btn row-menu-button project-new', 'btn row-menu-button project-menu']);
+  const button = projectMenu(w, project.id);
+  expect(button.getAttribute('aria-expanded')).toBe('true');
+  const menu = w.document.querySelector<HTMLElement>('.row-menu')!;
+  expect(menu.getAttribute('role')).toBe('menu');
+  expect([...menu.querySelectorAll<HTMLElement>('.row-menu-item')].map(item => item.dataset.rowAction)).toEqual(['group-new', 'color', 'secrets-shield', 'remove']);
+  expect(menuItem(w, 'remove').classList.contains('is-danger')).toBe(true);
+  expect(w.document.activeElement).toBe(menuItem(w, 'group-new'));
+  // Keyboard: Down and Up move, Right opens the color submenu on the current choice, Left comes back.
+  menu.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+  expect(w.document.activeElement).toBe(menuItem(w, 'color'));
+  menu.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+  expect(w.document.activeElement).toBe(menuItem(w, 'secrets-shield'));
+  menu.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+  expect(w.document.activeElement).toBe(menuItem(w, 'remove'));
+  menu.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true }));
+  menu.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true }));
+  expect(w.document.activeElement).toBe(menuItem(w, 'color'));
+  menu.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+  expect(w.document.querySelectorAll('.row-menu').length).toBe(2);
+  expect(w.document.activeElement).toBe(menuItem(w, 'color-none'));
+  expect(menuItem(w, 'color-none').getAttribute('aria-checked')).toBe('true');
+  w.document.querySelectorAll<HTMLElement>('.row-menu')[1]!.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
+  expect(w.document.querySelectorAll('.row-menu').length).toBe(1);
+  expect(w.document.activeElement).toBe(menuItem(w, 'color'));
+  // Escape closes it and gives focus back to the row's button.
+  menu.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  expect(w.document.querySelector('.row-menu')).toBeNull();
+  expect(w.document.activeElement).toBe(button);
+  expect(button.getAttribute('aria-expanded')).toBe('false');
+  // A right click on the row opens the same menu; a click elsewhere closes it.
+  group.querySelector('.project-heading')!.dispatchEvent(new w.MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 40, clientY: 60 }));
+  expect(menuItem(w, 'color')).not.toBeNull();
+  w.document.body.dispatchEvent(new w.Event('pointerdown', { bubbles: true }));
+  expect(w.document.querySelector('.row-menu')).toBeNull();
+  // New chat in this project: the row's own button, no longer a menu item.
+  expect(projectMenu(w, project.id) && menuItem(w, 'new-chat')).toBeNull();
+  w.document.body.dispatchEvent(new w.Event('pointerdown', { bubbles: true }));
+  (w.document.querySelector(`.project-heading > [data-new-project="${project.id}"]`) as HTMLButtonElement).click(); await settle();
+  expect((w.document.getElementById('chatInput') as HTMLTextAreaElement).placeholder).toBe('Message in Workspace…');
 });
 
 it('picks and clears project color without changing project membership', async () => {
@@ -1569,32 +1950,49 @@ it('picks and clears project color without changing project membership', async (
   const { w } = await boot([], false, [], [project]);
   const api = (w as any).api;
   api.setProjectColor = vi.fn(async (_id: string, color: string | null) => ({ ok: true, data: { ...project, ...(color ? { color } : {}) } }));
-  const group = w.document.querySelector<HTMLElement>(`.project-group[data-project-id="${project.id}"]`)!;
-  const color = group.querySelector<HTMLButtonElement>('.project-color')!;
-  expect(color.dataset.color).toBe('');
-  expect(color.getAttribute('aria-expanded')).toBe('false');
-  color.click(); await settle();
-  expect(color.getAttribute('aria-expanded')).toBe('true');
-  const none = group.querySelector<HTMLButtonElement>('[data-project-color-choice=""]')!;
-  const blue = group.querySelector<HTMLButtonElement>('[data-project-color-choice="blue"]')!;
-  expect(w.document.activeElement).toBe(none);
-  none.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
-  expect(w.document.activeElement).toBe(blue);
-  blue.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-  expect(color.getAttribute('aria-expanded')).toBe('false');
-  expect(w.document.activeElement).toBe(color);
-  color.click(); await settle();
-  group.querySelector<HTMLButtonElement>('[data-project-color-choice="blue"]')!.click(); await settle();
+  colorChoice(w, project.id, 'blue').click(); await settle();
   expect(api.setProjectColor).toHaveBeenNthCalledWith(1, project.id, 'blue');
   let refreshed = w.document.querySelector<HTMLElement>(`.project-group[data-project-id="${project.id}"]`)!;
   expect(refreshed.dataset.projectColor).toBe('blue');
-  expect(refreshed.querySelector<HTMLButtonElement>('.project-color')?.dataset.color).toBe('blue');
-  refreshed.querySelector<HTMLButtonElement>('.project-color')!.click(); await settle();
-  refreshed.querySelector<HTMLButtonElement>('[data-project-color-choice=""]')!.click(); await settle();
+  expect(colorChoice(w, project.id, 'blue').getAttribute('aria-checked')).toBe('true');
+  menuItem(w, 'color-none').click(); await settle();
   expect(api.setProjectColor).toHaveBeenNthCalledWith(2, project.id, null);
   refreshed = w.document.querySelector<HTMLElement>(`.project-group[data-project-id="${project.id}"]`)!;
   expect(refreshed.dataset.projectColor).toBeUndefined();
-  expect(refreshed.querySelector<HTMLButtonElement>('.project-color')?.dataset.color).toBe('');
+  // Choosing the color it already has saves nothing.
+  colorChoice(w, project.id, 'none').click(); await settle();
+  expect(api.setProjectColor).toHaveBeenCalledTimes(2);
+});
+
+it('turns the secrets shield off and on for one project from its menu (#1797)', async () => {
+  const project = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'Workspace', path: '/workspace', createdAt: 1 };
+  const { w } = await boot([], false, [], [project]);
+  const api = (w as any).api;
+  api.setProjectSecretsShieldOff = vi.fn(async (_id: string, off: boolean) => ({ ok: true, data: { ...project, ...(off ? { secretsShieldOff: true } : {}) } }));
+  projectMenu(w, project.id);
+  let item = menuItem(w, 'secrets-shield');
+  // An on/off switch, on by default.
+  expect(item.getAttribute('role')).toBe('menuitemcheckbox');
+  expect(item.getAttribute('aria-checked')).toBe('true');
+  expect(item.title).toBe("Keys and tokens in this project's tool results are hidden from ChatGPT");
+  item.click(); await settle();
+  expect(api.setProjectSecretsShieldOff).toHaveBeenNthCalledWith(1, project.id, true);
+  projectMenu(w, project.id);
+  item = menuItem(w, 'secrets-shield');
+  expect(item.getAttribute('aria-checked')).toBe('false');
+  expect(item.title).toBe("This project's tools send keys and tokens to ChatGPT as they are");
+  item.click(); await settle();
+  expect(api.setProjectSecretsShieldOff).toHaveBeenNthCalledWith(2, project.id, false);
+  projectMenu(w, project.id);
+  expect(menuItem(w, 'secrets-shield').getAttribute('aria-checked')).toBe('true');
+  w.document.body.dispatchEvent(new w.Event('pointerdown', { bubbles: true }));
+  // Off in Settings for every project: the switch shows off and waits there.
+  (await api.getState()).data.config.ui.secretsShield = false;
+  projectMenu(w, project.id);
+  item = menuItem(w, 'secrets-shield');
+  expect(item.getAttribute('aria-checked')).toBe('false');
+  expect(item.disabled).toBe(true);
+  expect(item.title).toBe('Off for every project in Settings');
 });
 
 it.each([[false, true], [true, true], [true, false]])('preserves the keyboard color-save focus owner (focus moved: %s, focusin: %s)', async (moved, propagates) => {
@@ -1602,10 +2000,7 @@ it.each([[false, true], [true, true], [true, false]])('preserves the keyboard co
   const { w } = await boot([], false, [], [project]);
   let finish!: (value: unknown) => void;
   (w as any).api.setProjectColor = vi.fn(() => new Promise(resolve => { finish = resolve; }));
-  const color = w.document.querySelector<HTMLButtonElement>('.project-color')!;
-  color.focus(); color.click(); await settle();
-  const blue = w.document.querySelector<HTMLButtonElement>('[data-project-color-choice="blue"]')!;
-  blue.focus(); blue.click();
+  colorChoice(w, project.id, 'blue').click();
   const other = w.document.createElement('button'); other.textContent = 'Other control'; w.document.body.append(other);
   if (moved) {
     // An inactive Electron document can update activeElement without delivering focusin.
@@ -1614,27 +2009,28 @@ it.each([[false, true], [true, true], [true, false]])('preserves the keyboard co
     other.focus();
   }
   finish({ ok: true, data: { ...project, color: 'blue' } }); await settle();
-  const currentColor = w.document.querySelector<HTMLButtonElement>('.project-color')!;
-  expect(currentColor.dataset.color).toBe('blue');
-  expect(w.document.activeElement === (moved ? other : currentColor)).toBe(true);
+  const button = w.document.querySelector<HTMLButtonElement>('.project-menu')!;
+  expect(w.document.querySelector<HTMLElement>('.project-group')!.dataset.projectColor).toBe('blue');
+  expect(w.document.activeElement === (moved ? other : button)).toBe(true);
 });
 
-it.each([false, true])('a rejected color-save preserves the current focus owner (focus moved: %s)', async moved => {
+it.each([false, true])('a rejected color-save keeps the color and the current focus owner (focus moved: %s)', async moved => {
   const project = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'Workspace', path: '/workspace', createdAt: 1 };
   const { w } = await boot([], false, [], [project]);
   let finish!: (value: unknown) => void;
   (w as any).api.setProjectColor = vi.fn(() => new Promise(resolve => { finish = resolve; }));
-  const color = w.document.querySelector<HTMLButtonElement>('.project-color')!;
-  color.focus(); color.click(); await settle();
-  const blue = w.document.querySelector<HTMLButtonElement>('[data-project-color-choice="blue"]')!;
-  blue.focus(); blue.click();
+  colorChoice(w, project.id, 'blue').click();
+  // While the save is pending, its choices wait for the answer.
+  expect(colorChoice(w, project.id, 'teal').disabled).toBe(true);
+  menuItem(w, 'color').dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  w.document.querySelector<HTMLElement>('.row-menu')?.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  const button = w.document.querySelector<HTMLButtonElement>('.project-menu')!;
   const other = w.document.getElementById('chatInput')!;
   if (moved) other.focus();
   finish({ ok: false, error: 'Synthetic save refusal' }); await settle();
-  expect(color.disabled).toBe(false);
-  expect(color.dataset.color).toBe('');
-  const selected = w.document.querySelector('[data-project-color-choice=""]');
-  expect(w.document.activeElement === (moved ? other : selected)).toBe(true);
+  expect(w.document.querySelector<HTMLElement>('.project-group')!.dataset.projectColor).toBeUndefined();
+  expect(w.document.activeElement === (moved ? other : button)).toBe(true);
+  expect(colorChoice(w, project.id, 'blue').disabled).toBe(false);
 });
 
 it.each([false, true])('does not restore an old color-save focus after selecting another chat and returning (rejected: %s)', async rejected => {
@@ -1644,41 +2040,36 @@ it.each([false, true])('does not restore an old color-save focus after selecting
   const { w } = await boot([], true, [], [project], { sessions: [a, b] });
   let finish!: (value: unknown) => void;
   (w as any).api.setProjectColor = vi.fn(() => new Promise(resolve => { finish = resolve; }));
-  const color = w.document.querySelector<HTMLButtonElement>('.project-color')!;
-  color.focus(); color.click(); await settle();
-  const blue = w.document.querySelector<HTMLButtonElement>('[data-project-color-choice="blue"]')!;
-  blue.focus(); blue.click();
-  w.document.querySelector<HTMLElement>('[data-id="color-chat-b"] [data-session-select]')!.click(); await settle();
-  w.document.querySelector<HTMLElement>('[data-id="color-chat-a"] [data-session-select]')!.click(); await settle();
-  const focused = w.document.activeElement;
+  colorChoice(w, project.id, 'blue').click();
+  // A real click on a chat row moves focus to it; jsdom's click() does not, so do both.
+  const choose = (id: string): void => { const row = w.document.querySelector<HTMLElement>(`[data-id="${id}"] [data-session-select]`)!; row.focus(); row.click(); };
+  choose('color-chat-b'); await settle();
+  choose('color-chat-a'); await settle();
   finish(rejected ? { ok: false, error: 'Synthetic save refusal' } : { ok: true, data: { ...project, color: 'blue' } }); await settle();
-  expect(w.document.querySelector<HTMLButtonElement>('.project-color')!.dataset.color).toBe(rejected ? '' : 'blue');
-  expect(w.document.activeElement === focused).toBe(true);
+  expect(w.document.querySelector<HTMLElement>('.project-group')!.dataset.projectColor).toBe(rejected ? undefined : 'blue');
+  // The old save does not pull focus back to the project's menu button.
+  expect(w.document.activeElement?.closest('.project-heading')).toBeNull();
 });
 
-it('names project colors in the interface language and keeps focus on the color button after a pick', async () => {
+it('names project colors in the interface language and keeps focus on the menu button after a pick', async () => {
   const project = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'Workspace', path: '/workspace', createdAt: 1 };
   const { w } = await boot([], false, [], [project]);
   const api = (w as any).api;
   api.setProjectColor = vi.fn(async (_id: string, color: string | null) => ({ ok: true, data: { ...project, ...(color ? { color } : {}) } }));
   const group = (): HTMLElement => w.document.querySelector<HTMLElement>(`.project-group[data-project-id="${project.id}"]`)!;
-  // The menu is already named "Change project color"; each choice is the color itself, in words
-  // a screen reader can say, never the internal value.
-  const blue = group().querySelector<HTMLButtonElement>('[data-project-color-choice="blue"]')!;
-  expect(blue.getAttribute('aria-label')).toBe('Blue');
+  // Each choice is the color itself, in words a screen reader can say, never the internal value.
   const { setLanguage } = await import('../src/renderer/i18n.js');
+  expect(colorChoice(w, project.id, 'blue').textContent).toBe('Blue');
   setLanguage('de');
-  expect(blue.getAttribute('aria-label')).toBe('Blau');
-  expect(blue.title).toBe('Blau');
+  expect(menuItem(w, 'color-blue').textContent).toBe('Blau');
+  expect(menuItem(w, 'color').textContent).toBe('Farbe');
   setLanguage('en');
 
-  // Picking repaints the sidebar. Focus must come back to the new color button, not fall to the page.
-  group().querySelector<HTMLButtonElement>('.project-color')!.click(); await settle();
-  group().querySelector<HTMLButtonElement>('[data-project-color-choice="teal"]')!.click(); await settle();
+  // Picking repaints the sidebar. Focus must come back to the new menu button, not fall to the page.
+  menuItem(w, 'color-teal').click(); await settle();
   expect(api.setProjectColor).toHaveBeenCalledWith(project.id, 'teal');
-  const button = group().querySelector<HTMLButtonElement>('.project-color')!;
-  expect(button.dataset.color).toBe('teal');
-  expect(w.document.activeElement).toBe(button);
+  expect(group().dataset.projectColor).toBe('teal');
+  expect(w.document.activeElement).toBe(group().querySelector<HTMLButtonElement>('.project-menu'));
 });
 
 it('Share a folder creates a sidebar project and keeps it when an older list refresh finishes', async () => {
@@ -1705,6 +2096,38 @@ it('Share a folder creates a sidebar project and keeps it when an older list ref
   (w.document.getElementById('chatSend') as HTMLButtonElement).click();
   await settle();
   expect(live.sent[0]).toMatchObject({ sessionId: null, projectId: project.id, text: 'Work in this folder' });
+});
+
+// #1469: the sidebar's + offers a folder on this computer or one on a server.
+it('offers a local folder and a server folder from the sidebar +, and marks a server project', async () => {
+  const { w } = await boot([], false);
+  const api = (w as any).api;
+  const doc = w.document;
+  const local = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee1', name: 'Local', path: '/local', createdAt: 1 };
+  const remote = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee2', name: 'app', path: 'me@devbox:/srv/app', createdAt: 2, remote: { host: 'me@devbox', path: '/srv/app' } };
+  api.addProject = vi.fn(async () => ({ ok: true, data: local }));
+  api.addRemoteProject = vi.fn(async () => ({ ok: true, data: remote }));
+  const item = (action: string) => doc.querySelector<HTMLButtonElement>(`[data-row-action="${action}"]`);
+  (doc.getElementById('addProject') as HTMLButtonElement).click();
+  await settle();
+  expect(item('add-local-project')?.textContent).toContain('Folder on this computer');
+  item('add-local-project')!.click();
+  await settle();
+  expect(api.addProject).toHaveBeenCalledTimes(1);
+  expect(doc.querySelector(`[data-project-id="${local.id}"] .project-badge`)).toBeNull();
+  (doc.getElementById('addProject') as HTMLButtonElement).click();
+  await settle();
+  item('add-ssh-project')!.click();
+  await settle();
+  expect((doc.getElementById('sshProjectDialog') as HTMLDialogElement).open).toBe(true);
+  (doc.getElementById('sshProjectAddress') as HTMLInputElement).value = 'me@devbox';
+  (doc.getElementById('sshProjectFolder') as HTMLInputElement).value = '/srv/app';
+  doc.getElementById('sshProjectForm')!.dispatchEvent(new w.Event('submit', { cancelable: true }));
+  await settle();
+  expect(api.addRemoteProject).toHaveBeenCalledWith('me@devbox', '/srv/app');
+  const badge = doc.querySelector(`[data-project-id="${remote.id}"] .project-badge`);
+  expect(badge?.textContent).toBe('SSH');
+  expect(badge?.getAttribute('title')).toBe('me@devbox');
 });
 
 it('sends a new chat at once with Automatic when no model list is readable and none was asked for (#864)', async () => {
@@ -1759,7 +2182,7 @@ it('groups project chats and restores each project composer with its selected id
   expect([...groups].map(group => group.open)).toEqual([false, false]);
   expect(groups[0]!.querySelector('[data-id]')?.getAttribute('data-id')).toBe(summary([]).id);
   const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
-  const choose = (id: string) => (w.document.querySelector(`[data-new-project="${id}"]`) as HTMLButtonElement).click();
+  const choose = (id: string) => { (w.document.querySelector(`.project-heading > [data-new-project="${id}"]`) as HTMLButtonElement).click(); };
   choose(projects[0]!.id); expect(w.document.querySelector<HTMLDetailsElement>(`[data-project-id="${projects[0]!.id}"]`)!.open).toBe(true); input.value = 'Alpha draft';
   choose(projects[1]!.id); expect(w.document.querySelector<HTMLDetailsElement>(`[data-project-id="${projects[1]!.id}"]`)!.open).toBe(true); expect(input.value).toBe(''); input.value = 'Beta draft';
   (w.document.getElementById('newChat') as HTMLButtonElement).click();
@@ -1810,7 +2233,7 @@ it('reorders whole project groups without changing chat selection, ownership or 
   expect(ids()).toEqual(projects.map(project => project.id));
   expect(w.document.activeElement).toBe(groups()[1]!.querySelector('summary'));
   const saved = w.localStorage.getItem('chat-on-steroids.sidebar-order');
-  pointer(groups()[0]!.querySelector('.project-new')!, 'pointerdown', 10);
+  pointer(groups()[0]!.querySelector('.project-menu')!, 'pointerdown', 10);
   pointer(list, 'pointermove', 500); pointer(w as unknown as Window, 'pointerup', 500);
   expect(w.localStorage.getItem('chat-on-steroids.sidebar-order')).toBe(saved);
   expect(live.sent).toEqual([]);
@@ -1878,6 +2301,82 @@ it('keeps working state per chat and marks only completed background chats as un
   await refresh();
   expect(row('chat-a').querySelector('.session-status.is-unseen')).not.toBeNull();
   expect(row('chat-b').querySelector('.session-status.is-unseen')).toBeNull();
+});
+
+it("marks every New response seen from the header, or one project's from its menu, and leaves a working chat working", async () => {
+  const project = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'Workspace', path: '/workspace', createdAt: 1 };
+  const startedAt = Date.now();
+  const chat = (id: string, projectId?: string): SessionSummary => ({ ...summary([]), id, title: id, conversationId: `conversation-${id}`, chatIds: [`conversation-${id}`],
+    projectId, updatedAt: startedAt, lastToolCallAt: startedAt, activityExpiresAt: startedAt + 60_000 });
+  const chats = [chat('p1', project.id), chat('p2', project.id), chat('p3', project.id), chat('u1')];
+  const { w } = await boot([], false, [], [project], { sessions: chats });
+  const row = (id: string) => w.document.querySelector<HTMLElement>(`.sess[data-id="${id}"]`)!;
+  const unseen = () => chats.map(entry => entry.id).filter(id => row(id).querySelector('.session-status.is-unseen'));
+  const header = () => w.document.getElementById('markAllSeen') as HTMLButtonElement;
+  const actions = () => [...w.document.querySelectorAll<HTMLElement>('.row-menu .row-menu-item')].map(item => item.dataset.rowAction);
+  const refresh = async () => { (w.document.getElementById('chatRefresh') as HTMLButtonElement).click(); await settle(); };
+  expect(header().hidden).toBe(true);
+  projectMenu(w, project.id);
+  expect(actions()).toEqual(['group-new', 'color', 'secrets-shield', 'remove']);
+  w.document.querySelector<HTMLElement>('.row-menu')!.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+
+  // p1, p2 and u1 finish in the background; p3 is still running.
+  let at = Date.now();
+  for (const entry of [chats[0]!, chats[1]!, chats[3]!]) {
+    const done = ++at;
+    Object.assign(entry, { activityExpiresAt: null, lastAssistantFinalAt: done, lastTurnEndAt: done, lastTurnOutcome: 'completed', updatedAt: done });
+  }
+  await refresh();
+  expect(unseen()).toEqual(['p1', 'p2', 'u1']);
+  expect(header().hidden).toBe(false);
+
+  projectMenu(w, project.id);
+  expect(actions()).toEqual(['group-new', 'mark-seen', 'color', 'secrets-shield', 'remove']);
+  menuItem(w, 'mark-seen').click();
+  await settle();
+  expect(unseen()).toEqual(['u1']);
+  expect(row('p3').querySelector('.session-status.is-active')).not.toBeNull();
+  projectMenu(w, project.id);
+  expect(actions()).toEqual(['group-new', 'color', 'secrets-shield', 'remove']);
+  w.document.querySelector<HTMLElement>('.row-menu')!.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+
+  header().focus();
+  header().click();
+  await settle();
+  expect(unseen()).toEqual([]);
+  expect(header().hidden).toBe(true);
+  expect(w.document.activeElement?.id).toBe('searchChatsButton');
+  expect(row('p3').querySelector('.session-status.is-active')).not.toBeNull();
+  const saved = w.localStorage.getItem('chat-on-steroids.sidebar-completion-seen')!;
+  for (const id of ['p1', 'p2', 'u1']) expect(saved).toContain(`"${id}"`);
+  expect(saved).not.toContain('"p3"');
+});
+
+it.each(['projects', 'inbox'] as const)("hands the keyboard on to search when the last New response is read while the header button has focus (%s layout)", async layout => {
+  const startedAt = Date.now();
+  const chats: SessionSummary[] = [{ ...summary([]), id: 'chat-a', title: 'Alpha', conversationId: 'conversation-a', chatIds: ['conversation-a'],
+    updatedAt: startedAt, lastToolCallAt: startedAt, activityExpiresAt: startedAt + 60_000 }];
+  const { w } = await boot([], false, [], [], { sessions: chats, inbox: layout === 'inbox' });
+  const header = () => w.document.getElementById('markAllSeen') as HTMLButtonElement;
+  const row = () => w.document.querySelector<HTMLElement>('.sess[data-id="chat-a"]')!;
+  const search = () => layout === 'inbox' ? w.document.querySelector<HTMLElement>('[data-inbox-control="search"]')! : w.document.getElementById('searchChatsButton')!;
+  // The chat finishes in the background.
+  const done = Date.now() + 1;
+  Object.assign(chats[0]!, { activityExpiresAt: null, lastAssistantFinalAt: done, lastTurnEndAt: done, lastTurnOutcome: 'completed', updatedAt: done });
+  (w.document.getElementById('chatRefresh') as HTMLButtonElement).click();
+  await vi.waitFor(() => expect(header().hidden).toBe(false), { timeout: 5000 });
+  header().focus();
+  expect(w.document.activeElement).toBe(header());
+
+  // Opening the chat acknowledges it only when its detail read comes back, not on the click.
+  let reply: (value: unknown) => void = () => {};
+  (w as any).api.getSession = vi.fn(() => new Promise(resolve => { reply = resolve; }));
+  row().querySelector<HTMLElement>('[data-session-select]')!.click();
+  await vi.waitFor(() => expect((w as any).api.getSession).toHaveBeenCalled(), { timeout: 5000 });
+  expect(header().hidden).toBe(false);
+  reply({ ok: true, data: { summary: chats[0], events: [], total: 0, nextFrom: 0 } });
+  await vi.waitFor(() => expect(header().hidden).toBe(true), { timeout: 5000 });
+  expect(w.document.activeElement).toBe(search());
 });
 
 it('keeps the sidebar working spinner on one continuous phase across activity repaints', async () => {
@@ -2384,6 +2883,62 @@ it('says why a compaction died when the app abandoned it', async () => {
   expect(card.textContent).toContain('abandoned');
 });
 
+it('offers to open a new chat with the summary an abandoned compaction already saved (#1215)', async () => {
+  const [request, start, brief, end, handoff] = compaction(2);
+  const abandoned = { seq: 9, time: T0 + 9000, source: 'app', kind: 'note', continuation: TOKEN,
+    message: text('Compact & Resume abandoned — the new chat could not be opened') } as SessionEvent;
+  const { w, live } = await boot([request!, start!, brief!, end!, handoff!, abandoned]);
+  const card = w.document.querySelector<HTMLDetailsElement>('details.compaction')!;
+  expect(card.className).toContain('tone-bad');
+  const reuse = card.querySelector<HTMLButtonElement>('.compaction-reuse')!;
+  expect(reuse.textContent).toBe('Open a new chat with this summary');
+  reuse.click();
+  await vi.waitFor(() => expect(live.controlCalls).toContainEqual(
+    expect.objectContaining({ action: `resume:${(handoff as Extract<SessionEvent, { kind: 'handoff' }>).handoffId}` })));
+});
+
+it('offers no summary reuse when the abandoned run never saved a summary', async () => {
+  const [request, start, brief, end] = compaction(2);
+  const abandoned = { seq: 9, time: T0 + 9000, source: 'app', kind: 'note', continuation: TOKEN,
+    message: text('Compact & Resume abandoned — the summary was not written') } as SessionEvent;
+  const { w } = await boot([request!, start!, brief!, end!, abandoned]);
+  expect(w.document.querySelector('details.compaction')).not.toBeNull();
+  expect(w.document.querySelector('.compaction-reuse')).toBeNull();
+});
+
+it('takes the summary reuse off an abandoned run once a later Compact & Resume started (#1215)', async () => {
+  const [request, start, brief, end, handoff] = compaction(2);
+  const abandoned = { seq: 9, time: T0 + 9000, source: 'app', kind: 'note', continuation: TOKEN,
+    message: text('Compact & Resume abandoned — cancelled') } as SessionEvent;
+  const later = { seq: 10, time: T0 + 10000, source: 'extension', kind: 'user_message', messageId: 'm-later-bootstrap',
+    message: text('[[CLF-RESUME:tok_fedcba9876543210]] Continue from this brief: keep the loop running.') } as SessionEvent;
+  const { w } = await boot([request!, start!, brief!, end!, handoff!, abandoned, later]);
+  expect(w.document.querySelectorAll('details.compaction')).toHaveLength(2);
+  expect(w.document.querySelector('.compaction-reuse')).toBeNull();
+});
+
+it('puts a reopened run\'s saved summary in its own row (#1215)', async () => {
+  const [request, start, brief, end, handoff] = compaction(2);
+  const abandoned = { seq: 9, time: T0 + 9000, source: 'app', kind: 'note', continuation: TOKEN,
+    message: text('Compact & Resume abandoned — cancelled') } as SessionEvent;
+  const again = { seq: 10, time: T0 + 10000, source: 'app', kind: 'handoff', handoffId: 'h-2', chars: 26_333,
+    reason: 'compact and resume', continuation: 'tok_fedcba9876543210' } as SessionEvent;
+  const bootstrap = { seq: 11, time: T0 + 11000, source: 'extension', kind: 'user_message', messageId: 'm-again',
+    message: text('[[CLF-RESUME:tok_fedcba9876543210]] Continue from this brief: keep the loop running.') } as SessionEvent;
+  const { w } = await boot([request!, start!, brief!, end!, handoff!, abandoned, again, bootstrap]);
+  const timeline = w.document.getElementById('timeline')!;
+  expect([...timeline.children].map((row) => row.className)).toEqual(['ev ev-compaction', 'ev ev-compaction']);
+  const rows = [...timeline.querySelectorAll('details.compaction')];
+  expect(rows[1]!.querySelector('summary .state')!.textContent).toContain('26k characters');
+});
+
+it('offers no summary reuse once the new chat opened', async () => {
+  const [request, start, brief, end, handoff, resume] = compaction(2);
+  const { w } = await boot([request!, start!, brief!, end!, handoff!, resume!]);
+  expect(w.document.querySelector('details.compaction')).not.toBeNull();
+  expect(w.document.querySelector('.compaction-reuse')).toBeNull();
+});
+
 it('retains the open compaction disclosure and brief request while the summary streams and completes', async () => {
   const [request, start, original, , handoff, resume] = compaction(2);
   const brief = { ...original, origin: original!.seq, state: 'streaming', final: false } as Extract<SessionEvent, { kind: 'assistant_message' }>;
@@ -2427,6 +2982,337 @@ it('keeps a streaming message anchor and its following tool group across canonic
   expect(group.open).toBe(true);
 });
 
+describe('an answer while ChatGPT writes it', () => {
+  const answer = (seq: number, body: string, more: Partial<Extract<SessionEvent, { kind: 'assistant_message' }>> = {}): SessionEvent => ({
+    seq, origin: 1, time: T0, source: 'extension', kind: 'assistant_message', messageId: 'live-answer', message: text(body),
+    state: 'streaming', final: false, ...more });
+  const blocks = (w: { document: Document }) => [...w.document.querySelectorAll<HTMLElement>('.ev-assistant_message .msg.rich > *')];
+  const fading = (w: { document: Document }) => blocks(w).filter(block => block.classList.contains('is-entering')).map(block => block.textContent?.trim());
+
+  it('keeps finished paragraphs of a streaming answer as the same nodes while it grows', async () => {
+    const { w, append } = await boot([answer(1, 'Alpha one.')]);
+    const row = w.document.querySelector('.ev-assistant_message');
+    const [first] = blocks(w);
+    const selection = w.getSelection()!;
+    selection.setBaseAndExtent(first!.firstChild!, 0, first!.firstChild!, 5);
+    await append([answer(2, 'Alpha one.\n\nBeta two.')]);
+    expect(w.document.querySelector('.ev-assistant_message')).toBe(row);
+    expect(blocks(w)[0]).toBe(first);
+    expect(blocks(w).map(block => block.textContent)).toEqual(['Alpha one.', 'Beta two.']);
+    expect(selection.anchorNode).toBe(first!.firstChild);
+    expect(selection.toString()).toBe('Alpha');
+  });
+
+  it('fades in only the blocks a revision adds, not the one that grew', async () => {
+    const { w, append } = await boot([answer(1, 'Alpha.\n\nBeta')]);
+    await append([answer(2, 'Alpha.\n\nBeta grew.\n\nGamma.\n\n- Delta')]);
+    expect(fading(w)).toEqual(['Gamma.', 'Delta']);
+  });
+
+  it('keeps a block that faded in as the same node on the next revision', async () => {
+    const { w, append } = await boot([answer(1, 'Alpha.')]);
+    await append([answer(2, 'Alpha.\n\nBeta.')]);
+    const beta = blocks(w)[1]!;
+    expect(beta.classList.contains('is-entering')).toBe(true);
+    // The ended fade leaves the block's class attribute behind, empty.
+    beta.dispatchEvent(new w.Event('animationend'));
+    await append([answer(3, 'Alpha.\n\nBeta.\n\nGamma.')]);
+    expect(blocks(w)[1]).toBe(beta);
+    expect(fading(w)).toEqual(['Gamma.']);
+  });
+
+  it('keeps the blocks a reader used: an opened source card and a copied code block', async () => {
+    const body = 'Alpha. :chatgpt-content-reference{index="1"}\n\n```\nnpm test\n```';
+    const references = [{ index: 1, sources: [{ title: 'A report', url: 'https://news.example.com/report', source: 'Example News' }] }];
+    const { w, append } = await boot([answer(1, body, { references })]);
+    (w as any).api.writeClipboard = vi.fn(async () => ({ ok: true, data: true }));
+    const [alpha, code] = blocks(w);
+    alpha!.querySelector('.citation')!.dispatchEvent(new w.FocusEvent('focusin'));
+    expect(alpha!.querySelector<HTMLElement>('.citation-card')!.hidden).toBe(false);
+    code!.querySelector<HTMLButtonElement>('.tool-copy')!.click();
+    await vi.waitFor(() => expect(code!.querySelector('.tool-copy')!.textContent).toBe('Copied'));
+    await append([answer(2, `${body}\n\nBeta.`, { references })]);
+    expect(blocks(w)[0]).toBe(alpha);
+    expect(blocks(w)[1]).toBe(code);
+    expect(fading(w)).toEqual(['Beta.']);
+  });
+
+  it('opens a chat with a streaming answer without fading its blocks', async () => {
+    const { w } = await boot([answer(1, 'Alpha.\n\nBeta.')]);
+    expect(blocks(w)).toHaveLength(2);
+    expect(fading(w)).toEqual([]);
+  });
+
+  it('replaces an answer from the first block a revision changes', async () => {
+    const { w, append } = await boot([answer(1, 'Alpha.\n\nBeta')]);
+    const [alpha] = blocks(w);
+    // The next line turns the paragraph above it into a heading.
+    await append([answer(2, 'Alpha.\n\nBeta\n---\n\nGamma.')]);
+    expect(blocks(w)[0]).toBe(alpha);
+    expect(blocks(w).map(block => block.tagName)).toEqual(['P', 'H2', 'P']);
+    expect(fading(w)).toEqual(['Gamma.']);
+  });
+
+  it('keeps an answer\'s blocks when it completes and gains its actions', async () => {
+    const ask: SessionEvent = { kind: 'user_message', seq: 1, origin: 1, time: T0, source: 'extension', turnId: 'done-turn', messageId: 'ask', message: text('Say hello') };
+    const { w, append } = await boot([ask, answer(2, 'Alpha.', { origin: 2, turnId: 'done-turn' })]);
+    const row = w.document.querySelector('.ev-assistant_message')!;
+    const [alpha] = blocks(w);
+    expect(row.querySelector('.said > b')!.textContent).toBe('ChatGPT (partial)');
+    await append([answer(3, 'Alpha.\n\nBeta.', { origin: 2, turnId: 'done-turn', state: 'final', final: true })]);
+    await append([{ seq: 4, time: T0 + 2_000, source: 'extension', kind: 'turn_end', turnId: 'done-turn', outcome: 'completed' }]);
+    expect(w.document.querySelector('.ev-assistant_message')).toBe(row);
+    expect(blocks(w)[0]).toBe(alpha);
+    expect(row.querySelector('.said > b')!.textContent).toBe('ChatGPT');
+    expect(row.querySelectorAll('.said > .answer-actions')).toHaveLength(1);
+  });
+
+  it('adds no fade under reduced motion', async () => {
+    const { w, append } = await boot([answer(1, 'Alpha.')]);
+    expect(blocks(w)).toHaveLength(1);
+    Object.defineProperty(w, 'matchMedia', { configurable: true,
+      value: (query: string) => ({ matches: query.includes('reduce'), addEventListener: vi.fn(), removeEventListener: vi.fn() }) });
+    const [alpha] = blocks(w);
+    await append([answer(2, 'Alpha.\n\nBeta.')]);
+    expect(blocks(w)[0]).toBe(alpha);
+    expect(fading(w)).toEqual([]);
+  });
+
+  it('replaces a code block unfaded while it gains lines', async () => {
+    const { w, append } = await boot([answer(1, 'Alpha.\n\n```\nline 1')]);
+    const [alpha, code] = blocks(w);
+    await append([answer(2, 'Alpha.\n\n```\nline 1\nline 2')]);
+    expect(blocks(w)[0]).toBe(alpha);
+    expect(blocks(w)[1]).not.toBe(code);
+    expect(blocks(w)[1]!.querySelector('pre')!.textContent).toBe('line 1\nline 2\n');
+    expect(fading(w)).toEqual([]);
+  });
+
+  it('swaps the whole row when a revision is too long to draw rich', async () => {
+    const { w, append } = await boot([answer(1, 'Alpha.')]);
+    const row = w.document.querySelector('.ev-assistant_message');
+    await append([answer(2, `Alpha. ${'Long. '.repeat(50_000)}`)]);
+    const rows = w.document.querySelectorAll('.ev-assistant_message');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).not.toBe(row);
+    expect(rows[0]!.querySelector('.said > .msg')!.classList.contains('rich')).toBe(false);
+    expect(rows[0]!.textContent).toContain('Alpha. Long.');
+  });
+
+  describe('while its turn works', () => {
+    const start: SessionEvent = { seq: 1, time: T0, source: 'extension', kind: 'turn_start', turnId: 'live-turn' };
+    const written = (seq: number, body: string, more: Partial<Extract<SessionEvent, { kind: 'assistant_message' }>> = {}) =>
+      answer(seq, body, { origin: 2, turnId: 'live-turn', ...more });
+    const shown = (w: { document: Document }) => blocks(w).map(block => block.textContent?.trim());
+
+    it('holds back the paragraph ChatGPT is still writing', async () => {
+      const { w, append } = await boot([start, written(2, 'Alpha.\n\nBe')]);
+      expect(shown(w)).toEqual(['Alpha.']);
+      const [alpha] = blocks(w);
+      await append([written(3, 'Alpha.\n\nBeta.\n\nGa')]);
+      expect(shown(w)).toEqual(['Alpha.', 'Beta.']);
+      expect(blocks(w)[0]).toBe(alpha);
+      expect(fading(w)).toEqual(['Beta.']);
+    });
+
+    it('opens a chat mid-answer with the tail held back and nothing fading', async () => {
+      const { w } = await boot([start, written(2, 'Alpha.\n\nBeta.\n\nGa')]);
+      expect(shown(w)).toEqual(['Alpha.', 'Beta.']);
+      expect(fading(w)).toEqual([]);
+    });
+
+    it('fades in the first paragraph of an answer as it appears', async () => {
+      const { w, append } = await boot([start, written(2, 'Alp')]);
+      expect(w.document.querySelector<HTMLElement>('.ev-assistant_message')!.hidden).toBe(true);
+      await append([written(3, 'Alpha.\n\nBe')]);
+      expect(w.document.querySelector<HTMLElement>('.ev-assistant_message')!.hidden).toBe(false);
+      expect(fading(w)).toEqual(['Alpha.']);
+    });
+
+    it('never cuts inside an open code fence', async () => {
+      const { w, append } = await boot([start, written(2, 'Alpha.\n\n~~~~\none\n\n~~~\ntwo\n')]);
+      expect(shown(w)).toEqual(['Alpha.']);
+      await append([written(3, 'Alpha.\n\n~~~~\none\n\n~~~\ntwo\n~~~~\nAf')]);
+      expect(blocks(w)[1]!.querySelector('pre')!.textContent).toBe('one\n\n~~~\ntwo\n');
+    });
+
+    it('shows the whole answer once it is final, keeping the blocks it showed', async () => {
+      const { w, append } = await boot([start, written(2, 'Alpha.\n\nBe')]);
+      const [alpha] = blocks(w);
+      await append([written(3, 'Alpha.\n\nBeta.', { state: 'final', final: true })]);
+      expect(shown(w)).toEqual(['Alpha.', 'Beta.']);
+      expect(blocks(w)[0]).toBe(alpha);
+      expect(fading(w)).toEqual(['Beta.']);
+    });
+
+    it('shows the rest when the turn ends on a message that stays streaming', async () => {
+      const { w, append } = await boot([start, written(2, 'Alpha.\n\nBe')]);
+      expect(shown(w)).toEqual(['Alpha.']);
+      await append([{ seq: 3, time: T0 + 3_000, source: 'extension', kind: 'turn_end', turnId: 'live-turn', outcome: 'stopped' }]);
+      expect(shown(w)).toEqual(['Alpha.', 'Be']);
+    });
+
+    it('shows the rest once something follows the message in its turn', async () => {
+      const { w, append } = await boot([start, written(2, 'Alpha.\n\nBe')]);
+      expect(shown(w)).toEqual(['Alpha.']);
+      await append([{ ...toolCall(3, 'after'), turnId: 'live-turn' }]);
+      expect(shown(w)).toEqual(['Alpha.', 'Be']);
+    });
+
+    it('keeps the live row while it holds back a block ChatGPT is still writing', async () => {
+      const ask: SessionEvent = { kind: 'user_message', seq: 2, origin: 2, time: T0, source: 'extension', turnId: 'live-turn', messageId: 'ask-live', message: text('Write it') };
+      const { w, append } = await boot([start, ask, written(3, 'Alpha.\n\n```ts\nconst a = 1;')]);
+      const live = () => {
+        const row = w.document.querySelector<HTMLElement>('#timeline .turn-now');
+        return row && !row.hidden ? row.querySelector('.turn-now-text')!.textContent : null;
+      };
+      expect(shown(w)).toEqual(['Alpha.']);
+      expect(live()).toBe('Thinking');
+      await append([written(4, 'Alpha.\n\n```ts\nconst a = 1;\nconst b = 2;\nconst c = 3;')]);
+      expect(shown(w)).toEqual(['Alpha.']);
+      expect(live()).toBe('Thinking');
+      // Everything written so far shows: the prose speaks for itself.
+      await append([written(5, 'Alpha.\n\n```ts\nconst a = 1;\nconst b = 2;\nconst c = 3;\n```\n\n')]);
+      expect(blocks(w)).toHaveLength(2);
+      expect(live()).toBeNull();
+    });
+
+    it('draws nothing again for a chunk that finishes no block', async () => {
+      const { w, append } = await boot([start, written(2, 'Alpha.\n\nBe', { renderedHtml: text('<p>Alpha.</p><p>Be</p>') })]);
+      const row = w.document.querySelector('.ev-assistant_message');
+      const lex = vi.spyOn(Lexer, 'lex');
+      // A revision advances the seq and the page's capture grows, but what shows is the same.
+      await append([written(3, 'Alpha.\n\nBeta is', { renderedHtml: text('<p>Alpha.</p><p>Beta is</p>') })]);
+      expect(lex).not.toHaveBeenCalled();
+      expect(w.document.querySelector('.ev-assistant_message')).toBe(row);
+      // The store can move a revision's time to when the page authored it; the held row keeps its clock.
+      const clock = row!.querySelector('time')!.textContent;
+      await append([written(4, 'Alpha.\n\nBeta is mo', { time: T0 + 1_500 })]);
+      expect(lex).not.toHaveBeenCalled();
+      await append([written(5, 'Alpha.\n\nBeta is done.\n\nGa')]);
+      expect(lex).toHaveBeenCalled();
+      expect(shown(w)).toEqual(['Alpha.', 'Beta is done.']);
+      lex.mockClear();
+      await append([written(6, 'Alpha.\n\nBeta is done.\n\nGamma.', { state: 'final', final: true, time: T0 + 120_000 })]);
+      expect(lex).toHaveBeenCalled();
+      expect(shown(w)).toEqual(['Alpha.', 'Beta is done.', 'Gamma.']);
+      // The final event is not held: it draws its own time.
+      expect(w.document.querySelector('.ev-assistant_message time')!.textContent).not.toBe(clock);
+      lex.mockRestore();
+    });
+
+    /** Opens the chat with its controls held back until `release`, answered with `change` applied. */
+    const openBeforeControls = async (change: Record<string, unknown> = {}) => {
+      const { w, append } = await boot([start, written(2, 'Alpha.\n\nBe')], false);
+      const api = (w as any).api, original = api.getSessionControls, pending: Array<() => void> = [];
+      api.getSessionControls = (id: string) => new Promise(resolve => pending.push(async () => {
+        const answer = await original(id);
+        resolve({ ...answer, data: { ...answer.data, ...change } });
+      }));
+      (w.document.querySelector('#sessionList [data-id]') as HTMLElement).click();
+      await settle();
+      return { w, append, release: async () => { for (const reply of pending.splice(0)) reply(); await settle(); } };
+    };
+
+    it('holds the tail back from the first paint, before the chat\'s controls arrive', async () => {
+      const { w, release } = await openBeforeControls();
+      expect(blocks(w)).toHaveLength(1);
+      expect(shown(w)).toEqual(['Alpha.']);
+      await release();
+      expect(shown(w)).toEqual(['Alpha.']);
+    });
+
+    it('shows the message whole once the controls say its open turn is not working', async () => {
+      const { w, release } = await openBeforeControls({ activeTurnId: null });
+      expect(shown(w)).toEqual(['Alpha.']);
+      await release();
+      expect(shown(w)).toEqual(['Alpha.', 'Be']);
+    });
+
+    it('keeps holding the tail when this app files a status row after the message', async () => {
+      const { w, append } = await boot([start, written(2, 'Alpha.\n\nBe')]);
+      await append([
+        { seq: 3, time: T0 + 1_000, source: 'app', kind: 'progress', progressId: 'finish-notice:x', message: text('Preparing finish notice') },
+        { seq: 4, time: T0 + 1_100, source: 'app', kind: 'note', message: text('Recovered the page') },
+        { seq: 5, time: T0 + 1_200, source: 'app', kind: 'progress', turnId: 'live-turn', progressId: 'browser-repair:y', message: text('Repairing') }
+      ]);
+      expect(shown(w)).toEqual(['Alpha.']);
+      await append([written(6, 'Alpha.\n\nBeta.\n\nGa')]);
+      expect(shown(w)).toEqual(['Alpha.', 'Beta.']);
+    });
+
+    it('shows the rest when an error for the chat follows the message, with or without its turn', async () => {
+      const { w, append } = await boot([start, written(2, 'Alpha.\n\nBe')]);
+      await append([{ seq: 3, time: T0 + 1_000, source: 'extension', kind: 'chat_error', message: text('Something went wrong') }]);
+      expect(shown(w)).toEqual(['Alpha.', 'Be']);
+    });
+
+    it('shows the rest when ChatGPT\'s own commentary follows the message', async () => {
+      const { w, append } = await boot([start, written(2, 'Alpha.\n\nBe')]);
+      await append([{ seq: 3, time: T0 + 1_000, source: 'extension', kind: 'progress', message: text('Checking the docs') }]);
+      expect(shown(w)).toEqual(['Alpha.', 'Be']);
+    });
+
+    it('draws a revision that rewrites a shown block to the same length', async () => {
+      const { w, append } = await boot([start, written(2, 'Alpha.\n\nBe')]);
+      expect(shown(w)).toEqual(['Alpha.']);
+      await append([written(3, 'Omega.\n\nBe')]);
+      expect(shown(w)).toEqual(['Omega.']);
+    });
+
+    it('draws a source a revision adds to a block already shown', async () => {
+      const body = 'Alpha. :chatgpt-content-reference{index="1"}\n\nBe';
+      const { w, append } = await boot([start, written(2, body)]);
+      expect(blocks(w)[0]!.querySelector('.citation')).toBeNull();
+      const references = [{ index: 1, sources: [{ title: 'A report', url: 'https://news.example.com/report', source: 'Example News' }] }];
+      await append([written(3, body, { references })]);
+      expect(blocks(w)[0]!.querySelector('.citation-pill')?.getAttribute('href')).toBe('https://news.example.com/report');
+      expect(shown(w)).toHaveLength(1);
+    });
+
+    it('shows a list once it ends, so it does not turn loose on screen', async () => {
+      const { w, append } = await boot([start, written(2, 'Alpha.\n\n- one\n- two\n\n- thr')]);
+      expect(shown(w)).toEqual(['Alpha.']);
+      await append([written(3, 'Alpha.\n\n- one\n- two\n\n- three\n\nAfter.\n\nNe')]);
+      expect(blocks(w).map(block => block.tagName)).toEqual(['P', 'UL', 'P']);
+      const list = blocks(w)[1]!;
+      expect(list.querySelectorAll('li > p')).toHaveLength(3);
+      expect(fading(w)).toEqual([list.textContent?.trim(), 'After.']);
+      await append([written(4, 'Alpha.\n\n- one\n- two\n\n- three\n\nAfter.\n\nNext.\n\n')]);
+      expect(blocks(w)[1]).toBe(list);
+    });
+  });
+
+  it('draws a final answer opened with the chat again when it is revised', async () => {
+    const { w, append } = await boot([answer(1, 'Alpha.\n\nBeta.', { state: 'final', final: true })]);
+    await append([answer(2, 'Alpha.\n\nBeta, revised.', { state: 'final', final: true })]);
+    expect(blocks(w).map(block => block.textContent)).toEqual(['Alpha.', 'Beta, revised.']);
+  });
+
+  it('pages an earlier answer in without fading it', async () => {
+    const asks = Array.from({ length: 30 }, (_, i): SessionEvent => ({ seq: i + 2, time: T0 + i + 2, source: 'extension',
+      kind: 'user_message', messageId: `ask-${i}`, message: text(`Ask ${i}`) }));
+    const { w } = await boot([answer(1, 'Earlier alpha.\n\nEarlier beta.', { messageId: 'earlier', state: 'final', final: true }), ...asks]);
+    expect(blocks(w)).toEqual([]);
+    const pane = w.document.getElementById('chatBody')!;
+    Object.defineProperties(pane, { clientHeight: { value: 800 }, scrollHeight: { value: 800 } });
+    pane.scrollTop = 0;
+    pane.dispatchEvent(new w.WheelEvent('wheel', { deltaY: -100 }));
+    await settleHistoryFrame(w);
+    expect(blocks(w).map(block => block.textContent)).toEqual(['Earlier alpha.', 'Earlier beta.']);
+    expect(fading(w)).toEqual([]);
+  });
+
+  it('fades nothing when a revision shortens an answer', async () => {
+    const { w, append } = await boot([answer(1, 'Alpha.\n\nBeta.\n\nGamma.')]);
+    const [alpha] = blocks(w);
+    await append([answer(2, 'Alpha.\n\nBeta')]);
+    expect(blocks(w)[0]).toBe(alpha);
+    expect(blocks(w).map(block => block.textContent)).toEqual(['Alpha.', 'Beta']);
+    expect(fading(w)).toEqual([]);
+  });
+});
+
 it('keeps an unfolded tool row as the same open node while the chat keeps appending', async () => {
   const { w, append } = await boot([
     { seq: 1, time: T0, source: 'app', kind: 'session_start', conversationId: 'chat-a', title: 'Loop under test' },
@@ -2457,7 +3343,8 @@ it('keeps an unfolded tool row as the same open node while the chat keeps append
   expect(detached.some(node => node === group || node === before || (node as Element).contains?.(before))).toBe(false);
   expect(timeline.querySelector('details.tool-group')).toBe(group);
   expect(group.open).toBe(false);
-  expect(group.querySelector('summary')!.textContent).toBe('Read README.md');
+  expect(group.querySelector('.activity-title')!.textContent).toBe('Read README.md');
+  expect(group.querySelector('.activity-count')!.textContent).toBe('4');
   expect(group.querySelector('summary')!.title).toContain('4 actions');
 });
 
@@ -2498,7 +3385,7 @@ it('colors removed lines separately from added lines without changing other tool
   expect(rows[1]!.querySelector('.edit-card .metric-removed')?.textContent).toBe('−7');
 });
 
-it('keeps mixed tool and agent activity in one latest-action disclosure between authored messages', async () => {
+it('opens a round with the ChatGPT caption and keeps its mixed tool and agent activity in one latest-action disclosure', async () => {
   const { w, append } = await boot([
     { seq: 1, time: T0, source: 'extension', kind: 'progress', message: text('Checking the implementation') },
     toolCall(2, 'first'),
@@ -2508,7 +3395,10 @@ it('keeps mixed tool and agent activity in one latest-action disclosure between 
   const timeline = w.document.getElementById('timeline')!;
   const group = timeline.querySelector<HTMLDetailsElement>('.tool-group')!;
   expect(group.open).toBe(false);
-  expect(group.querySelector('.activity-title')!.textContent).toBe('Checking the implementation');
+  // The caption is what ChatGPT said before the step: it stands as the round's opening line.
+  expect(timeline.children[0]!.className).toContain('ev-progress');
+  expect(timeline.children[0]!.textContent).toContain('Checking the implementation');
+  expect(group.querySelector('.activity-title')!.textContent).toBe(group.querySelector('.ev-tool_call:last-of-type .tool > summary b')!.textContent);
   expect(group.querySelector('.agent-communication summary')!.textContent).toContain('Message from worker-2');
   expect(group.querySelector('.agent-avatar')).not.toBeNull();
   expect(group.querySelectorAll('.ev')).toHaveLength(3);
@@ -2518,6 +3408,85 @@ it('keeps mixed tool and agent activity in one latest-action disclosure between 
   ]);
   expect(timeline.querySelectorAll('.tool-group')).toHaveLength(2);
   expect(timeline.children[0]!.className).toContain('ev-progress');
+});
+
+// The maintainer asked to answer ChatGPT's approval card from the app (2026-10-14): the row shows
+// the card's words and offers Deny and Allow once for exactly that card. Never "always".
+describe('ChatGPT\'s approval card in the timeline', () => {
+  const waitingRow = { seq: 1, time: T0, source: 'app', kind: 'progress', progressId: 'approval-wait:chat-a:1',
+    message: text('ChatGPT is waiting for you to allow or deny a tool call in this chat. Nothing continues until you answer it there.') } as SessionEvent;
+
+  it('shows the card\'s words with Deny and Allow once, and answers that exact card once', async () => {
+    let card: any = { id: 'card-1234567', lines: ['Gmail', 'Allow ChatGPT to use Gmail?', 'Creates a draft.'], allow: true, answer: null };
+    const answers: string[][] = [];
+    const { w } = await boot([waitingRow], true, [], [], {
+      approvalCard: () => card,
+      answerApproval: (_id, cardId, choice) => { answers.push([cardId, choice]); card = { ...card, answer: { choice, outcome: null } }; return { ok: true }; }
+    });
+    const timeline = w.document.getElementById('timeline')!;
+    await vi.waitFor(() => expect(timeline.querySelector('.approval-card')?.textContent).toContain('Allow ChatGPT to use Gmail?'));
+    // The recorded English is unchanged; the row now says the answer can be given here too.
+    expect(timeline.querySelector('.approval-wait')?.textContent).toContain('here or in the browser');
+    const buttons = () => [...timeline.querySelectorAll<HTMLButtonElement>('.approval-card button')];
+    expect(buttons().map(button => button.textContent)).toEqual(['Deny', 'Allow once']);
+    expect(buttons().every(button => !button.disabled)).toBe(true);
+    buttons()[1]!.click();
+    await vi.waitFor(() => expect(answers).toEqual([['card-1234567', 'allow']]));
+    expect(buttons().every(button => button.disabled)).toBe(true);
+    expect(timeline.querySelector('.approval-card')?.textContent).toContain('Sending your answer to ChatGPT');
+    // The page found a different card: nothing was pressed, and the row says so.
+    card = { ...card, answer: { choice: 'allow', outcome: 'card_changed' } };
+    await vi.waitFor(() => expect(timeline.querySelector('.approval-card')?.textContent).toContain('Nothing was pressed'), { timeout: 4000 });
+  });
+
+  it('keeps only the newest unanswered approval row live; older ones read as past, without buttons', async () => {
+    // VM, 2026-10-20: two app restarts while one card waited left three "waiting" rows, each with
+    // its own Deny and Allow once for the same card. A row from an earlier episode was never answered
+    // there, so it says ChatGPT asked, not that it is waiting or answered.
+    const older = { ...waitingRow, seq: 1, progressId: 'approval-wait:chat-a:1' } as SessionEvent;
+    const middle = { ...waitingRow, seq: 2, progressId: 'approval-wait:chat-a:2' } as SessionEvent;
+    const newest = { ...waitingRow, seq: 3, progressId: 'approval-wait:chat-a:3' } as SessionEvent;
+    const { w } = await boot([older, middle, newest], true, [], [], {
+      approvalCard: () => ({ id: 'card-1', lines: ['Allow ChatGPT to use Chat On Steroids Core?', 'Start a worker.'], allow: true, answer: null })
+    });
+    const timeline = w.document.getElementById('timeline')!;
+    await vi.waitFor(() => expect(timeline.querySelectorAll('.approval-card')).toHaveLength(1));
+    const rows = [...timeline.querySelectorAll('.approval-wait')];
+    expect(rows).toHaveLength(3);
+    expect(rows.filter(row => row.classList.contains('is-waiting'))).toHaveLength(1);
+    expect(rows[2]!.classList.contains('is-waiting')).toBe(true);
+    for (const row of rows.slice(0, 2)) {
+      expect(row.textContent).toBe('ChatGPT asked for a tool approval in this chat.');
+      expect(row.querySelector('button')).toBeNull();
+    }
+  });
+
+  it('offers only Deny where ChatGPT itself disabled Allow once', async () => {
+    const { w } = await boot([waitingRow], true, [], [], {
+      approvalCard: () => ({ id: 'card-7654321', lines: ['Gmail', 'Allow ChatGPT to use Gmail?', 'External app access is unavailable in this conversation'], allow: false, answer: null })
+    });
+    const timeline = w.document.getElementById('timeline')!;
+    await vi.waitFor(() => expect(timeline.querySelector('.approval-card button')).not.toBeNull());
+    const [deny, allow] = [...timeline.querySelectorAll<HTMLButtonElement>('.approval-card button')];
+    expect(deny!.disabled).toBe(false);
+    expect(allow!.disabled).toBe(true);
+    expect(timeline.querySelector('.approval-card')?.textContent).toContain('ChatGPT does not allow it in this chat');
+  });
+});
+
+it('shows a strict-mode refusal notice in the interface language', async () => {
+  // VM, 2026-10-20: a German interface showed this notice in English; the app records it in English.
+  const { UNTRUSTED_NOTICE } = await import('../src/shared/trust-notices.js');
+  const { w } = await boot([{ seq: 1, time: T0, source: 'app', kind: 'progress', progressId: 'strict-chat-refusal:one',
+    message: text(UNTRUSTED_NOTICE) } as SessionEvent]);
+  const timeline = w.document.getElementById('timeline')!;
+  await vi.waitFor(() => expect(timeline.textContent).toContain('untrusted chat was refused'));
+  const { setLanguage } = await import('../src/renderer/i18n.js');
+  setLanguage('de');
+  try {
+    await vi.waitFor(() => expect(timeline.textContent).toContain('Chat vertrauen'));
+    expect(timeline.textContent).not.toContain('untrusted chat was refused');
+  } finally { setLanguage('en'); }
 });
 
 it('never titles a tool group with the app\'s own recovery note', async () => {
@@ -2534,9 +3503,39 @@ it('never titles a tool group with the app\'s own recovery note', async () => {
   const title = group.querySelector('.activity-title')!.textContent;
   expect(title).not.toContain('Reloaded chat');
   expect(title).toBe(group.querySelector('.ev-tool_call:last-of-type .tool > summary b')?.textContent ?? title);
-  expect(group.classList.contains('has-activity-phase')).toBe(false);
   // The note itself stays in the transcript, in front of the group.
   expect(timeline.children[0]!.textContent).toContain('Reloaded chat to recover an interrupted response.');
+});
+
+it('closes a stopped turn with a line saying it stopped, after any late work, and keeps the request line', async () => {
+  // 2026-10-09: "ChatGPT has not yet confirmed that generation stopped" was the last word on a
+  // turn the page had already ended as stopped. The request stays where it was made; the end of
+  // the turn says it stopped once nothing runs any more.
+  const request = 'Stop requested. The finish hold was released; ChatGPT has not yet confirmed that generation stopped.';
+  const stoppedLine = 'Stopped. ChatGPT no longer shows this turn running.';
+  const { w, append } = await boot([
+    { seq: 1, time: T0, source: 'extension', kind: 'turn_start', turnId: 'g-stop' },
+    { ...toolCall(2, 'before-stop'), turnId: 'g-stop' } as SessionEvent,
+    { seq: 3, time: T0 + 3000, source: 'app', kind: 'progress', turnId: 'g-stop', progressId: 'finish-release:g-stop', message: text(request) }
+  ]);
+  const timeline = w.document.getElementById('timeline')!;
+  const lines = () => [...timeline.querySelectorAll('.ev')].map(row => row.textContent ?? '');
+  const last = () => lines().at(-1)!;
+  expect(lines().some(line => line.includes(stoppedLine))).toBe(false);
+  await append([{ seq: 4, time: T0 + 3200, source: 'extension', kind: 'turn_end', turnId: 'g-stop', outcome: 'stopped' }]);
+  expect(last()).toContain(stoppedLine);
+  expect(lines().filter(line => line.includes(request))).toHaveLength(1);
+  // A call ChatGPT dispatched before it obeyed reopens the turn: nothing says it stopped yet.
+  await append([
+    { ...toolCall(5, 'late'), time: T0 + 4000, turnId: 'g-stop' } as SessionEvent,
+    { seq: 6, time: T0 + 4000, source: 'app', kind: 'turn_start', turnId: 'g-stop' }
+  ]);
+  expect(lines().some(line => line.includes(stoppedLine))).toBe(false);
+  // The page ends it again: the line closes the turn, after the late call.
+  await append([{ seq: 7, time: T0 + 9000, source: 'extension', kind: 'turn_end', turnId: 'g-stop', outcome: 'stopped' }]);
+  expect(lines().filter(line => line.includes(stoppedLine))).toHaveLength(1);
+  expect(last()).toContain(stoppedLine);
+  expect(lines().filter(line => line.includes(request))).toHaveLength(1);
 });
 
 it('folds five consecutive status polls while retaining each exact tool row', async () => {
@@ -2672,25 +3671,145 @@ it('shows injection only for an exact active turn, never merely recent chat acti
   expect((w.document.getElementById('sendMode') as HTMLSelectElement).value).toBe('auto');
 });
 
-it('shows Send directly before MCP, keeps After this turn selected, and changes the visible menu after MCP', async () => {
+// A text for the running turn goes through ChatGPT's composer (#1231), so a running turn offers
+// Send directly alone; Inject now stays for a Pro turn, which keeps tool injection.
+it('shows Send directly alone for a running turn, keeps After this turn selected, and offers Inject now on a Pro turn', async () => {
   const { w, append } = await boot([]);
   const api = (w as any).api;
   const original = api.getSessionControls;
-  let tools = false;
+  let pro = false;
   api.getSessionControls = async (id: string) => ({ ok: true, data: { ...(await original(id)).data,
-    activeTurnId: 'plain-turn', canInject: tools, canSendDirectly: !tools, queueAtFinish: false } });
+    activeTurnId: 'plain-turn', canInject: pro, canSendDirectly: !pro, queueAtFinish: false } });
   await append([]);
   const options = w.document.getElementById('sendOptions')!;
   expect(options.hidden).toBe(false);
   expect(options.querySelector('[data-delivery="auto"]')!.textContent).toBe('Send directly');
-  expect((options.querySelector('[data-delivery="tool"]') as HTMLElement).hidden).toBe(false);
+  expect((options.querySelector('[data-delivery="tool"]') as HTMLElement).hidden).toBe(true);
+  await append([toolCall(1, 'first-mcp-call')]);
+  expect(options.querySelector('[data-delivery="auto"]')!.textContent).toBe('Send directly');
   (options.querySelector('[data-delivery="after-turn"]') as HTMLButtonElement).click();
   await append([]);
   expect((w.document.getElementById('sendMode') as HTMLSelectElement).value).toBe('after-turn');
-  tools = true;
-  await append([toolCall(1, 'first-mcp-call')]);
+  pro = true;
+  await append([toolCall(2, 'second-mcp-call')]);
+  expect((options.querySelector('[data-delivery="tool"]') as HTMLElement).hidden).toBe(false);
   expect(options.querySelector('[data-delivery="auto"]')!.textContent).toBe('Inject now');
   expect((w.document.getElementById('sendMode') as HTMLSelectElement).value).toBe('after-turn');
+});
+
+it("retires the running turn's lines when the turn ends after its rows were drawn (2026-10-12)", async () => {
+  // The turn's end reached the header ("Worked for") after the last rows were drawn; the timeline kept
+  // "Working for" and "Thinking" frozen under the finished answer until another event arrived.
+  const asked = Date.now() - 60_000;
+  const app = await boot([
+    { seq: 1, time: asked - 100, source: 'extension', kind: 'turn_start', turnId: 'ending-turn' },
+    { kind: 'user_message', seq: 2, origin: 2, time: asked, source: 'extension', turnId: 'ending-turn', messageId: 'q-end', message: text('Finish the step') }
+  ]);
+  const { w } = app;
+  const api = (w as any).api;
+  const original = api.getSessionControls;
+  api.getSessionControls = async (id: string) => ({ ok: true, data: { ...(await original(id)).data, activeTurnId: 'ending-turn' } });
+  await app.append([{ seq: 3, time: asked + 50_000, source: 'extension', kind: 'assistant_message', turnId: 'ending-turn', messageId: 'a-end', final: true, message: text('Step finished.') },
+    { seq: 4, time: asked + 51_000, source: 'extension', kind: 'turn_end', turnId: 'ending-turn', outcome: 'completed' }]);
+  // The rows were drawn while the controls still said the turn runs.
+  expect(w.document.querySelector('#timeline .turn-status.is-working')).not.toBeNull();
+  api.getSessionControls = async (id: string) => ({ ok: true, data: { ...(await original(id)).data, activeTurnId: null } });
+  // An app state update re-reads only the controls, as the live app did when the turn ended.
+  const chat = await import('../src/renderer/chat.js');
+  chat.chatApply((await api.getState()).data);
+  await settle(); await settle();
+  expect(w.document.getElementById('chatState')!.textContent).toMatch(/^Worked for /);
+  expect(w.document.querySelector('#timeline .turn-status.is-working')).toBeNull();
+  expect(w.document.querySelector('#timeline .turn-now')).toBeNull();
+});
+
+// #1787: a chat's page stopped reporting, the app gave up recovering it and its activity window ran
+// out, but nothing new was written to the chat. The caption had read the controls once and went on
+// saying "Working for …" for six hours.
+it('stops counting a turn the app no longer sees running, even when nothing new arrives in the chat', async () => {
+  const { w } = await boot([{ seq: 1, time: Date.now() - 60_000, source: 'extension', kind: 'turn_start', turnId: 'held-turn' }]);
+  expect(w.document.getElementById('chatState')!.textContent).toMatch(/^Working for /);
+  const api = (w as any).api;
+  const original = api.getSessionControls;
+  api.getSessionControls = async (id: string) => ({ ok: true, data: { ...(await original(id)).data, activeTurnId: null } });
+  try {
+    vi.setSystemTime(Date.now() + 5 * 60_000);
+    await vi.waitFor(() => expect(w.document.getElementById('chatState')!.textContent).not.toMatch(/^Working for /), { timeout: 5_000 });
+  } finally { vi.useRealTimers(); }
+});
+
+it('says a chat stopped when recovery gave up on its unfinished turn, and drops that once the page is back', async () => {
+  const { w, append } = await boot([{ seq: 1, time: Date.now() - 60_000, source: 'extension', kind: 'turn_start', turnId: 'held-turn' }]);
+  const api = (w as any).api;
+  const original = api.getSessionControls;
+  let stopped = true;
+  api.getSessionControls = async (id: string) => ({ ok: true, data: { ...(await original(id)).data, activeTurnId: null, pageless: stopped } });
+  await append([]);
+  const caption = () => w.document.getElementById('chatState')!;
+  expect(caption().textContent).toBe("Stopped · open this chat's tab again to continue");
+  expect(caption().classList.contains('is-bad')).toBe(true);
+  expect(caption().classList.contains('is-working')).toBe(false);
+  stopped = false;
+  await append([]);
+  expect(caption().textContent).toBe('');
+});
+
+it('takes the stopped line away when the page is back, even when nothing new arrives in the chat', async () => {
+  const { w, append } = await boot([{ seq: 1, time: Date.now() - 60_000, source: 'extension', kind: 'turn_start', turnId: 'held-turn' }]);
+  const api = (w as any).api;
+  const original = api.getSessionControls;
+  let stopped = true;
+  api.getSessionControls = async (id: string) => ({ ok: true, data: { ...(await original(id)).data, activeTurnId: null, pageless: stopped } });
+  await append([]);
+  expect(w.document.getElementById('chatState')!.textContent).toBe("Stopped · open this chat's tab again to continue");
+  stopped = false;
+  try {
+    vi.setSystemTime(Date.now() + 60_000);
+    await vi.waitFor(() => expect(w.document.getElementById('chatState')!.textContent).toBe(''), { timeout: 5_000 });
+  } finally { vi.useRealTimers(); }
+});
+
+it('says a reopened turn stopped rather than how long it worked', async () => {
+  const at = Date.now() - 120_000;
+  const { w, append } = await boot([
+    { seq: 1, time: at, source: 'extension', kind: 'turn_start', turnId: 'reopened-turn' },
+    { seq: 2, time: at + 10_000, source: 'extension', kind: 'turn_end', turnId: 'reopened-turn', outcome: 'completed' },
+    { seq: 3, time: at + 20_000, source: 'extension', kind: 'turn_start', turnId: 'reopened-turn' }
+  ]);
+  const api = (w as any).api;
+  const original = api.getSessionControls;
+  api.getSessionControls = async (id: string) => ({ ok: true, data: { ...(await original(id)).data, activeTurnId: null, pageless: true } });
+  await append([]);
+  expect(w.document.getElementById('chatState')!.textContent).toBe("Stopped · open this chat's tab again to continue");
+});
+
+it('shows the stopped line at the top of the loaded rows when its question is further up', async () => {
+  const asked = Date.now() - 45 * 60_000;
+  const calls = Array.from({ length: 220 }, (_, i): SessionEvent => ({ ...toolCall(i + 3, `long-${i}`), time: asked + (i + 1) * 1000, turnId: 'long-turn' }));
+  const app = await boot([
+    { seq: 1, time: asked - 100, source: 'extension', kind: 'turn_start', turnId: 'long-turn' },
+    { kind: 'user_message', seq: 2, origin: 2, time: asked, source: 'extension', turnId: 'long-turn', messageId: 'q-long', message: text('Build all thirty quests') },
+    ...calls
+  ], true, [], [], { summary: { activeTurnId: 'long-turn' } });
+  const { w } = app;
+  const api = (w as any).api;
+  const original = api.getSessionControls;
+  api.getSessionControls = async (id: string) => ({ ok: true, data: { ...(await original(id)).data, activeTurnId: null, pageless: true } });
+  await app.append([]); await app.append([]);
+  const timeline = w.document.getElementById('timeline')!;
+  expect(timeline.querySelector('.ev-user_message')).toBeNull();
+  const rows = [...timeline.querySelectorAll('[data-timeline-key], .turn-stopped, .turn-status')];
+  expect(rows[0]?.matches('.turn-stopped')).toBe(true);
+  expect(rows[0]?.textContent).toBe("Stopped · open this chat's tab again to continue");
+  expect(timeline.querySelector('.turn-status.is-working')).toBeNull();
+});
+
+// The 2.1.45 caption counted a six-hour turn as "Working for 372m 3s" (#1787 screenshots).
+it('counts a turn longer than an hour in hours and minutes', async () => {
+  const { w, append } = await boot([{ seq: 1, time: T0, source: 'extension', kind: 'turn_start', turnId: 'held-turn' }]);
+  (w as any).api.getSessionControls = (id: string) => Promise.resolve({ ok: true, data: { sessionId: id, automation: 'off', activeTurnId: null, finishHeld: false, blocked: '', job: null } });
+  await append([{ seq: 2, time: T0 + (6 * 3600 + 12 * 60 + 3) * 1000, source: 'extension', kind: 'turn_end', turnId: 'held-turn', outcome: 'completed' }]);
+  expect(w.document.getElementById('chatState')!.textContent).toBe('Worked for 6h 12m 3s');
 });
 
 it('shows elapsed work for the exact recorded turn without exposing lifecycle rows', async () => {
@@ -2785,6 +3904,119 @@ it('stops directly from the empty composer without a second Stop menu action', a
   await settle();
   expect(stop).toHaveBeenCalledWith('2026-09-02-test0001', 'held-turn');
   expect(input.value).toBe('');
+});
+
+describe('Esc in the empty composer during a turn', () => {
+  const esc = (w: JSDOM['window'], init: KeyboardEventInit = {}) => {
+    const event = new w.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true, ...init });
+    w.document.getElementById('chatInput')!.dispatchEvent(event);
+    return event.defaultPrevented;
+  };
+  const status = (w: JSDOM['window']) => w.document.getElementById('composerStatus')!.textContent;
+
+  it('stops the running turn on a second Esc, and only says so on the first', async () => {
+    const { w } = await boot([]);
+    const stop = vi.fn(async () => ({ ok: true, data: {} }));
+    (w as any).api.stopSessionTurn = stop;
+    expect(esc(w)).toBe(true);
+    await settle();
+    expect(stop).not.toHaveBeenCalled();
+    expect(status(w)).toBe('Press Esc again to stop the turn');
+    expect(esc(w)).toBe(true);
+    await settle();
+    expect(stop).toHaveBeenCalledWith('2026-09-02-test0001', 'held-turn');
+    expect(status(w)).toBe('');
+  });
+
+  it.each([false, true])('stops the turn it was pressed for before the controls are read again (Plan armed: %s)', async (armPlan) => {
+    const { w, live } = await boot([]);
+    const api = (w as any).api;
+    const stop = vi.fn(async () => ({ ok: true, data: {} }));
+    api.stopSessionTurn = stop;
+    const plan = vi.fn(async () => ({ ok: true, data: null }));
+    api.draftTaskPlan = plan;
+    if (armPlan) (w.document.getElementById('createPlan') as HTMLButtonElement).click();
+    await settle();
+    expect(w.document.getElementById('chatSend')!.dataset.action).toBe('stop');
+    // A turn the window has not seen yet: Stop goes to the turn on screen, not to whatever a reread finds.
+    const controls = api.getSessionControls;
+    api.getSessionControls = async (id: string) => ({ ok: true, data: { ...(await controls(id)).data, activeTurnId: 'unseen-turn' } });
+    esc(w); esc(w);
+    await settle();
+    expect(stop).toHaveBeenCalledWith('2026-09-02-test0001', 'held-turn');
+    expect(stop).toHaveBeenCalledTimes(1);
+    expect(plan).not.toHaveBeenCalled();
+    expect(live.sent).toEqual([]);
+  });
+
+  it('disarms on the arrows prompt recall takes, even when they leave the composer empty again', async () => {
+    const asked = [{ kind: 'user_message', seq: 1, time: T0 + 1000, source: 'extension', turnId: 't1', messageId: 'q-1', message: text('An earlier question') },
+      { kind: 'assistant_message', seq: 2, time: T0 + 2000, source: 'extension', turnId: 't1', messageId: 'a-2', message: text('An answer'), final: true, state: 'final' }] as SessionEvent[];
+    const { w } = await boot(asked);
+    const stop = vi.fn(async () => ({ ok: true, data: {} }));
+    (w as any).api.stopSessionTurn = stop;
+    const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+    const arrow = (key: string) => { const event = new w.KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }); input.dispatchEvent(event); return event.defaultPrevented; };
+    esc(w);
+    expect(arrow('ArrowUp')).toBe(true);
+    expect(input.value).toBe('An earlier question');
+    input.setSelectionRange(input.value.length, input.value.length);
+    expect(arrow('ArrowDown')).toBe(true);
+    expect(input.value).toBe('');
+    expect(status(w)).toBe('');
+    // A fresh first press: it only asks.
+    expect(esc(w)).toBe(true);
+    await settle();
+    expect(stop).not.toHaveBeenCalled();
+    expect(status(w)).toBe('Press Esc again to stop the turn');
+  });
+
+  it('does not let an Esc armed for one turn stop the next turn', async () => {
+    const { w, append } = await boot([]);
+    const api = (w as any).api;
+    const stop = vi.fn(async () => ({ ok: true, data: {} }));
+    api.stopSessionTurn = stop;
+    esc(w);
+    const controls = api.getSessionControls;
+    api.getSessionControls = async (id: string) => ({ ok: true, data: { ...(await controls(id)).data, activeTurnId: 'next-turn' } });
+    await append([]);
+    expect(w.document.getElementById('chatSend')!.dataset.action).toBe('stop');
+    // The press after the new turn started only asks again; the next one stops that turn.
+    expect(esc(w)).toBe(true);
+    await settle();
+    expect(stop).not.toHaveBeenCalled();
+    expect(status(w)).toBe('Press Esc again to stop the turn');
+    esc(w);
+    await settle();
+    expect(stop).toHaveBeenCalledWith('2026-09-02-test0001', 'next-turn');
+    expect(stop).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not stop for Esc with a draft, a held Esc, a key between, modifiers or a late second Esc', async () => {
+    const { w } = await boot([]);
+    const stop = vi.fn(async () => ({ ok: true, data: {} }));
+    (w as any).api.stopSessionTurn = stop;
+    const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+    input.value = 'Keep this draft'; input.dispatchEvent(new w.Event('input'));
+    expect(esc(w)).toBe(false); esc(w);
+    expect(status(w)).toBe('');
+    input.value = ''; input.dispatchEvent(new w.Event('input'));
+    esc(w); esc(w, { repeat: true }); esc(w, { repeat: true });
+    input.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Shift', bubbles: true, cancelable: true }));
+    expect(status(w)).toBe('');
+    esc(w); expect(esc(w, { ctrlKey: true })).toBe(false);
+    const now = performance.now.bind(performance);
+    let skew = 0;
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => now() + skew);
+    try {
+      esc(w); skew = 1_600;
+      // Too late to stop: this press only asks again.
+      expect(esc(w)).toBe(true);
+      expect(status(w)).toBe('Press Esc again to stop the turn');
+    } finally { clock.mockRestore(); }
+    await settle();
+    expect(stop).not.toHaveBeenCalled();
+  });
 });
 
 it('shows Stop immediately for a queued first send, switches to Send for a new draft, and cancels through the same button', async () => {
@@ -3200,6 +4432,41 @@ it('cancels pending planning without replacing the draft with a late result', as
   expect(live.sent).toHaveLength(0);
 });
 
+// 2.1.41 bug hunt: a ready plan had already taken the request out of the composer, so Cancel plan
+// (whose tooltip promises to keep the draft) or deleting its last stage lost the request outright.
+it('gives the request back to the composer when a ready plan is cancelled or its last stage deleted', async () => {
+  const { w, live } = await boot([], false);
+  const api = (w as any).api;
+  api.draftTaskPlan = vi.fn(async () => ({ ok: true, data: ['Write it', 'Check it'] }));
+  const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  const plan = w.document.getElementById('createPlan') as HTMLButtonElement;
+  const prepare = async (text: string) => {
+    input.value = text; input.dispatchEvent(new w.Event('input'));
+    plan.click(); w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { cancelable: true })); await settle();
+    expect(input.value).toBe('');
+    expect(w.document.querySelectorAll('#taskPlanPreview .plan-stage')).toHaveLength(2);
+  };
+  await prepare('Write a poem about a lighthouse');
+  plan.click(); await settle();
+  expect(plan.getAttribute('aria-pressed')).toBe('false');
+  expect(input.value).toBe('Write a poem about a lighthouse');
+
+  input.value = ''; input.dispatchEvent(new w.Event('input'));
+  await prepare('Write a song about the sea');
+  for (let i = 0; i < 2; i++) (w.document.querySelector('#taskPlanPreview .plan-stage [aria-label^="Delete stage"]') as HTMLButtonElement).click();
+  await settle();
+  expect(plan.getAttribute('aria-pressed')).toBe('false');
+  expect(input.value).toBe('Write a song about the sea');
+
+  // Something typed since stays; the request does not overwrite it.
+  input.value = ''; input.dispatchEvent(new w.Event('input'));
+  await prepare('Write a limerick');
+  input.value = 'A newer thought'; input.dispatchEvent(new w.Event('input'));
+  plan.click(); await settle();
+  expect(input.value).toBe('A newer thought');
+  expect(live.sent).toHaveLength(0);
+});
+
 it('keeps completed stages after clearing or replacing the composer until explicitly deleted', async () => {
   const { w, live } = await boot([], false);
   const api = (w as any).api;
@@ -3238,6 +4505,32 @@ it('queues every generated stage in an existing session without Send and preserv
   expect(w.document.querySelectorAll('#finishQueue .queued-input')).toHaveLength(1);
   expect(w.document.getElementById('finishQueue')!.textContent).toContain('Verify it');
   expect(live.sent).toHaveLength(1);
+});
+
+// #1428: in a chat with nothing running, the plan used to be queued "at Session finish" right
+// away, and Session finish only comes at the end of a turn. Nothing started until the person
+// sent some other message.
+it('shows the plan in an idle chat and starts it with Enter, like in a new chat', async () => {
+  const { w, live } = await boot([]);
+  const api = (w as any).api;
+  api.getSessionControls = (id: string) => Promise.resolve({ ok: true, data: { sessionId: id, conversationId: 'chat-a', automation: 'off', activeTurnId: null, finishHeld: false, blocked: '', job: null } });
+  // Selected again, so the chat's state is read with nothing running.
+  w.document.getElementById('newChat')!.click(); await settle();
+  (w.document.querySelector(`[data-id="${summary([]).id}"]`) as HTMLButtonElement).click(); await settle();
+  api.draftTaskPlan = vi.fn(async () => ({ ok: true, data: ['Build foundation', 'Verify it'] }));
+  const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  input.value = 'Build the whole task'; input.dispatchEvent(new w.Event('input'));
+  w.document.getElementById('createPlan')!.click(); w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { cancelable: true })); await settle();
+  // Written out for review, not queued behind a turn that will not come.
+  expect(live.sent).toHaveLength(0);
+  expect(w.document.querySelectorAll('.plan-stage')).toHaveLength(2);
+  expect(w.document.getElementById('chatSend')!.getAttribute('aria-label')).toBe('Start full plan');
+  expect(w.document.querySelector('.plan-stage-heading')!.getAttribute('title')).not.toMatch(/Session finish/);
+  input.focus();
+  input.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })); await settle();
+  expect(live.sent).toHaveLength(1);
+  expect(live.sent[0]).toMatchObject({ sessionId: summary([]).id, text: 'Build foundation', stages: ['Verify it'], objective: 'Build the whole task', authoredSource: 'objective', mode: 'auto' });
+  expect(w.document.querySelectorAll('.plan-stage')).toHaveLength(0);
 });
 
 it('retries a materialized finish checkpoint without recreating its already independent siblings', async () => {
@@ -3288,6 +4581,9 @@ it.each([false, true])('clears the planner prompt and starts a new-chat plan wit
   input.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Enter', cancelable: true })); await settle();
   expect(live.sent).toHaveLength(1);
   expect(live.sent[0]).toMatchObject({ objective: 'Original objective', text: 'Build foundation', stages: ['Verify it'], reasoningEffort: pro ? 'pro' : 'high' });
+  // While it is delivered, the message shows what the person wrote, as it will once recorded.
+  await settle();
+  expect([...w.document.querySelectorAll('.pending-message-text')].map(node => node.textContent)).toEqual(['Original objective']);
 });
 
 it('does not erase a new composer draft while completed-plan queue admission is pending', async () => {
@@ -3735,6 +5031,37 @@ it('preserves composer drafts across chat and settings navigation without forcin
   chat.openChatView('timeline');
   expect(input.value).toBe(draft);
   expect(input.style.height).toBe('');
+});
+
+it('marks chats that hold an unsent draft, and gives drafts back after a restart', async () => {
+  const first = summary([]), second = { ...first, id: 'second-chat', title: 'Second chat' };
+  const sessions = [first, second];
+  const { w } = await boot([], false, [], [], { sessions });
+  const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  const row = (id: string) => w.document.querySelector<HTMLElement>(`#sessionList .sess[data-id="${id}"]`)!;
+  const type = (value: string) => { input.value = value; input.dispatchEvent(new w.Event('input')); };
+  type('A new chat idea');
+  row(first.id).querySelector<HTMLElement>('[data-session-select]')!.click(); await settle();
+  type('Unsent reply');
+  // The open chat shows its draft in the composer, so its row needs no mark.
+  expect(row(first.id).querySelector('.sess-draft-mark')).toBeNull();
+  row(second.id).querySelector<HTMLElement>('[data-session-select]')!.click(); await settle();
+  expect(row(first.id).querySelector('.sess-draft-mark')).not.toBeNull();
+  expect(row(first.id).title).toContain('Draft');
+  expect(row(first.id).querySelector('[data-session-select] .sess-draft-mark')!.getAttribute('aria-label')).toBe('Draft');
+  expect(row(second.id).querySelector('.sess-draft-mark')).toBeNull();
+
+  w.dispatchEvent(new w.Event('pagehide'));
+  const saved = w.localStorage.getItem('chat-on-steroids.composer-drafts')!;
+  dom!.window.close(); vi.resetModules();
+  const restarted = await boot([], false, [], [], { sessions, storage: { 'chat-on-steroids.composer-drafts': saved } });
+  const after = restarted.w.document;
+  const again = after.getElementById('chatInput') as HTMLTextAreaElement;
+  expect(again.value).toBe('A new chat idea');
+  expect(after.querySelector(`#sessionList .sess[data-id="${first.id}"] .sess-draft-mark`)).not.toBeNull();
+  after.querySelector<HTMLElement>(`#sessionList .sess[data-id="${first.id}"] [data-session-select]`)!.click(); await settle();
+  expect(again.value).toBe('Unsent reply');
+  expect(after.querySelector(`#sessionList .sess[data-id="${first.id}"] .sess-draft-mark`)).toBeNull();
 });
 
 it('retains an existing running chat planner across navigation and accepts its result only in that draft', async () => {
@@ -4301,7 +5628,8 @@ it('retains the visible collapsed group beyond the normal resident target and st
   // One deliberate movement keeps filling the edge through collapsed batches.
   // Await the actual read result, including its animation-frame yields.
   pane.scrollTop = 0; pane.dispatchEvent(new w.WheelEvent('wheel', { deltaY: -100 }));
-  await vi.waitFor(() => expect(timeline.querySelectorAll('.ev-tool_call')).toHaveLength(rows.length), { timeout: 5000 });
+  // 2.7 s here; the macOS x64 release runner stopped at 300–390 of 400 rows after 5 s (2026-10-15).
+  await vi.waitFor(() => expect(timeline.querySelectorAll('.ev-tool_call')).toHaveLength(rows.length), { timeout: 20_000 });
   expect(timeline.querySelector('.tool-group')).toBe(group);
   expect(timeline.querySelectorAll('.raw')).toHaveLength(0);
   for (let i = 0; i < 14; i++) {
@@ -4346,6 +5674,25 @@ it('clears a delivered check when later model activity arrives without a timer',
   expect(receipt.hidden).toBe(true);
 });
 
+
+// 2026-10-15, the user's Mac: three fresh-turn continues that failed ("the browser did not pick up
+// this message within 60 seconds") stayed at the end of the chat as its newest messages, even after
+// the work moved on. A failed automatic continue belongs to its time, like a cancelled one.
+it('keeps a failed fresh-turn continue at its creation time, not at the end of the chat', async () => {
+  const app = await boot([
+    { seq: 1, time: T0, source: 'extension', kind: 'user_message', messageId: 'before-rotation', message: text('Original work') },
+    { seq: 2, time: T0 + 2000, source: 'extension', kind: 'user_message', messageId: 'after-rotation', message: text('Later continuation') }
+  ]);
+  const { w, live } = app;
+  live.inputs.push({ id: 'failed-rotation', sessionId: summary([]).id, conversationId: 'chat-b', text: 'Continue the task from where you are.',
+    mode: 'auto', dueAt: T0 + 1000, createdAt: T0 + 1000, state: 'failed', owner: null, model: null, reasoningEffort: null, purpose: 'rotation',
+    error: 'Not sent: the browser did not pick up this message within 60 seconds.' });
+  await app.append([]);
+  const timeline = w.document.getElementById('timeline')!;
+  expect(timeline.querySelector('[data-input-id="failed-rotation"]')).not.toBeNull();
+  expect(w.document.getElementById('inputQueue')!.textContent).not.toContain('Continue the task from where you are.');
+  expect(timeline.textContent!.indexOf('Continue the task from where you are.')).toBeLessThan(timeline.textContent!.indexOf('Later continuation'));
+});
 
 it('keeps a cancelled automatic draft at its creation time as later messages arrive', async () => {
   const app = await boot([
@@ -4407,7 +5754,7 @@ it('uses a playful work word when it is turned on in Settings', async () => {
   expect(w.document.getElementById('chatState')!.textContent).toMatch(PLAYFUL_WORDS);
 });
 
-it('offers copy and Markdown export under the answer of a completed turn only', async () => {
+it('offers copy and Markdown or HTML export under the answer of a completed turn only', async () => {
   const ask: SessionEvent = { kind: 'user_message', seq: 1, origin: 1, time: T0, source: 'extension', turnId: 'done-turn', messageId: 'ask', message: text('Write hello.txt') };
   const reply: SessionEvent = { kind: 'assistant_message', seq: 2, time: T0 + 1_000, source: 'extension', turnId: 'done-turn', messageId: 'reply', message: text('Created **hello.txt**.'), final: true, state: 'final' };
   const { w, append } = await boot([ask, reply]);
@@ -4427,9 +5774,16 @@ it('offers copy and Markdown export under the answer of a completed turn only', 
 
   api.exportMarkdown = vi.fn(async () => ({ ok: true, data: { done: 'saved', name: 'chat.md' } }));
   const choices = [...actions!.querySelectorAll<HTMLButtonElement>('.answer-export-choice')];
-  expect(choices.map(choice => choice.textContent)).toEqual(['This answer', 'Whole session']);
+  expect(choices.map(choice => choice.textContent)).toEqual(['This answer', 'Whole session', 'Whole session as HTML']);
+  // Choosing closes the menu and takes the choice off the screen; focus goes back to the Export button, not the page.
+  actions!.querySelector<HTMLDetailsElement>('details.answer-export')!.open = true;
+  choices[1]!.focus();
   choices[1]!.click(); await settle();
+  expect(actions!.querySelector<HTMLDetailsElement>('details.answer-export')!.open).toBe(false);
+  expect(w.document.activeElement).toBe(actions!.querySelector('details.answer-export > summary'));
   expect(api.exportMarkdown).toHaveBeenCalledWith({ id: summary([]).id, scope: 'session', turnId: undefined, target: 'file' });
+  choices[2]!.click(); await settle();
+  expect(api.exportMarkdown).toHaveBeenLastCalledWith({ id: summary([]).id, scope: 'session', turnId: undefined, target: 'file', format: 'html' });
 });
 
 it('does not offer copy or export after an interrupted turn', async () => {
@@ -4515,8 +5869,13 @@ it('ends the running turn with a row saying what it is doing now', async () => {
   // It follows the work: a new step lands above it, and it stays the last row.
   expect(now().previousElementSibling?.textContent).toContain('Searching the web');
   expect(now().parentElement!.lastElementChild).toBe(now());
-  // Prose speaks for itself while it is being written…
-  await append([{ kind: 'assistant_message', seq: 4, time: Date.now(), source: 'extension', messageId: 'a-now', message: text('Two tests fail…'), final: false, state: 'streaming' }]);
+  // Prose speaks for itself while it is being written, once its first block shows…
+  await append([{ kind: 'assistant_message', seq: 4, time: Date.now(), source: 'extension', messageId: 'a-now', message: text('Two tests'), final: false, state: 'streaming' }]);
+  expect(shown()).toEqual(['Thinking', '']);
+  await append([{ kind: 'assistant_message', seq: 5, time: Date.now(), source: 'extension', messageId: 'a-now', message: text('Two tests fail.\n\nThe'), final: false, state: 'streaming' }]);
+  // …and once nothing of it is held back.
+  expect(shown()).toEqual(['Thinking', '']);
+  await append([{ kind: 'assistant_message', seq: 6, time: Date.now(), source: 'extension', messageId: 'a-now', message: text('Two tests fail.\n\nThe rest pass.\n\n'), final: false, state: 'streaming' }]);
   expect(shown()).toBeNull();
   // …and once it stops changing the turn is still working: an interim paragraph stays "streaming".
   await new Promise(resolve => setTimeout(resolve, 2_600));
@@ -4524,7 +5883,7 @@ it('ends the running turn with a row saying what it is doing now', async () => {
   expect(shown()?.[0]).toBe('Thinking');
 });
 
-it('says what a new chat\'s first turn is writing before ChatGPT publishes it (#942)', async () => {
+it('shows a new chat\'s first sentences in the timeline and keeps the live row for what happens now (#942)', async () => {
   const asked = Date.now() - 12_000;
   const { w, append } = await boot([
     { seq: 1, time: asked - 100, source: 'extension', kind: 'turn_start', turnId: 'held-turn' },
@@ -4533,23 +5892,35 @@ it('says what a new chat\'s first turn is writing before ChatGPT publishes it (#
   const now = () => w.document.querySelector<HTMLElement>('#timeline .turn-now')!;
   const shown = () => now().hidden ? null : now().querySelector('.turn-now-text')!.textContent;
   const asks: string[][] = [];
-  (w as any).api.livePreview = (ids: string[]) => {
+  // ChatGPT shows the sentence long before it publishes a message for it; the turn's outline holds it.
+  (w as any).api.turnTraces = (_id: string, ids: string[]) => {
     asks.push(ids);
-    return Promise.resolve({ ok: true, data: 'First command printed one; now running the second.' });
+    return Promise.resolve({ ok: true, data: { 'held-turn': [{ kind: 'say', text: 'First command printed one; now running the second.', done: true },
+      ...(status ? [{ kind: 'now', text: status }] : [])] } });
   };
+  let status = '';
   await append([]); await append([]);
-  expect(asks.at(-1)).toEqual(['chat-b', 'chat-a']);
-  expect(shown()).toBe('First command printed one; now running the second.');
+  expect(asks.at(-1)).toEqual(['held-turn']);
+  const sentence = w.document.querySelector<HTMLElement>('#timeline .ev.is-interim')!;
+  expect(sentence.textContent).toContain('First command printed one; now running the second.');
+  // The sentence is the turn's own words, before the row that says what it does right now.
+  expect(sentence.compareDocumentPosition(now()) & w.Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(shown()).toBe('Thinking');
+  // ChatGPT's own phrase for what the turn is doing takes Thinking's place, with Thinking's sign.
+  status = 'Comparando três estruturas de projeto';
+  await append([]); await append([]);
+  expect(shown()).toBe('Comparando três estruturas de projeto');
   expect(now().classList.contains('is-thinking')).toBe(true);
-  // A call of this app that runs right now is what the turn is doing.
+  // A call of this app running meanwhile keeps ChatGPT's words and lends them its icon.
+  (w as any).api.runningTools = () => Promise.resolve({ ok: true, data: [{ title: 'Running echo one', kind: 'run', since: Date.now() }] });
+  await append([]); await append([]);
+  expect(shown()).toBe('Comparando três estruturas de projeto');
+  expect(now().classList.contains('is-thinking')).toBe(false);
+  status = '';
   (w as any).api.runningTools = () => Promise.resolve({ ok: true, data: [{ title: 'Running echo two', kind: 'run', since: Date.now() }] });
   await append([]); await append([]);
   expect(shown()).toBe('Running echo two');
-  // Once the page clears it, the row is back to its ordinary state.
-  (w as any).api.runningTools = () => Promise.resolve({ ok: true, data: [] });
-  (w as any).api.livePreview = () => Promise.resolve({ ok: true, data: null });
-  await append([]); await append([]);
-  expect(shown()).toBe('Thinking');
+  expect(w.document.querySelectorAll('#timeline .ev.is-interim')).toHaveLength(1);
 });
 
 it('shows a just-started turn working right after your message, never in the header first', async () => {
@@ -4641,6 +6012,31 @@ it('offers a way back to the end of the chat that clears any reserved space', as
   expect(content.style.getPropertyValue('--timeline-scroll-reserve')).toBe('');
 });
 
+it('keeps the chat reading state out of Agents & automation, which shares its scroll pane', async () => {
+  const { w, append } = await boot([{ kind: 'assistant_message', seq: 1, time: T0 + 1000, source: 'extension', messageId: 'first', message: text('Hello'), final: false }]);
+  const pane = w.document.getElementById('chatBody')!;
+  const jump = w.document.getElementById('jumpLatest')!;
+  // The real navigation: the Agents & automation tab, then Back to chat.
+  const view = (name: string) => (w.document.querySelector(name === 'settings' ? 'nav button[data-tab="settings"]' : '#backToChat') as HTMLButtonElement).click();
+  Object.defineProperties(pane, { clientHeight: { value: 400, configurable: true }, scrollHeight: { value: 2000, configurable: true } });
+  pane.scrollTop = 1600;
+  // Settings open at their top, not at the chat's end, and offer no way back to a chat end.
+  view('settings');
+  expect(pane.scrollTop).toBe(0);
+  expect(jump.classList.contains('is-shown')).toBe(false);
+  // Reading the settings upwards is not reading the chat.
+  pane.scrollTop = 900;
+  pane.dispatchEvent(new w.WheelEvent('wheel', { deltaY: -120 }));
+  pane.dispatchEvent(new w.Event('scroll'));
+  expect(jump.classList.contains('is-shown')).toBe(false);
+  // Back in the chat, it is still at its end and still follows new output.
+  view('timeline');
+  expect(pane.scrollTop).toBe(2000);
+  await append([{ kind: 'assistant_message', seq: 2, time: T0 + 2000, source: 'extension', messageId: 'later', message: text('More output'), final: false }]);
+  expect(pane.scrollTop).toBe(pane.scrollHeight);
+  expect(jump.classList.contains('is-shown')).toBe(false);
+});
+
 it('opens round participants in the existing dock without moving the prime reader or draft', async () => {
   const report = (seq: number, worker: string): SessionEvent => ({ kind: 'agent_message', seq, time: T0 + seq * 1000,
     source: 'app', from: worker, to: 'prime', messageId: `report-${seq}`, delivery: 'delivered', message: text('Verified the build') });
@@ -4656,6 +6052,7 @@ it('opens round participants in the existing dock without moving the prime reade
   expect(w.document.getElementById('inlineAgents')).toBeNull();
   expect(w.document.querySelectorAll('#chatBody .agent-panel')).toHaveLength(0);
   const indicators = [...w.document.querySelectorAll<HTMLButtonElement>('#timeline .activity-workers')];
+  // One pill per round, whatever the count: the team icon and how many workers it involved.
   expect(indicators.map(button => button.textContent)).toEqual(['2', '1']);
   expect(indicators[0]!.getAttribute('aria-label')).toBe('2 sub-agents in this round');
   // One worker reads as one, not "1 sub-agents" (seen on the 2.1.27 canary).
@@ -4791,7 +6188,10 @@ it.each(['scrollend', 'no-movement-frame'])(
       pane.dispatchEvent(new w.Event('scroll'));
       pane.dispatchEvent(new w.Event('scrollend'));
     } else {
-      await new Promise<void>(resolve => w.requestAnimationFrame(() => resolve()));
+      // Input that moved nothing expires after two frames and at least 100 ms.
+      const armed = w.performance.now();
+      for (let frames = 0; frames < 3 || w.performance.now() - armed < 150; frames++)
+        await new Promise<void>(resolve => w.requestAnimationFrame(() => resolve()));
     }
     // No fresh input: a repaint/clamp is not the reader moving away from the end.
     pane.scrollTop = 300; pane.dispatchEvent(new w.Event('scroll'));
@@ -4800,6 +6200,25 @@ it.each(['scrollend', 'no-movement-frame'])(
     expect(pane.scrollTop).toBe(pane.scrollHeight);
   }
 );
+
+it('counts a smooth wheel scroll that starts a frame after its wheel event as reading', async () => {
+  // A smooth scroll's first movement comes a frame after the wheel event. Expiring the wheel at that
+  // frame meant one notch up never counted, and the next delivery pulled the reader back down.
+  const rows = Array.from({ length: 40 }, (_, i): SessionEvent => ({ seq: i + 1, time: T0 + i,
+    source: 'extension', kind: 'user_message', messageId: `notch-${i}`, message: text(`Item ${i + 1}`) }));
+  const { w, append } = await boot(rows);
+  const pane = w.document.getElementById('chatBody')!;
+  const timeline = w.document.getElementById('timeline')!;
+  Object.defineProperties(pane, { clientHeight: { value: 400 },
+    scrollHeight: { get: () => timeline.querySelectorAll('[data-timeline-key]').length * 100 } });
+  pane.scrollTop = pane.scrollHeight;
+  pane.dispatchEvent(new w.WheelEvent('wheel'));
+  await new Promise<void>(resolve => w.requestAnimationFrame(() => resolve()));
+  pane.scrollTop = 300; pane.dispatchEvent(new w.Event('scroll'));
+  await append([{ seq: 100, time: T0 + 100, source: 'extension', kind: 'assistant_message',
+    messageId: 'notch-answer', message: text('A growing answer'), final: false }]);
+  expect(pane.scrollTop).toBe(300);
+});
 
 it('keeps a slow scrolling gesture through its final position at the end', async () => {
   const rows = Array.from({ length: 40 }, (_, i): SessionEvent => ({ seq: i + 1, time: T0 + i,
@@ -4917,4 +6336,1633 @@ it('opens the next chat at its end after the reader scrolled away from a sent me
   // Its answer keeps growing: the reader who just opened it follows the end.
   await append([{ seq: 100, time: T0 + 100, source: 'extension', kind: 'assistant_message', messageId: 'grown', message: text('A new answer'), final: false }]);
   expect(pane.scrollTop).toBe(pane.scrollHeight);
+});
+
+/** Counts how often the running turn's two lines are taken out of the page and put back. */
+function lineMoves(w: JSDOM['window']): { stop: () => number } {
+  let moves = 0;
+  const watched = (node: Node) => node instanceof w.HTMLElement && (node.matches('.turn-status') || node.matches('.turn-now'));
+  const observer = new w.MutationObserver(records => {
+    for (const record of records) for (const node of [...record.addedNodes, ...record.removedNodes]) if (watched(node)) moves++;
+  });
+  observer.observe(w.document.getElementById('timelineContent')!, { childList: true, subtree: true });
+  return { stop: () => { observer.takeRecords().forEach(record => { for (const node of [...record.addedNodes, ...record.removedNodes]) if (watched(node)) moves++; }); observer.disconnect(); return moves; } };
+}
+
+it('keeps the working line under your message while a failed delivery notice stays in the queue (2026-10-12)', async () => {
+  // A failed "continue" kept its notice in the queue. Counted as a message on its way, it parked the
+  // running turn's line after the queue, below the question, and every repaint moved it again.
+  const asked = Date.now() - 12_000;
+  const app = await boot([
+    { seq: 1, time: asked - 100, source: 'extension', kind: 'turn_start', turnId: 'held-turn' },
+    { kind: 'user_message', seq: 2, origin: 2, time: asked, source: 'extension', turnId: 'held-turn', messageId: 'q-live', message: text('Finish the three steps') }
+  ]);
+  const { w } = app;
+  app.live.inputs.push({ id: 'failed-continue', sessionId: '2026-09-02-test0001', text: 'Continue from where you left off.',
+    mode: 'auto', dueAt: 0, model: null, reasoningEffort: null, state: 'failed', owner: null, createdAt: asked - 60_000,
+    conversationId: 'chat-b', error: 'Not injected: the selected turn ended before an eligible tool call.' });
+  await app.append([]);
+  expect(w.document.querySelector('#inputQueue .pending-message.is-delivery-error')).not.toBeNull();
+  const line = w.document.querySelector<HTMLElement>('.turn-status')!;
+  expect(line.closest('#timeline')).not.toBeNull();
+  expect(line.previousElementSibling?.matches('.ev-user_message')).toBe(true);
+  const moves = lineMoves(w);
+  await app.append([]); await app.append([]); await app.append([]);
+  expect(moves.stop()).toBe(0);
+});
+
+it("keeps a long running turn's line at the top of its loaded rows, not under its newest action (2026-10-12)", async () => {
+  // A 45-minute turn pushed its question out of the loaded rows. "Working for" fell to the bottom,
+  // after the newest action, and jumped back under the question whenever that was loaded again.
+  const asked = Date.now() - 45 * 60_000;
+  const calls = Array.from({ length: 220 }, (_, i): SessionEvent => ({ ...toolCall(i + 3, `long-${i}`), time: asked + (i + 1) * 1000, turnId: 'long-turn' }));
+  const app = await boot([
+    { seq: 1, time: asked - 100, source: 'extension', kind: 'turn_start', turnId: 'long-turn' },
+    { kind: 'user_message', seq: 2, origin: 2, time: asked, source: 'extension', turnId: 'long-turn', messageId: 'q-long', message: text('Build all thirty quests') },
+    ...calls
+  ]);
+  const { w } = app;
+  const timeline = w.document.getElementById('timeline')!;
+  expect(timeline.querySelector('.ev-user_message')).toBeNull();
+  const line = w.document.querySelector<HTMLElement>('.turn-status')!;
+  expect(line.closest('#timeline')).not.toBeNull();
+  const rows = [...timeline.querySelectorAll('[data-timeline-key], .turn-status, .turn-now')];
+  expect(rows[0]).toBe(line);
+  expect(rows.at(-1)?.matches('.turn-now')).toBe(true);
+  const moves = lineMoves(w);
+  await app.append([]); await app.append([]);
+  expect(moves.stop()).toBe(0);
+});
+
+it('keeps a running turn’s line under its question while a message sent into it waits (2026-10-12)', async () => {
+  // A message sent mid-round pulled the running turn's line below it, as if the chat had moved on to
+  // the new message; the rows jumped back once it was delivered or cancelled.
+  const asked = Date.now() - 200_000;
+  const app = await boot([
+    { seq: 1, time: asked - 100, source: 'extension', kind: 'turn_start', turnId: 'running-turn' },
+    { kind: 'user_message', seq: 2, origin: 2, time: asked, source: 'extension', turnId: 'running-turn', messageId: 'q-run', message: text('Port the reference client') },
+    { ...toolCall(3, 'mid-call'), turnId: 'running-turn' }
+  ]);
+  const { w } = app;
+  app.live.inputs.push({ id: 'mid-round', sessionId: '2026-09-02-test0001', text: 'Here is where the reference files are.',
+    mode: 'auto', dueAt: 0, model: null, reasoningEffort: null, state: 'browser', owner: 'page', createdAt: Date.now(), conversationId: 'chat-a' });
+  await app.append([]);
+  expect(w.document.querySelector('#inputQueue .pending-message:not(.is-delivery-error)')).not.toBeNull();
+  const line = w.document.querySelector<HTMLElement>('.turn-status')!;
+  expect(line.closest('#timeline')).not.toBeNull();
+  expect(line.previousElementSibling?.matches('.ev-user_message')).toBe(true);
+  const moves = lineMoves(w);
+  await app.append([]); await app.append([]);
+  expect(moves.stop()).toBe(0);
+});
+
+it('does not move a parked working line on every repaint', async () => {
+  // A turn with no row yet parks its line after the queue; repainting it in place used to re-insert
+  // it each time, restarting its shimmer and Thinking's breathing several times a second.
+  const app = await boot([]);
+  const { w } = app;
+  expect(w.document.querySelector('.turn-status')!.previousElementSibling?.id).toBe('inputQueue');
+  const moves = lineMoves(w);
+  await app.append([]); await app.append([]); await app.append([]);
+  expect(moves.stop()).toBe(0);
+  expect(w.document.querySelector('.turn-status')!.previousElementSibling?.id).toBe('inputQueue');
+});
+
+it("never hangs the running turn's clock under an older question read further up (2026-10-12)", async () => {
+  // Reading a page of history up the chat, its newest loaded question is an old, finished one. The live
+  // "Working for" went right under it, as if that old exchange were still running.
+  const rows = Array.from({ length: 360 }, (_, i): SessionEvent => ({ seq: i + 1, time: T0 + i,
+    source: 'extension', kind: 'user_message', messageId: `origin-${i}`, message: text(`Origin row ${i + 1}.`) }));
+  const { w } = await boot(rows);
+  const pane = w.document.getElementById('chatBody')!;
+  const timeline = w.document.getElementById('timeline')!;
+  Object.defineProperties(pane, { clientHeight: { value: 400 },
+    scrollHeight: { get: () => Math.max(400, timeline.querySelectorAll('[data-timeline-key]').length * 20) } });
+  w.HTMLElement.prototype.getBoundingClientRect = function () {
+    const index = [...timeline.querySelectorAll('[data-timeline-key]')].indexOf(this);
+    const top = index < 0 ? 0 : index * 20 - pane.scrollTop;
+    return { top, bottom: top + 20, height: 20 } as DOMRect;
+  };
+  // At the end the running turn's line sits under the newest question.
+  expect(w.document.querySelector('.turn-status')!.closest('#timeline')).not.toBeNull();
+  for (let index = 0; index < 8 && !timeline.textContent?.includes('Origin row 200.'); index++) {
+    pane.scrollTop = 0;
+    pane.dispatchEvent(new w.WheelEvent('wheel', { deltaY: -100 }));
+    await settleHistoryFrame(w);
+  }
+  expect(timeline.textContent).not.toContain('Origin row 360.');
+  expect(w.document.querySelector('#timeline .turn-status')).toBeNull();
+});
+
+// A long turn's answer was opened early and filled only at the end. The live update carrying the
+// finished answer was skipped as "an old revision owned by an older page", so the chat seemed to
+// stop at its last work heading with no summary.
+it("shows a long turn's final answer when it arrives live, at the end of the turn", async () => {
+  const TURN = 'g-long-0-1';
+  // Like the store, every row of the turn names its turn's start (`turnOrigin`).
+  const opened: SessionEvent = { seq: 2, time: T0 + 2000, source: 'extension', kind: 'assistant_message', messageId: 'answer', turnId: TURN, turnOrigin: 1, final: false, message: text('Restoring the fleet first.') };
+  const work = Array.from({ length: 120 }, (_, i) => ({ ...toolCall(3 + i, `call-${i}`), turnId: TURN, turnOrigin: 1 }) as SessionEvent);
+  const { w, live, append } = await boot([{ seq: 1, time: T0 + 1000, source: 'extension', kind: 'turn_start', turnId: TURN }, opened, ...work]);
+  const timeline = w.document.getElementById('timeline')!;
+  expect(timeline.textContent).not.toContain('Restoring the fleet first.');
+  // The store rewrites the same message: same origin, new sequence, final text.
+  live.events.splice(live.events.indexOf(opened), 1);
+  await append([
+    { seq: 123, origin: 2, contentSeq: 123, time: T0 + 2000, source: 'extension', kind: 'assistant_message', messageId: 'answer', turnId: TURN, turnOrigin: 1, final: true,
+      message: text('Restoring the fleet first. Done: 53 devices are back.') } as SessionEvent,
+    { seq: 124, time: T0 + 124_000, source: 'extension', kind: 'turn_end', turnId: TURN, turnOrigin: 1, outcome: 'completed' } as SessionEvent
+  ]);
+  expect(timeline.textContent).toContain('Done: 53 devices are back.');
+  const rows = [...timeline.querySelectorAll('[data-timeline-key]')];
+  const answerRow = rows.findIndex(row => row.textContent?.includes('Done: 53 devices are back.'));
+  const lastWork = rows.map((row, index) => row.matches('.tool-group, [data-timeline-key^="event:"][class*="tool"]') ? index : -1).reduce((a, b) => Math.max(a, b), -1);
+  expect(answerRow).toBeGreaterThan(lastWork);
+});
+
+// Like Codex's Steer: a message waiting for the end of the turn can be sent into it now.
+it('offers Send now on a queued message while the running turn can take it', async () => {
+  const { w, live, append } = await boot([]);
+  const api = (w as any).api;
+  let directly = false;
+  api.getSessionControls = async () => ({ ok: true, data: { sessionId: summary([]).id,
+    activeTurnId: 'plain-turn', canInject: false, canSendDirectly: directly, queueAtFinish: false } });
+  live.inputs.push({ id: 'waiting', sessionId: summary([]).id, text: 'Also check the logs', mode: 'after-turn', dueAt: 0,
+    model: null, reasoningEffort: null, state: 'queued', owner: null, createdAt: 0, conversationId: 'chat-b' });
+  await append([]);
+  const sendNow = () => w.document.querySelector<HTMLButtonElement>('#finishQueue [aria-label="Send now"]:not([hidden])');
+  // A turn that cannot be joined (or no turn at all): the message just waits.
+  expect(sendNow()).toBeNull();
+
+  directly = true;
+  await append([]);
+  const steer = vi.fn(async () => { live.inputs[0]!.mode = 'auto'; return { ok: true, data: true }; });
+  api.sendQueuedInputNow = steer;
+  sendNow()!.click(); sendNow()?.click();
+  await settle();
+  expect(steer).toHaveBeenCalledTimes(1);
+  expect(steer).toHaveBeenCalledWith('waiting');
+});
+
+it('says so when a queued message can no longer join the running turn', async () => {
+  const { w, live, append } = await boot([]);
+  const api = (w as any).api;
+  api.getSessionControls = async () => ({ ok: true, data: { sessionId: summary([]).id,
+    activeTurnId: 'plain-turn', canInject: false, canSendDirectly: true, queueAtFinish: false } });
+  live.inputs.push({ id: 'waiting', sessionId: summary([]).id, text: 'Also check the logs', mode: 'after-turn', dueAt: 0,
+    model: null, reasoningEffort: null, state: 'queued', owner: null, createdAt: 0, conversationId: 'chat-b' });
+  await append([]);
+  api.sendQueuedInputNow = async () => ({ ok: true, data: false });
+  w.document.querySelector<HTMLButtonElement>('#finishQueue [aria-label="Send now"]:not([hidden])')!.click();
+  await settle();
+  expect(w.document.body.textContent).toContain('The turn ended before this message could join it. It stays queued.');
+});
+
+// Codex's Find in chat: ⌘F (Ctrl+F) searches the open chat's whole recording, newest match first.
+it('finds in the open chat with Cmd/Ctrl+F, steps through matches and closes with Escape', async () => {
+  const rows: SessionEvent[] = [
+    { seq: 1, time: T0 + 1000, source: 'extension', kind: 'user_message', messageId: 'q1', message: text('Check the Windows installer') },
+    { seq: 2, time: T0 + 2000, source: 'extension', kind: 'assistant_message', messageId: 'a1', final: true, message: text('The windows installer builds.') },
+    { seq: 3, time: T0 + 3000, source: 'extension', kind: 'user_message', messageId: 'q2', message: text('Now the docs') }
+  ];
+  const { w } = await boot(rows);
+  const api = (w as any).api;
+  const find = vi.fn(async () => ({ ok: true, data: [
+    { seq: 1, kind: 'user_message', messageId: 'q1', position: 1 },
+    { seq: 2, kind: 'assistant_message', messageId: 'a1', position: 2 }
+  ] }));
+  api.findInChat = find;
+  const bar = w.document.getElementById('chatFind')!;
+  expect(bar.hidden).toBe(true);
+  // The app reads the platform as isMac() does: ⌘F there, Ctrl+F elsewhere; both keys at once is neither.
+  const mac = /^Mac/.test(globalThis.navigator.platform);
+  w.document.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'f', ctrlKey: true, metaKey: true, bubbles: true, cancelable: true }));
+  expect(bar.hidden).toBe(true);
+  w.document.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'f', ctrlKey: !mac, metaKey: mac, bubbles: true, cancelable: true }));
+  expect(bar.hidden).toBe(false);
+  const field = w.document.getElementById('chatFindField') as HTMLInputElement;
+  expect(w.document.activeElement).toBe(field);
+  field.value = 'windows installer';
+  field.dispatchEvent(new w.Event('input', { bubbles: true }));
+  await vi.waitFor(() => expect(w.document.getElementById('chatFindCount')!.textContent).toBe('2 of 2'));
+  expect(find).toHaveBeenCalledWith(summary(rows).id, 'windows installer');
+  field.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+  await vi.waitFor(() => expect(w.document.getElementById('chatFindCount')!.textContent).toBe('1 of 2'));
+  field.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Enter', shiftKey: true, bubbles: true, cancelable: true }));
+  await vi.waitFor(() => expect(w.document.getElementById('chatFindCount')!.textContent).toBe('2 of 2'));
+  find.mockResolvedValueOnce({ ok: true, data: [] });
+  field.value = 'linux';
+  field.dispatchEvent(new w.Event('input', { bubbles: true }));
+  await vi.waitFor(() => expect(w.document.getElementById('chatFindCount')!.textContent).toBe('No matches'));
+  field.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+  expect(bar.hidden).toBe(true);
+});
+
+// Codex's "Follow-up behavior": messages typed while a turn runs join it, or wait for its end.
+// Cmd/Ctrl+Shift+Enter sends the other way.
+async function sendDuringTurn(followUp: 'steer' | 'queue' | undefined, keys: { metaKey?: boolean; ctrlKey?: boolean; shiftKey?: boolean } = {}) {
+  const app = await boot([], true, [], [], followUp === undefined ? {} : { followUp });
+  const api = (app.w as any).api;
+  api.getSessionControls = async () => ({ ok: true, data: { sessionId: summary([]).id, activeTurnId: 'running-turn', canInject: false, canSendDirectly: true, queueAtFinish: false } });
+  await app.append([]);
+  const input = app.w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  input.value = 'Also check the logs';
+  input.dispatchEvent(new app.w.Event('input', { bubbles: true }));
+  input.dispatchEvent(new app.w.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true, ...keys }));
+  await vi.waitFor(() => expect(app.live.sent).toHaveLength(1));
+  return { app, sent: app.live.sent[0]! };
+}
+
+it('sends a message into the running turn by default', async () => {
+  const { app, sent } = await sendDuringTurn(undefined);
+  expect(sent.mode).toBe('auto');
+  expect((app.w.document.getElementById('sendMode') as HTMLSelectElement).value).toBe('auto');
+});
+
+it('queues a message for after the turn when that is the chosen follow-up behavior', async () => {
+  const { sent } = await sendDuringTurn('queue');
+  expect(sent.mode).toBe('after-turn');
+});
+
+it.each([
+  [{ metaKey: true }, undefined, 'after-turn'], [{ ctrlKey: true }, undefined, 'after-turn'],
+  [{ metaKey: true }, 'queue', 'auto'], [{ ctrlKey: true }, 'queue', 'auto']
+] as const)('sends the other way with %o + Shift + Enter (default %s)', async (modifier, followUp, mode) => {
+  expect((await sendDuringTurn(followUp, { ...modifier, shiftKey: true })).sent.mode).toBe(mode);
+});
+
+// A typed app command sent the other way with Cmd/Ctrl+Shift+Enter during a turn went out as a Skill
+// directive ("/goal …" as text); it now runs as Enter runs it, and its rest goes the other way.
+async function typedDuringTurn(text: string, skills: Array<{ id: string; name: string }> = []) {
+  const app = await boot([], true);
+  const api = (app.w as any).api;
+  api.getSessionControls = async () => ({ ok: true, data: { sessionId: summary([]).id, automation: app.live.automation, activeTurnId: 'running-turn', canInject: false, canSendDirectly: true, queueAtFinish: false } });
+  api.skillLibrary = async () => ({ ok: true, data: { skills: skills.map(skill => ({ ...skill, description: '', path: `/skills/${skill.id}/SKILL.md`, scope: 'user', source: 'user', managed: true })), roots: [], errors: [], includeInstructions: true } });
+  await app.append([]);
+  const input = app.w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  input.value = text;
+  input.dispatchEvent(new app.w.Event('input', { bubbles: true }));
+  const mac = /^Mac/.test(globalThis.navigator.platform);
+  input.dispatchEvent(new app.w.KeyboardEvent('keydown', { key: 'Enter', shiftKey: true, ctrlKey: !mac, metaKey: mac, bubbles: true, cancelable: true }));
+  await settle(); await settle();
+  return { ...app, input };
+}
+
+it('runs a typed /goal sent with Cmd/Ctrl+Shift+Enter during a turn and sends the rest the other way', async () => {
+  const { w, live } = await typedDuringTurn('/goal Reply with exactly: done');
+  expect(w.document.getElementById('sendOptions')!.hidden).toBe(false);
+  expect((w.document.getElementById('chatAutomation') as HTMLSelectElement).value).toBe('goal');
+  expect(live.sent).toHaveLength(1);
+  expect(live.sent[0]).toMatchObject({ text: 'Reply with exactly: done', automation: 'goal', mode: 'after-turn' });
+});
+
+it('runs a typed /rename sent with Cmd/Ctrl+Shift+Enter during a turn without sending anything', async () => {
+  const { w, live, input } = await typedDuringTurn('/rename');
+  expect(w.document.querySelector('#sessionList .sess-rename')).not.toBeNull();
+  expect(live.sent).toHaveLength(0);
+  expect(input.value).toBe('');
+});
+
+it('keeps a Skill named like a command a directive with Cmd/Ctrl+Shift+Enter, sent the other way', async () => {
+  const { live } = await typedDuringTurn('/goal Reply with exactly: done', [{ id: 'goal', name: 'Goal' }]);
+  expect(live.sent.at(-1)).toMatchObject({ text: '/goal Reply with exactly: done', mode: 'after-turn' });
+});
+
+// /image (#1701): a picture request in words the app can't recognize goes without the app, so
+// ChatGPT's own image tool is on for that one message.
+it('sends a typed /image message as a picture request, without the command', async () => {
+  const { w, live, input } = await slash('image');
+  input.value = '/image You have the concept now, design it';
+  w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
+  await settle(); await settle();
+  expect(live.sent.at(-1)).toMatchObject({ text: 'You have the concept now, design it', imageRequest: true });
+  // The next ordinary message is not one.
+  input.value = 'Thanks, now describe it';
+  w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
+  await settle(); await settle();
+  expect(live.sent.at(-1)).toMatchObject({ text: 'Thanks, now describe it' });
+  expect(live.sent.at(-1)).not.toHaveProperty('imageRequest');
+});
+
+it('puts /image in front of the draft when picked from the menu, and sends nothing for a bare /image', async () => {
+  const { w, live, input, row } = await slash('image');
+  row!.click(); await settle();
+  expect(input.value).toBe('/image ');
+  w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
+  await settle(); await settle();
+  expect(live.sent).toHaveLength(0);
+  expect(input.value).toBe('/image ');
+});
+
+// Codex's slash commands, each opening what the app already has.
+async function slash(command: string, selectExisting = true) {
+  const app = await boot([], selectExisting);
+  (app.w as any).api.skillLibrary = async () => ({ ok: true, data: { skills: [], roots: [], errors: [], includeInstructions: true } });
+  const input = app.w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  input.value = `/${command}`; input.setSelectionRange(input.value.length, input.value.length);
+  input.dispatchEvent(new app.w.Event('input', { bubbles: true }));
+  await settle();
+  const row = app.w.document.querySelector<HTMLElement>(`#skillPicker .slash-menu-option[title="/${command}"]`);
+  return { ...app, input, row };
+}
+
+it('lists the Codex slash commands in the composer menu', async () => {
+  const { w, input } = await slash('');
+  const listed = [...w.document.querySelectorAll<HTMLElement>('#skillPicker .slash-menu-option')].map(row => row.title);
+  expect(listed).toEqual(expect.arrayContaining(['/plan', '/goal', '/loop', '/compact', '/model', '/reasoning', '/new', '/rename', '/pin',
+    '/status', '/review', '/init', '/usage', '/plugins', '/pet', '/feedback', '/copy', '/export', '/find']));
+  expect(input.value).toBe('/');
+});
+
+it('opens the model picker with /model (/reasoning opens the same picker)', async () => {
+  for (const command of ['model', 'reasoning']) {
+    const { w, row } = await slash(command);
+    row!.click(); await settle();
+    expect((w.document.getElementById('modelMenu') as HTMLDetailsElement).open).toBe(true);
+    break;
+  }
+});
+
+it('renames the open chat with /rename', async () => {
+  const { w, row, input } = await slash('rename');
+  row!.click(); await settle();
+  expect(w.document.querySelector('#sessionList .sess-rename')).not.toBeNull();
+  expect(input.value).toBe('');
+});
+
+it('pins the open chat with /pin', async () => {
+  const { w, row } = await slash('pin');
+  row!.click(); await settle();
+  expect(w.document.body.textContent).toContain('Chat pinned');
+});
+
+it('shows the context status with /status', async () => {
+  const { w, row } = await slash('status');
+  row!.click(); await settle();
+  expect(w.document.getElementById('contextMeterButton')!.getAttribute('aria-expanded')).toBe('true');
+});
+
+it('starts a review request with /review and keeps what was typed after it', async () => {
+  const app = await boot([]);
+  (app.w as any).api.skillLibrary = async () => ({ ok: true, data: { skills: [], roots: [], errors: [], includeInstructions: true } });
+  const input = app.w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  input.value = '/review'; input.setSelectionRange(7, 7); input.dispatchEvent(new app.w.Event('input', { bubbles: true }));
+  await settle();
+  app.w.document.querySelector<HTMLElement>('#skillPicker .slash-menu-option[title="/review"]')!.click(); await settle();
+  expect(input.value).toMatch(/^Review the uncommitted changes in this project/);
+});
+
+it('opens New chat, Usage, Plugins, Pets and the diagnostics report from their commands', async () => {
+  const { w, row } = await slash('usage');
+  row!.click(); await settle();
+  expect(w.document.querySelector<HTMLElement>('.app')!.dataset.screen).toBe('settings');
+  expect(w.document.querySelector('[data-tab="usage"]')!.classList.contains('is-sel') || w.document.querySelector('[data-tab="usage"]')!.getAttribute('aria-selected') === 'true').toBe(true);
+});
+
+// 2.1.41 release round: "/goal …" typed or pasted and sent without picking it from the menu went out as
+// a Skill named "goal" and failed ("Skill "goal" is unavailable in this project"). A leading app command
+// is that command unless a Skill has the name; Goal, Loop and Plan then send the rest as the mode would.
+async function typed(text: string, skills: Array<{ id: string; name: string }> = [], selectExisting = false) {
+  const app = await boot([], selectExisting);
+  (app.w as any).api.skillLibrary = async () => ({ ok: true, data: { skills: skills.map(skill => ({ ...skill, description: '', path: `/skills/${skill.id}/SKILL.md`, scope: 'user', source: 'user', managed: true })), roots: [], errors: [], includeInstructions: true } });
+  const input = app.w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  input.value = text;
+  app.w.document.getElementById('composer')!.dispatchEvent(new app.w.Event('submit', { bubbles: true, cancelable: true }));
+  await settle(); await settle();
+  return { ...app, input };
+}
+
+it('runs a typed /goal as the Goal command and sends the rest as its message', async () => {
+  const { w, live } = await typed('/goal Reply with exactly: done');
+  expect((w.document.getElementById('chatAutomation') as HTMLSelectElement).value).toBe('goal');
+  expect(live.sent.at(-1)).toMatchObject({ text: 'Reply with exactly: done', automation: 'goal' });
+  expect(live.sent.some((sent: any) => /^\/goal/.test(sent.text))).toBe(false);
+});
+
+it('drafts a plan from the rest of a typed /plan, and leaves a bare /goal waiting for its message', async () => {
+  const app = await boot([]);
+  (app.w as any).api.skillLibrary = async () => ({ ok: true, data: { skills: [], roots: [], errors: [], includeInstructions: true } });
+  const drafted: string[] = [];
+  (app.w as any).api.draftTaskPlan = async (text: string) => { drafted.push(text); return { ok: false, error: 'stopped in test' }; };
+  const input = app.w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  const submit = () => app.w.document.getElementById('composer')!.dispatchEvent(new app.w.Event('submit', { bubbles: true, cancelable: true }));
+  input.value = '/plan Add a settings page'; submit(); await settle(); await settle();
+  expect(drafted).toEqual(['Add a settings page']);
+  app.w.document.getElementById('newChat')!.click(); await settle();
+  input.value = '/goal'; submit(); await settle(); await settle();
+  expect((app.w.document.getElementById('chatAutomation') as HTMLSelectElement).value).toBe('goal');
+  expect(app.live.sent).toHaveLength(0);
+  expect(input.value).toBe('');
+});
+
+it('keeps Plan armed and drafts the plan when /plan is typed with Plan already armed', async () => {
+  const app = await boot([]);
+  (app.w as any).api.skillLibrary = async () => ({ ok: true, data: { skills: [], roots: [], errors: [], includeInstructions: true } });
+  const drafted: string[] = [];
+  (app.w as any).api.draftTaskPlan = async (text: string) => { drafted.push(text); return { ok: false, error: 'stopped in test' }; };
+  const input = app.w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  app.w.document.getElementById('createPlan')!.click(); await settle();
+  input.value = '/plan refactor the parser';
+  app.w.document.getElementById('composer')!.dispatchEvent(new app.w.Event('submit', { bubbles: true, cancelable: true }));
+  await settle(); await settle();
+  expect(app.live.sent).toHaveLength(0);
+  expect(drafted).toEqual(['refactor the parser']);
+});
+
+it('runs a typed /rename on the open chat without sending anything', async () => {
+  const { w, live, input } = await typed('/rename', [], true);
+  expect(w.document.querySelector('#sessionList .sess-rename')).not.toBeNull();
+  expect(live.sent).toHaveLength(0);
+  expect(input.value).toBe('');
+});
+
+it('keeps a typed /goal a Skill directive when a Skill has that name', async () => {
+  const { live } = await typed('/goal Reply with exactly: done', [{ id: 'goal', name: 'Goal' }]);
+  expect(live.sent.at(-1)).toMatchObject({ text: '/goal Reply with exactly: done' });
+});
+
+it('offers chat-only commands only while a chat is open', async () => {
+  const { w } = await slash('', false);
+  const listed = [...w.document.querySelectorAll<HTMLElement>('#skillPicker .slash-menu-option')].map(row => row.title);
+  expect(listed).toEqual(expect.arrayContaining(['/new', '/model', '/review']));
+  expect(listed).not.toEqual(expect.arrayContaining(['/rename']));
+  expect(listed).not.toContain('/pin');
+  expect(listed).not.toContain('/status');
+  for (const command of ['/copy', '/export', '/find']) expect(listed).not.toContain(command);
+});
+
+// /copy, /export and /find run the open chat's answer copy, Markdown export and Find in chat.
+it('copies the newest finished answer with /copy and says so', async () => {
+  const { w, row } = await slash('copy');
+  const api = (w as any).api;
+  api.exportMarkdown = vi.fn(async () => ({ ok: true, data: { done: 'copied' } }));
+  row!.click(); await settle();
+  expect(api.exportMarkdown).toHaveBeenCalledWith({ id: summary([]).id, scope: 'latest', target: 'clipboard' });
+  expect(w.document.body.textContent).toContain('Answer copied');
+});
+
+it('saves the whole chat as Markdown with a typed /export, sending nothing', async () => {
+  const app = await boot([]);
+  const api = (app.w as any).api;
+  api.skillLibrary = async () => ({ ok: true, data: { skills: [], roots: [], errors: [], includeInstructions: true } });
+  api.exportMarkdown = vi.fn(async () => ({ ok: true, data: { done: 'saved', name: 'chat.md' } }));
+  const input = app.w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  input.value = '/export';
+  app.w.document.getElementById('composer')!.dispatchEvent(new app.w.Event('submit', { bubbles: true, cancelable: true }));
+  await settle(); await settle();
+  expect(api.exportMarkdown).toHaveBeenCalledWith({ id: summary([]).id, scope: 'session', target: 'file' });
+  expect(app.w.document.body.textContent).toContain('Saved chat.md');
+  expect(app.live.sent).toHaveLength(0);
+});
+
+it('drops a typed /export when another chat opens while the Skills load', async () => {
+  const first = summary([]), second = { ...summary([]), id: '2026-09-02-test0002', title: 'Other session' };
+  const app = await boot([], true, [], [], { sessions: [first, second] });
+  const api = (app.w as any).api;
+  let release!: (value: unknown) => void;
+  api.skillLibrary = () => new Promise(resolve => { release = resolve; });
+  api.exportMarkdown = vi.fn(async () => ({ ok: true, data: { done: 'saved', name: 'chat.md' } }));
+  const input = app.w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  input.value = '/export';
+  app.w.document.getElementById('composer')!.dispatchEvent(new app.w.Event('submit', { bubbles: true, cancelable: true }));
+  await settle();
+  (app.w.document.querySelector(`#sessionList [data-id="${second.id}"]`) as HTMLElement).click();
+  release({ ok: true, data: { skills: [], roots: [], errors: [], includeInstructions: true } });
+  await settle(); await settle();
+  expect(api.exportMarkdown).not.toHaveBeenCalled();
+  expect(app.live.sent).toHaveLength(0);
+});
+
+it('drops a typed /export and keeps the new draft when the draft changes while the Skills load', async () => {
+  const app = await boot([]);
+  const api = (app.w as any).api;
+  let release!: (value: unknown) => void;
+  api.skillLibrary = () => new Promise(resolve => { release = resolve; });
+  api.exportMarkdown = vi.fn(async () => ({ ok: true, data: { done: 'saved', name: 'chat.md' } }));
+  const input = app.w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  input.value = '/export';
+  app.w.document.getElementById('composer')!.dispatchEvent(new app.w.Event('submit', { bubbles: true, cancelable: true }));
+  await settle();
+  input.value = 'Keep this draft';
+  input.dispatchEvent(new app.w.Event('input', { bubbles: true }));
+  release({ ok: true, data: { skills: [], roots: [], errors: [], includeInstructions: true } });
+  await settle(); await settle();
+  expect(api.exportMarkdown).not.toHaveBeenCalled();
+  expect(input.value).toBe('Keep this draft');
+  expect(app.live.sent).toHaveLength(0);
+});
+
+it('opens Find in chat with /find, its field focused', async () => {
+  const { w, row, input } = await slash('find');
+  row!.click(); await settle();
+  expect(w.document.getElementById('chatFind')!.hidden).toBe(false);
+  expect(w.document.activeElement).toBe(w.document.getElementById('chatFindField'));
+  expect(input.value).toBe('');
+});
+
+// Codex's "Enter key behavior": Enter sends, or Cmd/Ctrl+Enter sends and Enter adds a line.
+async function pressInComposer(enterSends: boolean | undefined, keys: { metaKey?: boolean; ctrlKey?: boolean; shiftKey?: boolean }) {
+  const app = await boot([], true, [], [], enterSends === undefined ? {} : { enterSends });
+  const input = app.w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  input.value = 'Run the tests';
+  input.dispatchEvent(new app.w.Event('input', { bubbles: true }));
+  const event = new app.w.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true, ...keys });
+  input.dispatchEvent(event);
+  await settle(300);
+  return { sent: app.live.sent.length, prevented: event.defaultPrevented };
+}
+
+it('sends with Enter by default', async () => {
+  expect(await pressInComposer(undefined, {})).toEqual({ sent: 1, prevented: true });
+});
+it('keeps Shift+Enter as a new line', async () => {
+  expect(await pressInComposer(undefined, { shiftKey: true })).toEqual({ sent: 0, prevented: false });
+});
+it('adds a line with Enter when Cmd/Ctrl+Enter is chosen to send', async () => {
+  expect(await pressInComposer(false, {})).toEqual({ sent: 0, prevented: false });
+});
+it.each([{ metaKey: true }, { ctrlKey: true }])('sends with %o + Enter when that is chosen', async modifier => {
+  expect(await pressInComposer(false, modifier)).toEqual({ sent: 1, prevented: true });
+});
+
+// Polish 2.1.37: the new Enter-key choice and the slash menu meet in the same keystroke.
+it.each([true, false])('runs the highlighted slash command with Enter whatever Enter sends (enterSends=%s)', async enterSends => {
+  const app = await boot([], true, [], [], { enterSends });
+  (app.w as any).api.skillLibrary = async () => ({ ok: true, data: { skills: [], roots: [], errors: [], includeInstructions: true } });
+  const input = app.w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  input.value = '/status'; input.setSelectionRange(7, 7); input.dispatchEvent(new app.w.Event('input', { bubbles: true }));
+  await settle();
+  const event = new app.w.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+  input.dispatchEvent(event);
+  await settle(300);
+  expect(event.defaultPrevented).toBe(true);
+  expect(app.live.sent).toHaveLength(0);
+  expect(app.w.document.getElementById('contextMeterButton')!.getAttribute('aria-expanded')).toBe('true');
+  expect(input.value).toBe('');
+});
+
+describe('branch in new chat (#482)', () => {
+  const chat = '6ad337fe-47a4-83ed-a21f-c2e24d5829a4';
+  const replyId = '2b06482d-0dc6-4847-bf7a-2e1a0f671e89';
+  const ask: SessionEvent = { kind: 'user_message', seq: 1, origin: 1, time: T0, source: 'extension', turnId: 'done-turn', messageId: 'ask', message: text('Plan the release') };
+  const reply = (messageId = replyId): SessionEvent => ({ kind: 'assistant_message', seq: 2, time: T0 + 1_000, source: 'extension', turnId: 'done-turn', messageId, message: text('Tag first, then build.'), final: true, state: 'final' });
+  const end: SessionEvent = { seq: 3, time: T0 + 2_000, source: 'extension', kind: 'turn_end', turnId: 'done-turn', outcome: 'completed' };
+  const branchButton = (w: { document: Document }) => w.document.querySelector<HTMLButtonElement>('.answer-actions .answer-branch');
+  const submit = async (w: Window & typeof globalThis, value: string) => {
+    (w.document.getElementById('chatInput') as HTMLTextAreaElement).value = value;
+    w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
+    await settle();
+  };
+
+  it('starts a new chat from a completed answer and sends its first message at that reply', async () => {
+    const { w, live } = await boot([ask, reply(), end], true, [], [], { summary: { conversationId: chat } });
+    const button = branchButton(w)!;
+    expect(button.getAttribute('aria-label')).toBe('Branch in new chat');
+    button.click(); await settle();
+    expect(w.document.getElementById('chatTitle')!.textContent).toBe('New chat');
+    const notice = w.document.getElementById('branchDraft')!;
+    expect(notice.hidden).toBe(false);
+    expect(notice.textContent).toContain('Loop under test');
+    await submit(w as any, 'Try the other approach.');
+    expect(live.sent.at(-1)).toMatchObject({ sessionId: null, text: 'Try the other approach.',
+      branch: { sessionId: summary([]).id, conversationId: chat, messageId: replyId } });
+  });
+
+  it('goes back to the reply it came from when the person cancels the branch', async () => {
+    const { w, live } = await boot([ask, reply(), end], true, [], [], { summary: { conversationId: chat } });
+    const api = (w as any).api;
+    api.locateMessage = vi.fn(async () => ({ ok: true, data: { seq: 2, kind: 'assistant_message', messageId: replyId, position: 2 } }));
+    branchButton(w)!.click(); await settle();
+    w.document.querySelector<HTMLButtonElement>('#branchDraft .branch-draft-cancel')!.click(); await settle();
+    expect(w.document.getElementById('branchDraft')!.hidden).toBe(true);
+    expect(w.document.querySelector(`.sess.is-sel[data-id="${summary([]).id}"]`)).not.toBeNull();
+    expect(api.locateMessage).toHaveBeenCalledWith(summary([]).id, replyId);
+    // An ordinary new chat afterwards carries no branch.
+    w.document.getElementById('newChat')!.click(); await settle();
+    await submit(w as any, 'Just a new chat.');
+    expect(live.sent.at(-1)).not.toHaveProperty('branch');
+  });
+
+  // 2.1.41 release round, macOS: Cancel branch opened the chat at the reply, on a page of older
+  // history. A message sent from there reached ChatGPT and was answered, but neither showed: a
+  // page of history takes no live rows. Sending returns the chat to its end first.
+  it('shows a message sent after cancelling a branch, even when the reply sat on an older page', async () => {
+    const filler: SessionEvent[] = [];
+    for (let n = 0; n < 40; n += 1) {
+      const seq = 4 + n * 3, turnId = `later-turn-${n}`;
+      filler.push({ kind: 'user_message', seq, origin: seq, time: T0 + seq * 1_000, source: 'extension', turnId, messageId: `later-ask-${n}`, message: text(`Later question ${n}`) },
+        { kind: 'assistant_message', seq: seq + 1, time: T0 + (seq + 1) * 1_000, source: 'extension', turnId,
+          messageId: `0000000${String(n).padStart(1, '0')}-0dc6-4847-bf7a-2e1a0f671e89`.slice(-36), message: text(`Later answer ${n}`), final: true, state: 'final' },
+        { seq: seq + 2, time: T0 + (seq + 2) * 1_000, source: 'extension', kind: 'turn_end', turnId, outcome: 'completed' });
+    }
+    const { w, live } = await boot([ask, reply(), end, ...filler], true, [], [], { summary: { conversationId: chat } });
+    const api = (w as any).api;
+    // The branch came from the first reply, far above the page the chat opens on.
+    api.locateMessage = vi.fn(async () => ({ ok: true, data: { seq: 2, kind: 'assistant_message', messageId: replyId, position: 2 } }));
+    const timeline = () => w.document.getElementById('timeline')!.textContent!;
+    expect(timeline()).toContain('Later answer 39');
+    [...w.document.querySelectorAll<HTMLButtonElement>('.answer-actions .answer-branch')].at(-1)!.click(); await settle();
+    w.document.querySelector<HTMLButtonElement>('#branchDraft .branch-draft-cancel')!.click(); await settle(); await settle();
+    expect(timeline()).toContain('Tag first, then build.');
+    expect(timeline()).not.toContain('Later answer 39');
+    // At the bottom of that page the newer rows are still not loaded: the way back to the end shows.
+    expect(w.document.getElementById('jumpLatest')!.classList.contains('is-shown')).toBe(true);
+    await submit(w as any, 'Continue from here.');
+    await settle(); await settle();
+    expect(live.sent.at(-1)).toMatchObject({ text: 'Continue from here.' });
+    // Back at the end: the latest exchange and the message just sent are in view.
+    expect(timeline()).toContain('Later answer 39');
+  });
+
+  it('drops the branch and stays a plain new chat when the chat it came from is deleted', async () => {
+    const { w, live, notifySession } = await boot([ask, reply(), end], true, [], [], { summary: { conversationId: chat } });
+    branchButton(w)!.click(); await settle();
+    // The source chat is deleted while the branch is still a draft.
+    (w as any).api.listSessions = async () => ({ ok: true, data: { sessions: [], activeId: null, pressure: [] } });
+    notifySession(); await settle(700);
+    // The notice no longer names a chat that is gone, and the first message starts a plain chat.
+    expect(w.document.getElementById('branchDraft')!.hidden).toBe(true);
+    expect(w.document.getElementById('chatTitle')!.textContent).toBe('New chat');
+    await submit(w as any, 'Just a new chat.');
+    expect(live.sent.at(-1)).not.toHaveProperty('branch');
+  });
+
+  it.each([
+    ['a reply without a native id', { reply: 'assistant:interim:1', summary: { conversationId: chat } }],
+    ['a chat without a native ChatGPT id', { reply: replyId, summary: {} }],
+    ['a worker chat', { reply: replyId, summary: { conversationId: chat, origin: { kind: 'worker', fromSessionId: null, agentId: 'worker-1', task: 'x' } } }]
+  ] as const)('offers no branch for %s', async (_name, setup) => {
+    const { w } = await boot([ask, reply(setup.reply), end], true, [], [], { summary: setup.summary as Partial<SessionSummary> });
+    expect(w.document.querySelector('.answer-actions')).not.toBeNull();
+    expect(branchButton(w)).toBeNull();
+  });
+
+  // History ChatGPT copied into a branch, and an adopted chat's earlier answers, are recorded
+  // without a turn: before, they had no actions at all, so nothing could branch from or copy them.
+  it('offers copy, export and branch on an answer recorded without a turn', async () => {
+    const earlierId = '6ad3a59b-0000-83eb-8bc4-8c84e68dd911';
+    const loose: SessionEvent = { kind: 'assistant_message', seq: 4, time: T0 + 3_000, source: 'extension', messageId: earlierId,
+      message: text('An earlier answer.'), final: true, state: 'final' };
+    const { w, live } = await boot([loose, ask, reply(), end], true, [], [], { summary: { conversationId: chat } });
+    const api = (w as any).api;
+    api.exportMarkdown = vi.fn(async () => ({ ok: true, data: { done: 'copied' } }));
+    const bars = [...w.document.querySelectorAll('.answer-actions')];
+    expect(bars).toHaveLength(2);
+    const bar = bars.find(node => node.closest('.said')!.textContent!.includes('An earlier answer'))!;
+    bar.querySelector<HTMLButtonElement>('.answer-action')!.click(); await settle();
+    expect(api.exportMarkdown).toHaveBeenCalledWith(expect.objectContaining({ scope: 'answer', messageId: earlierId, turnId: undefined }));
+    bar.querySelector<HTMLButtonElement>('.answer-branch')!.click(); await settle();
+    await submit(w as any, 'From the earlier answer.');
+    expect(live.sent.at(-1)).toMatchObject({ branch: { conversationId: chat, messageId: earlierId } });
+  });
+
+  it('links a branched chat back to the reply it came from', async () => {
+    const source = { ...summary([]), id: '2026-10-17-source01', title: 'Release plan', conversationId: chat };
+    const branched = { ...summary([]), id: '2026-10-17-branch01', title: 'Other approach', conversationId: '6ad388c2-faf8-83ed-bb4f-9efff4ad92de',
+      origin: { kind: 'desktop' as const, fromSessionId: source.id, agentId: null, task: '', branchOf: { conversationId: chat, messageId: replyId } } };
+    const { w } = await boot([ask, reply(), end], false, [], [], { sessions: [branched, source] });
+    const api = (w as any).api;
+    api.locateMessage = vi.fn(async () => ({ ok: true, data: { seq: 2, kind: 'assistant_message', messageId: replyId, position: 2 } }));
+    (w.document.querySelector(`#sessionList [data-id="${branched.id}"]`) as HTMLElement).click(); await settle();
+    const link = w.document.getElementById('chatBranchOrigin') as HTMLButtonElement;
+    expect(link.hidden).toBe(false);
+    expect(link.textContent).toContain('Release plan');
+    link.click(); await settle();
+    expect(w.document.querySelector(`.sess.is-sel[data-id="${source.id}"]`)).not.toBeNull();
+    expect(api.locateMessage).toHaveBeenCalledWith(source.id, replyId);
+    expect(link.hidden).toBe(true);
+  });
+
+  it('sends a retry from a branch that has not started yet at the same reply', async () => {
+    const source = { ...summary([]), id: '2026-10-17-source01', title: 'Release plan', conversationId: chat };
+    const pending = { ...summary([]), id: '2026-10-17-branch01', title: 'Other approach', conversationId: null, chatIds: [], selectedModel: undefined,
+      origin: { kind: 'desktop' as const, fromSessionId: source.id, agentId: null, task: '', branchOf: { conversationId: chat, messageId: replyId } } };
+    const { w, live } = await boot([], false, [], [], { sessions: [pending, source] });
+    (w.document.querySelector(`#sessionList [data-id="${pending.id}"]`) as HTMLElement).click(); await settle();
+    // Its failed first message left no observed model: the person picks one, as for any resend.
+    for (const [id, value] of [['composerModel', 'gpt-5.6-sol'], ['composerReasoning', 'high']] as const) {
+      const select = w.document.getElementById(id) as HTMLSelectElement;
+      select.value = value; select.dispatchEvent(new w.Event('change', { bubbles: true }));
+    }
+    await settle();
+    await submit(w as any, 'Again, please.');
+    expect(live.sent.at(-1)).toMatchObject({ sessionId: pending.id, branch: { sessionId: source.id, conversationId: chat, messageId: replyId } });
+  });
+});
+
+describe('edit and resubmit (#365)', () => {
+  const q = (seq: number, messageId: string, value: string, turnId: string, extra: object = {}): SessionEvent =>
+    ({ kind: 'user_message', seq, origin: seq, time: T0 + seq * 1000, source: 'extension', turnId, messageId, message: text(value), ...extra }) as SessionEvent;
+  const a = (seq: number, messageId: string, value: string, turnId: string): SessionEvent =>
+    ({ kind: 'assistant_message', seq, time: T0 + seq * 1000, source: 'extension', turnId, messageId, message: text(value), final: true, state: 'final' }) as SessionEvent;
+  const end = (seq: number, turnId: string): SessionEvent => ({ seq, time: T0 + seq * 1000, source: 'extension', kind: 'turn_end', turnId, outcome: 'completed' }) as SessionEvent;
+  const said = (w: { document: Document }) => [...w.document.querySelectorAll('#timeline > .ev-user_message, #timeline > .ev-assistant_message, #timeline > .earlier-version')]
+    .map(node => node.classList.contains('earlier-version') ? `earlier:${node.querySelector('summary')!.textContent!.trim()}` : node.querySelector('.said')!.textContent!.replace(/\s+/g, ' ').trim().slice(0, 40));
+
+  it('folds the version an edit replaced, and what followed it, under the edited question', async () => {
+    const events = [q(1, 'q-1', 'First question', 't1'), a(2, 'a-1', 'First answer', 't1'), end(3, 't1'),
+      q(4, 'q-2', 'Fix the logn bug', 't2'), a(5, 'a-2', 'Which bug?', 't2'), end(6, 't2'),
+      q(7, 'q-2b', 'Fix the login bug', 't3', { replaces: 'q-2' }), a(8, 'a-3', 'Done, here is the fix.', 't3'), end(9, 't3')];
+    const { w } = await boot(events, true);
+    const rows = said(w);
+    expect(rows[0]).toContain('First question');
+    expect(rows[1]).toContain('First answer');
+    expect(rows[2]).toContain('Fix the login bug');
+    expect(rows[3]).toBe('earlier:Earlier version · 2 messages');
+    expect(rows[4]).toContain('Done, here is the fix.');
+    expect(rows).toHaveLength(5);
+    expect(w.document.querySelector('#timeline > .ev-user_message:nth-of-type(n) .message-edited, #timeline .message-edited')?.textContent).toBe('Edited version');
+    // Directly under the edited question, before the line of the turn that answers it.
+    const editedRow = [...w.document.querySelectorAll('#timeline > .ev-user_message')].find(row => row.textContent!.includes('Fix the login bug'))!;
+    expect(editedRow.nextElementSibling?.classList.contains('earlier-version')).toBe(true);
+    const fold = w.document.querySelector<HTMLDetailsElement>('#timeline > .earlier-version')!;
+    expect(fold.open).toBe(false);
+    fold.open = true; fold.dispatchEvent(new w.Event('toggle')); await settle();
+    const shown = [...fold.querySelectorAll('.said')].map(node => node.textContent!.replace(/\s+/g, ' ').trim());
+    expect(shown).toHaveLength(2);
+    expect(shown[0]).toContain('Fix the logn bug');
+    expect(shown[1]).toContain('Which bug?');
+  });
+
+  it('folds every earlier version of a question edited twice into one row', async () => {
+    const events = [q(1, 'q-1', 'Ask', 't1'), a(2, 'a-1', 'Answer one', 't1'), end(3, 't1'),
+      q(4, 'q-1b', 'Ask again', 't2', { replaces: 'q-1' }), a(5, 'a-2', 'Answer two', 't2'), end(6, 't2'),
+      q(7, 'q-1c', 'Ask a third time', 't3', { replaces: 'q-1b' }), a(8, 'a-3', 'Answer three', 't3'), end(9, 't3')];
+    const { w } = await boot(events, true);
+    expect(said(w)).toEqual([expect.stringContaining('Ask a third time'), 'earlier:Earlier versions · 4 messages', expect.stringContaining('Answer three')]);
+  });
+
+  const chat = '6ad337fe-47a4-83ed-a21f-c2e24d5829a4';
+  const Q1 = '6ad3a59b-0001-83eb-8bc4-8c84e68dd911', Q2 = '6ad3a59b-0002-83eb-8bc4-8c84e68dd911';
+  const A1 = '6ad3a59b-00a1-83eb-8bc4-8c84e68dd911', A2 = '6ad3a59b-00a2-83eb-8bc4-8c84e68dd911';
+  const exchange = () => [q(1, Q1, 'First question', 't1'), a(2, A1, 'First answer', 't1'), end(3, 't1'),
+    q(4, Q2, 'Fix the logn bug', 't2'), a(5, A2, 'Which bug?', 't2'), end(6, 't2')];
+  const submit = async (w: Window & typeof globalThis, value?: string) => {
+    if (value !== undefined) (w.document.getElementById('chatInput') as HTMLTextAreaElement).value = value;
+    w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
+    await settle();
+  };
+  const editButton = (w: { document: Document }, text: string) => [...w.document.querySelectorAll('#timeline > .ev-user_message')]
+    .find(row => row.textContent!.includes(text))?.querySelector<HTMLButtonElement>('.question-edit') ?? null;
+
+  it('edits one of your questions from the composer and sends it as ChatGPT\'s edit of that question', async () => {
+    const { w, live } = await boot(exchange(), true, [], [], { summary: { conversationId: chat } });
+    (w.document.getElementById('chatInput') as HTMLTextAreaElement).value = 'A draft I was writing';
+    editButton(w, 'First question')!.click(); await settle();
+    const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+    expect(input.value).toBe('First question');
+    const notice = w.document.getElementById('editDraft')!;
+    expect(notice.hidden).toBe(false);
+    expect(notice.textContent).toContain('Editing your message · replaces 3 later messages');
+    // The question being edited is marked in the chat, so an earlier one is easy to find.
+    const marked = () => [...w.document.querySelectorAll('#timeline .ev-user_message.is-being-edited')].map(row => row.textContent!.includes('First question'));
+    expect(marked()).toEqual([true]);
+    await submit(w as any, 'First question, edited');
+    expect(live.sent.at(-1)).toMatchObject({ sessionId: summary([]).id, text: 'First question, edited', mode: 'auto', edit: { messageId: Q1 } });
+    expect(notice.hidden).toBe(true);
+    expect(marked()).toEqual([]);
+    // The draft that was there before the edit comes back.
+    expect(input.value).toBe('A draft I was writing');
+  });
+
+  it('says so when the latest question is edited, and gives the draft back when the edit is cancelled', async () => {
+    const { w, live } = await boot(exchange(), true, [], [], { summary: { conversationId: chat } });
+    const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+    input.value = 'Unfinished';
+    editButton(w, 'Fix the logn bug')!.click(); await settle();
+    expect(w.document.getElementById('editDraft')!.textContent).toContain('Editing your message · replaces 1 later message');
+    w.document.querySelector<HTMLButtonElement>('#editDraft .edit-draft-cancel')!.click(); await settle();
+    expect(w.document.getElementById('editDraft')!.hidden).toBe(true);
+    expect(input.value).toBe('Unfinished');
+    await submit(w as any, 'Just a follow-up');
+    expect(live.sent.at(-1)).not.toHaveProperty('edit');
+  });
+
+  it('sends Review\'s conflict request as a new message, even from an edit and a narrow window', async () => {
+    // It went into the edit, so Send replaced the question and every message after it.
+    const project: LocalProject = { id: '55555555-5555-4555-8555-555555555555', name: 'Workspace', path: '/workspace', createdAt: T0 };
+    const { w, live } = await boot(exchange(), true, [], [project], { summary: { conversationId: chat } });
+    const ok = <T>(data: T) => Promise.resolve({ ok: true as const, data });
+    w.api.getProjectGitSnapshot = () => ok({ projectId: project.id, state: 'ready', truncated: false, revision: 'merging',
+      changes: [{ status: 'C', path: 'src/both.ts', additions: null, deletions: null, binary: false }] });
+    w.api.getProjectGitDiff = () => ok({ projectId: project.id, status: 'C', path: 'src/both.ts', additions: null, deletions: null,
+      binary: false, tooLarge: false, baseText: 'ours', currentText: '<<<<<<< HEAD' });
+    Object.defineProperty(w, 'matchMedia', { configurable: true,
+      value: (query: string) => ({ matches: query.includes('850px'), addEventListener: vi.fn(), removeEventListener: vi.fn() }) });
+    const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+    input.value = 'Unfinished';
+    editButton(w, 'First question')!.click(); await settle();
+    w.document.querySelector<HTMLButtonElement>('.work-dock-quick[data-view="review"]')!.click(); await settle();
+    w.document.querySelector<HTMLButtonElement>('.review-panel .file-change-row[data-path="src/both.ts"]')!.click(); await settle();
+    [...w.document.querySelectorAll<HTMLButtonElement>('.review-panel .file-preview-actions button')].find(button => button.title === 'Ask chat to resolve')!.click();
+    await settle();
+    expect(w.document.getElementById('editDraft')!.hidden).toBe(true);
+    expect(input.value).toMatch(/^Help me resolve the merge conflict in src\/both\.ts\..*\n\nUnfinished$/s);
+    expect(w.document.querySelector('.has-work-dock')).toBeNull();
+    expect(w.document.activeElement).toBe(input);
+    await submit(w as any);
+    expect(live.sent.at(-1)).not.toHaveProperty('edit');
+    expect(live.sent.at(-1)?.text).toContain('Help me resolve the merge conflict in src/both.ts.');
+  });
+
+  it('does not put Review\'s conflict request in the composer while a prepared plan is waiting to be sent', async () => {
+    // Send starts the prepared plan, so the request the composer showed would never have been sent.
+    const project: LocalProject = { id: '55555555-5555-4555-8555-555555555555', name: 'Workspace', path: '/workspace', createdAt: T0 };
+    const { w, live } = await boot([], false, [], [project]);
+    const api = (w as any).api;
+    (w.document.querySelector(`.project-heading > [data-new-project="${project.id}"]`) as HTMLButtonElement).click(); await settle();
+    (await api.getState()).data.config.ui.finishTool = true;
+    const ok = <T>(data: T) => Promise.resolve({ ok: true as const, data });
+    api.draftTaskPlan = vi.fn(async () => ({ ok: true, data: ['Build foundation', 'Verify it'] }));
+    api.getProjectGitSnapshot = () => ok({ projectId: project.id, state: 'ready', truncated: false, revision: 'merging',
+      changes: [{ status: 'C', path: 'src/both.ts', additions: null, deletions: null, binary: false }] });
+    api.getProjectGitDiff = () => ok({ projectId: project.id, status: 'C', path: 'src/both.ts', additions: null, deletions: null,
+      binary: false, tooLarge: false, baseText: 'ours', currentText: '<<<<<<< HEAD' });
+    const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+    input.value = 'Build the whole task';
+    input.dispatchEvent(new w.Event('input'));
+    w.document.getElementById('createPlan')!.click();
+    w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { cancelable: true }));
+    await settle();
+    expect(w.document.getElementById('taskPlanPreview')!.textContent).toContain('Build foundation');
+    w.document.querySelector<HTMLButtonElement>('.work-dock-quick[data-view="review"]')!.click(); await settle();
+    w.document.querySelector<HTMLButtonElement>('.review-panel .file-change-row[data-path="src/both.ts"]')!.click(); await settle();
+    [...w.document.querySelectorAll<HTMLButtonElement>('.review-panel .file-preview-actions button')].find(button => button.title === 'Ask chat to resolve')!.click();
+    await settle();
+    expect(input.value).toBe('');
+    expect(w.document.querySelector('.toast')?.textContent).toBe('Start or cancel the prepared plan first, then ask again.');
+    expect(w.document.getElementById('taskPlanPreview')!.textContent).toContain('Build foundation');
+    expect(live.sent).toHaveLength(0);
+  });
+
+  it('offers no Edit in a worker chat', async () => {
+    const { w } = await boot(exchange(), true, [], [], { summary: { conversationId: chat, origin: { kind: 'worker', fromSessionId: null, agentId: 'worker-1', task: 'x' } } });
+    expect(editButton(w, 'First question')).toBeNull();
+  });
+
+  it('offers no Edit for a question without a native id', async () => {
+    const { w } = await boot([q(1, 'user:local:1', 'Local question', 't1'), a(2, A1, 'Answer', 't1'), end(3, 't1')], true, [], [], { summary: { conversationId: chat } });
+    expect(editButton(w, 'Local question')).toBeNull();
+  });
+
+  it('offers Edit on the newest version only, never inside the earlier versions it folded', async () => {
+    const { w } = await boot([...exchange(), q(7, '6ad3a59b-0003-83eb-8bc4-8c84e68dd911', 'Fix the login bug', 't3', { replaces: Q2 }), a(8, '6ad3a59b-00a3-83eb-8bc4-8c84e68dd911', 'Fixed.', 't3'), end(9, 't3')],
+      true, [], [], { summary: { conversationId: chat } });
+    expect(editButton(w, 'Fix the login bug')).not.toBeNull();
+    const fold = w.document.querySelector<HTMLDetailsElement>('#timeline > .earlier-version')!;
+    fold.open = true; fold.dispatchEvent(new w.Event('toggle')); await settle();
+    expect(fold.querySelector('.question-edit')).toBeNull();
+  });
+
+  it('leaves edit mode when another chat is opened', async () => {
+    const other = { ...summary([]), id: '2026-10-17-other001', title: 'Other chat', conversationId: '6ad388c2-faf8-83ed-bb4f-9efff4ad92de' };
+    const { w, live } = await boot(exchange(), true, [], [], { summary: { conversationId: chat }, sessions: [{ ...summary([]), conversationId: chat }, other] });
+    editButton(w, 'First question')!.click(); await settle();
+    (w.document.querySelector(`#sessionList [data-id="${other.id}"]`) as HTMLElement).click(); await settle();
+    expect(w.document.getElementById('editDraft')!.hidden).toBe(true);
+    await submit(w as any, 'Hello there');
+    expect(live.sent.at(-1)).not.toHaveProperty('edit');
+  });
+
+  it('shows an edit whose replaced version is not in the loaded history as edited, without a fold', async () => {
+    const { w } = await boot([q(7, 'q-2b', 'Fix the login bug', 't3', { replaces: 'q-gone' }), a(8, 'a-3', 'Done.', 't3'), end(9, 't3')], true);
+    expect(said(w)).toEqual([expect.stringContaining('Fix the login bug'), expect.stringContaining('Done.')]);
+    expect(w.document.querySelector('#timeline .message-edited')?.textContent).toBe('Edited version');
+  });
+
+  // The page failed an edit's delivery; the failed row keeps `edit`, and retrying must keep it an edit.
+  const failedInput = (text: string, extra: Partial<InputEntry> = {}): InputEntry => ({ id: 'failed-edit', sessionId: summary([]).id, requestedSessionId: null,
+    projectId: null, text, automation: 'off', model: 'gpt-5.6-sol', reasoningEffort: 'high', mode: 'auto', dueAt: 1, createdAt: T0 + 7000, state: 'failed',
+    owner: 'old-page', conversationId: chat, error: 'ChatGPT did not offer Edit for that message.', ...extra }) as InputEntry;
+  const retryDelivery = async (w: Window & typeof globalThis) => {
+    w.document.querySelector<HTMLButtonElement>('[aria-label="Retry delivery"]')!.click(); await settle();
+  };
+
+  it('retries a failed edit as an edit of the same question', async () => {
+    const { w, live, append } = await boot(exchange(), true, [], [], { summary: { conversationId: chat } });
+    live.inputs = [failedInput('First question, edited', { edit: { messageId: Q1 } })]; await append([]);
+    await retryDelivery(w as any);
+    const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+    expect(input.value).toBe('First question, edited');
+    const notice = w.document.getElementById('editDraft')!;
+    expect(notice.hidden).toBe(false);
+    expect(notice.textContent).toContain('Editing your message · replaces 3 later messages');
+    expect(w.document.querySelector('[aria-label="Retry delivery"]')).toBeNull();
+    await submit(w as any);
+    expect(live.sent.at(-1)).toMatchObject({ text: 'First question, edited', mode: 'auto', edit: { messageId: Q1 } });
+    expect(notice.hidden).toBe(true);
+  });
+
+  it('retries a failed ordinary message as an ordinary message', async () => {
+    const { w, live, append } = await boot(exchange(), true, [], [], { summary: { conversationId: chat } });
+    live.inputs = [failedInput('A follow-up', { error: 'Delivery failed' })]; await append([]);
+    await retryDelivery(w as any);
+    expect((w.document.getElementById('chatInput') as HTMLTextAreaElement).value).toBe('A follow-up');
+    expect(w.document.getElementById('editDraft')!.hidden).toBe(true);
+    await submit(w as any);
+    expect(live.sent.at(-1)).toMatchObject({ text: 'A follow-up' });
+    expect(live.sent.at(-1)).not.toHaveProperty('edit');
+  });
+
+  // An edit in progress is an unsent draft: retrying must neither replace it nor inherit it.
+  it.each([
+    ['a failed edit', { edit: { messageId: Q1 } }],
+    ['a failed ordinary message', {}]
+  ])('keeps an edit in progress, with the draft it will give back, when %s is retried', async (_name, extra) => {
+    const { w, live, append } = await boot(exchange(), true, [], [], { summary: { conversationId: chat } });
+    const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+    input.value = 'My draft';
+    editButton(w, 'Fix the logn bug')!.click(); await settle();
+    input.value = ''; input.dispatchEvent(new w.Event('input', { bubbles: true }));
+    live.inputs = [failedInput('Retried words', extra)]; await append([]);
+    await retryDelivery(w as any);
+    expect(w.document.querySelector('.toast')?.textContent).toContain('Send or clear your current draft before retrying this message.');
+    expect(input.value).toBe('');
+    expect(w.document.querySelector('[aria-label="Retry delivery"]')).not.toBeNull();
+    const notice = w.document.getElementById('editDraft')!;
+    expect(notice.hidden).toBe(false);
+    expect(notice.textContent).toContain('Editing your message · replaces 1 later message');
+    expect([...w.document.querySelectorAll('#timeline .ev-user_message.is-being-edited')].map(row => row.textContent!.includes('Fix the logn bug'))).toEqual([true]);
+    // Cancelling still gives back the draft the edit began with.
+    w.document.querySelector<HTMLButtonElement>('#editDraft .edit-draft-cancel')!.click(); await settle();
+    expect(input.value).toBe('My draft');
+  });
+
+  it('does not restore a failed edit while the question it edited is in older history that is not loaded', async () => {
+    const filler = Array.from({ length: 40 }, (_, i) => a(2 + i, `6ad3a59b-01${String(i).padStart(2, '0')}-83eb-8bc4-8c84e68dd911`, `Answer ${i}`, 't1'));
+    const { w, live, append } = await boot([q(1, Q1, 'First question', 't1'), ...filler, end(42, 't1')], true, [], [], { summary: { conversationId: chat } });
+    expect(w.document.getElementById('timeline')!.textContent).not.toContain('First question');
+    live.inputs = [failedInput('First question, edited', { edit: { messageId: Q1 } })]; await append([]);
+    await retryDelivery(w as any);
+    expect(w.document.querySelector('.toast')?.textContent).toContain('Scroll up to the message you edited, then retry.');
+    expect((w.document.getElementById('chatInput') as HTMLTextAreaElement).value).toBe('');
+    expect(w.document.getElementById('editDraft')!.hidden).toBe(true);
+    expect(w.document.querySelector('[aria-label="Retry delivery"]')).not.toBeNull();
+    await submit(w as any, 'Unrelated');
+    expect(live.sent.at(-1)).not.toHaveProperty('edit');
+  });
+
+  it('counts every later message of a retried edit, whatever the agent filter shows', async () => {
+    const worker = { ...a(5, A2, 'Which bug?', 't2'), agent: 'worker-1' } as SessionEvent;
+    const { w, live, append } = await boot([q(1, Q1, 'First question', 't1'), a(2, A1, 'First answer', 't1'), end(3, 't1'),
+      q(4, Q2, 'Fix the logn bug', 't2'), worker, end(6, 't2')], true, [], [], { developerMode: true, summary: { conversationId: chat } });
+    w.document.querySelector<HTMLButtonElement>('#chatAgentFilter [data-agent="worker-1"]')!.click(); await settle();
+    expect(w.document.getElementById('timeline')!.textContent).not.toContain('First question');
+    live.inputs = [failedInput('First question, edited', { edit: { messageId: Q1 } })]; await append([]);
+    await retryDelivery(w as any);
+    expect(w.document.getElementById('editDraft')!.textContent).toContain('Editing your message · replaces 3 later messages');
+  });
+
+  it('restores a failed edit whose question can no longer be edited as a new message, and says so', async () => {
+    const replaced = [...exchange(), q(7, '6ad3a59b-0003-83eb-8bc4-8c84e68dd911', 'Fix the login bug', 't3', { replaces: Q2 }), end(8, 't3')];
+    const { w, live, append } = await boot(replaced, true, [], [], { summary: { conversationId: chat } });
+    live.inputs = [failedInput('Fix the login bug please', { edit: { messageId: Q2 } })]; await append([]);
+    await retryDelivery(w as any);
+    expect((w.document.getElementById('chatInput') as HTMLTextAreaElement).value).toBe('Fix the login bug please');
+    expect(w.document.getElementById('editDraft')!.hidden).toBe(true);
+    expect(w.document.querySelector('.toast')?.textContent).toContain('can no longer be edited');
+    await submit(w as any);
+    expect(live.sent.at(-1)).not.toHaveProperty('edit');
+  });
+
+  it('recalls no earlier message with ArrowUp while a question is being edited, even with the edit cleared', async () => {
+    const { w } = await boot(exchange(), true, [], [], { summary: { conversationId: chat } });
+    editButton(w, 'First question')!.click(); await settle();
+    const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+    input.value = ''; input.dispatchEvent(new w.Event('input', { bubbles: true }));
+    const event = new w.KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true, cancelable: true });
+    input.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(false);
+    expect(input.value).toBe('');
+  });
+});
+
+describe('prompt recall in the composer', () => {
+  const ask = (seq: number, value: string, extra: object = {}): SessionEvent =>
+    ({ kind: 'user_message', seq, time: T0 + seq * 1000, source: 'extension', turnId: `t${seq}`, messageId: `q-${seq}`, message: text(value), ...extra }) as SessionEvent;
+  const answer = (seq: number, value: string): SessionEvent =>
+    ({ kind: 'assistant_message', seq, time: T0 + seq * 1000, source: 'extension', turnId: `t${seq - 1}`, messageId: `a-${seq}`, message: text(value), final: true, state: 'final' }) as SessionEvent;
+  // A message with only a file and no text is not recalled.
+  const chat = () => [ask(1, 'First question'), answer(2, 'First answer'),
+    ask(3, '', { attachments: [{ id: 'f-1', name: 'notes.txt', mimeType: 'text/plain', size: 4 }] }), answer(4, 'Read it.'),
+    ask(5, 'Second question'), answer(6, 'Second answer')];
+  const composer = (w: { document: Document }) => w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  /** Presses a key in the composer; true when the app took it over from the textarea. */
+  const press = (w: JSDOM['window'], key: string, init: KeyboardEventInit = {}) => {
+    const event = new w.KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...init });
+    composer(w).dispatchEvent(event);
+    return event.defaultPrevented;
+  };
+  /** The outbox row that sent the message `messageId`, delivered and recorded. */
+  const sentInput = (messageId: string, extra: Partial<InputEntry> = {}): InputEntry => ({ id: `input-${messageId}`, sessionId: summary([]).id, projectId: null,
+    text: 'Sent text', automation: 'off', model: null, reasoningEffort: null, mode: 'auto', dueAt: 1, createdAt: T0, state: 'sent', owner: 'page', conversationId: null,
+    messageId, deliveredAt: T0, historyRecorded: true, ...extra }) as InputEntry;
+
+  it('fills an empty composer with your last message on ArrowUp, caret at the start, without sending it', async () => {
+    const { w, live } = await boot(chat());
+    expect(press(w, 'ArrowUp')).toBe(true);
+    expect(composer(w).value).toBe('Second question');
+    expect([composer(w).selectionStart, composer(w).selectionEnd]).toEqual([0, 0]);
+    await settle();
+    expect(live.sent).toEqual([]);
+  });
+
+  it('goes further back with each ArrowUp and stops at your first message', async () => {
+    const { w } = await boot(chat());
+    press(w, 'ArrowUp');
+    expect(press(w, 'ArrowUp')).toBe(true);
+    expect(composer(w).value).toBe('First question');
+    expect(press(w, 'ArrowUp')).toBe(false);
+    expect(composer(w).value).toBe('First question');
+  });
+
+  it('comes forward with ArrowDown and gives back the empty composer past the newest message', async () => {
+    const { w } = await boot(chat());
+    press(w, 'ArrowUp'); press(w, 'ArrowUp');
+    // Up left the caret at the start: the first Down is the textarea's own, taking it to the end.
+    expect(press(w, 'ArrowDown')).toBe(false);
+    composer(w).setSelectionRange(14, 14);
+    expect(press(w, 'ArrowDown')).toBe(true);
+    expect(composer(w).value).toBe('Second question');
+    expect(composer(w).selectionStart).toBe('Second question'.length);
+    expect(press(w, 'ArrowDown')).toBe(true);
+    expect(composer(w).value).toBe('');
+    expect(press(w, 'ArrowDown')).toBe(false);
+  });
+
+  it('leaves the arrows to a typed draft', async () => {
+    const { w } = await boot(chat());
+    composer(w).value = 'A draft I am writing';
+    composer(w).dispatchEvent(new w.Event('input', { bubbles: true }));
+    expect(press(w, 'ArrowUp')).toBe(false);
+    expect(composer(w).value).toBe('A draft I am writing');
+  });
+
+  it.each([{ isComposing: true }, { altKey: true }, { ctrlKey: true }, { metaKey: true }, { shiftKey: true }])('recalls nothing with %o', async init => {
+    const { w } = await boot(chat());
+    expect(press(w, 'ArrowUp', init)).toBe(false);
+    expect(composer(w).value).toBe('');
+  });
+
+  it.each([false, true])('recalls nothing into a composer holding an attached file (attached after a recall: %s)', async recalledFirst => {
+    const { w } = await boot(chat());
+    if (recalledFirst) expect(press(w, 'ArrowUp')).toBe(true);
+    (w as any).api.chooseFiles = async () => ({ ok: true, data: [{ id: '11111111-2222-4333-8444-555555555555', name: 'image.png', mimeType: 'image/png', size: 42 }] });
+    w.document.getElementById('attachImages')!.click(); await settle();
+    expect(press(w, 'ArrowUp')).toBe(false);
+    expect(composer(w).value).toBe(recalledFirst ? 'Second question' : '');
+  });
+
+  it('gives the arrows back once the recalled message is edited', async () => {
+    const { w } = await boot(chat());
+    expect(press(w, 'ArrowUp')).toBe(true);
+    composer(w).value = 'Second question, shorter please';
+    composer(w).dispatchEvent(new w.Event('input', { bubbles: true }));
+    expect(press(w, 'ArrowUp')).toBe(false);
+    expect(press(w, 'ArrowDown')).toBe(false);
+    expect(composer(w).value).toBe('Second question, shorter please');
+  });
+
+  // A recall ends with the composer's next change: the same text typed again by hand is a draft.
+  it.each(['sent', 'cleared'])('leaves the arrows to the same text typed again after a recall was %s', async how => {
+    const { w } = await boot(chat());
+    const input = composer(w);
+    expect(press(w, 'ArrowUp')).toBe(true);
+    if (how === 'sent') { w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true })); await settle(); }
+    else { input.select(); input.setRangeText(''); input.dispatchEvent(new w.Event('input', { bubbles: true })); }
+    expect(input.value).toBe('');
+    input.value = 'Second question'; input.dispatchEvent(new w.Event('input', { bubbles: true }));
+    expect(press(w, 'ArrowUp')).toBe(false);
+    expect(input.value).toBe('Second question');
+  });
+
+  it('recalls only the messages the agent filter shows', async () => {
+    const { w } = await boot([ask(1, 'Main question', { agent: 'prime' }), answer(2, 'Main answer'), ask(3, 'Unattributed question'), answer(4, 'Unattributed answer')],
+      true, [], [], { developerMode: true });
+    w.document.querySelector<HTMLButtonElement>('#chatAgentFilter [data-agent="prime"]')!.click(); await settle();
+    expect(press(w, 'ArrowUp')).toBe(true);
+    expect(composer(w).value).toBe('Main question');
+    expect(press(w, 'ArrowUp')).toBe(false);
+  });
+
+  // A recalled message ending in a slash or @file fragment opens that menu; its arrows stay the menu's.
+  it('leaves the arrows to an open slash menu with no matches after a recall', async () => {
+    const { w } = await boot([ask(1, 'First question'), answer(2, 'First answer'), ask(3, 'Use /zzz'), answer(4, 'Done.')]);
+    (w as any).api.skillLibrary = async () => ({ ok: true, data: { skills: [], roots: [], errors: [], includeInstructions: true } });
+    press(w, 'ArrowUp'); press(w, 'ArrowUp');
+    composer(w).setSelectionRange(14, 14);
+    expect(press(w, 'ArrowDown')).toBe(true); await settle();
+    expect(composer(w).value).toBe('Use /zzz');
+    expect(w.document.getElementById('skillPicker')!.hidden).toBe(false);
+    expect(press(w, 'ArrowDown')).toBe(false);
+    expect(composer(w).value).toBe('Use /zzz');
+  });
+
+  it('keeps a refused recalled message in the composer when ArrowDown is pressed', async () => {
+    const { w } = await boot(chat());
+    expect(press(w, 'ArrowUp')).toBe(true);
+    (w as any).api.sendInput = async () => ({ ok: false, error: 'Not delivered' });
+    w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true })); await settle();
+    expect(composer(w).value).toBe('Second question');
+    expect(press(w, 'ArrowDown')).toBe(false);
+    expect(composer(w).value).toBe('Second question');
+  });
+
+  it('moves the caret through a recalled message of several lines before going further back', async () => {
+    const { w } = await boot([ask(1, 'First question'), answer(2, 'First answer'), ask(3, 'Line one\nLine two'), answer(4, 'Done.')]);
+    press(w, 'ArrowUp');
+    expect(composer(w).value).toBe('Line one\nLine two');
+    composer(w).setSelectionRange(17, 17);
+    expect(press(w, 'ArrowUp')).toBe(false);
+    composer(w).setSelectionRange(0, 0);
+    expect(press(w, 'ArrowUp')).toBe(true);
+    expect(composer(w).value).toBe('First question');
+  });
+
+  // A long one-line message wraps onto several rows: only its very start or end hands the arrows
+  // back to recall, so a lower or upper wrapped row still moves the caret.
+  it.each([['ArrowUp', 40], ['ArrowDown', 40], ['ArrowUp', 'end'], ['ArrowDown', 0]] as const)('leaves %s to the caret inside a long recalled prompt (caret at %s)', async (key, at) => {
+    const long = 'Summarize the release notes for every package in the workspace and group them by area';
+    const { w } = await boot([ask(1, 'First question'), answer(2, 'First answer'), ask(3, long), answer(4, 'Done.')]);
+    press(w, 'ArrowUp');
+    const caret = at === 'end' ? long.length : at;
+    composer(w).setSelectionRange(caret, caret);
+    expect(press(w, key)).toBe(false);
+    expect(composer(w).value).toBe(long);
+  });
+
+  // The slash/file menu reads the caret on the input event, so the caret must already be at the start.
+  it('opens no slash menu for a message ending in /… that ArrowUp recalls with the caret at the start', async () => {
+    const { w } = await boot([ask(1, 'First question'), answer(2, 'First answer'), ask(3, 'Use /zzz'), answer(4, 'Done.')]);
+    (w as any).api.skillLibrary = async () => ({ ok: true, data: { skills: [], roots: [], errors: [], includeInstructions: true } });
+    expect(press(w, 'ArrowUp')).toBe(true);
+    expect(composer(w).value).toBe('Use /zzz');
+    expect(composer(w).selectionStart).toBe(0);
+    expect(w.document.getElementById('skillPicker')!.hidden).toBe(true);
+    await settle();
+    expect(w.document.getElementById('skillPicker')!.hidden).toBe(true);
+  });
+
+  it('keeps its place when a message is recorded while you page through recall', async () => {
+    const { w, append } = await boot(chat());
+    expect(press(w, 'ArrowUp')).toBe(true);
+    await append([ask(7, 'Third question'), answer(8, 'Third answer')]);
+    expect(composer(w).value).toBe('Second question');
+    expect(press(w, 'ArrowUp')).toBe(true);
+    expect(composer(w).value).toBe('First question');
+    composer(w).setSelectionRange(14, 14);
+    expect(press(w, 'ArrowDown')).toBe(true);
+    expect(composer(w).value).toBe('Second question');
+    expect(press(w, 'ArrowDown')).toBe(true);
+    expect(composer(w).value).toBe('');
+    // A new recall starts from the newest message again.
+    expect(press(w, 'ArrowUp')).toBe(true);
+    expect(composer(w).value).toBe('Third question');
+  });
+
+  it.each([
+    ['a Goal continue', { finishOwner: { turnId: 't5', periodic: false, mode: 'goal' } }],
+    ['a Goal check you asked for', { finishOwner: { turnId: 't5', periodic: false, mode: 'goal', userRequested: true } }],
+    ['a Loop continue', { finishOwner: { turnId: 't5', periodic: true, mode: 'loop' } }],
+    ['a fresh-turn continue', { authoredSource: 'none', purpose: 'rotation' }],
+    ['a recovery continue', { recovery: { questionId: 'q-5', pro: false, busyUntil: 0, phase: 'resumed' } }],
+    ['a plan stage', { authoredSource: 'none', mode: 'finish' }]
+  ] as const)('skips %s, which the app wrote', async (_, extra) => {
+    const { w, live, append } = await boot([...chat(), ask(7, 'Continue with the next step'), answer(8, 'Next step done.')]);
+    live.inputs = [sentInput('q-5'), sentInput('q-7', extra as Partial<InputEntry>)]; await append([]);
+    expect(press(w, 'ArrowUp')).toBe(true);
+    expect(composer(w).value).toBe('Second question');
+  });
+
+  it('recalls a correction sent together with the next queued checkpoint', async () => {
+    const { w, live, append } = await boot([...chat(), ask(7, 'Use the staging database'), answer(8, 'Switched.')]);
+    live.inputs = [sentInput('q-7', { id: 'correction', companionInputId: 'checkpoint' }), sentInput('q-7', { id: 'checkpoint', authoredSource: 'none', mode: 'finish' })];
+    await append([]);
+    expect(press(w, 'ArrowUp')).toBe(true);
+    expect(composer(w).value).toBe('Use the staging database');
+  });
+
+  it('skips the tasks of a worker chat but recalls what you typed there', async () => {
+    const { w, live, append } = await boot(chat(), true, [], [], { origin: { kind: 'worker', fromSessionId: null, agentId: 'worker-1', task: 'Inspect' } });
+    expect(press(w, 'ArrowUp')).toBe(false);
+    expect(composer(w).value).toBe('');
+    live.inputs = [sentInput('q-5')]; await append([]);
+    expect(press(w, 'ArrowUp')).toBe(true);
+    expect(composer(w).value).toBe('Second question');
+    expect(press(w, 'ArrowUp')).toBe(false);
+  });
+
+  it('skips a worker task the agent filter shows', async () => {
+    const { w } = await boot([ask(1, 'Main question', { agent: 'prime' }), answer(2, 'Main answer'), ask(3, 'Inspect the parser', { agent: 'worker-1' }), answer(4, 'Inspected.')],
+      true, [], [], { developerMode: true });
+    w.document.querySelector<HTMLButtonElement>('#chatAgentFilter [data-agent="worker-1"]')!.click(); await settle();
+    expect(press(w, 'ArrowUp')).toBe(false);
+    expect(composer(w).value).toBe('');
+  });
+
+  it('announces each recalled message to screen readers, and nothing once it ends', async () => {
+    const { w } = await boot(chat());
+    const region = w.document.getElementById('recallAnnounce')!;
+    expect(region.getAttribute('aria-live')).toBe('polite');
+    press(w, 'ArrowUp');
+    expect(region.textContent).toBe('Second question');
+    press(w, 'ArrowUp');
+    expect(region.textContent).toBe('First question');
+    composer(w).setSelectionRange(14, 14);
+    press(w, 'ArrowDown'); press(w, 'ArrowDown');
+    expect(composer(w).value).toBe('');
+    expect(region.textContent).toBe('');
+    press(w, 'ArrowUp');
+    expect(region.textContent).toBe('Second question');
+    composer(w).value = 'Second question, shorter please';
+    composer(w).dispatchEvent(new w.Event('input', { bubbles: true }));
+    expect(region.textContent).toBe('');
+  });
+
+  it('ends a recall when the agent filter changes', async () => {
+    const { w } = await boot([ask(1, 'Main question', { agent: 'prime' }), answer(2, 'Main answer'), ask(3, 'Unattributed question'), answer(4, 'Unattributed answer')],
+      true, [], [], { developerMode: true });
+    expect(press(w, 'ArrowUp')).toBe(true);
+    expect(composer(w).value).toBe('Unattributed question');
+    w.document.querySelector<HTMLButtonElement>('#chatAgentFilter [data-agent="prime"]')!.click(); await settle();
+    expect(press(w, 'ArrowUp')).toBe(false);
+    expect(composer(w).value).toBe('Unattributed question');
+  });
+
+  it('leaves an arrow to a slash menu that was showing, even when the caret moved off its fragment', async () => {
+    const { w } = await boot([ask(1, 'First question'), answer(2, 'First answer'), ask(3, 'Use /zzz'), answer(4, 'Done.')]);
+    (w as any).api.skillLibrary = async () => ({ ok: true, data: { skills: [], roots: [], errors: [], includeInstructions: true } });
+    press(w, 'ArrowUp'); press(w, 'ArrowUp');
+    composer(w).setSelectionRange(14, 14);
+    expect(press(w, 'ArrowDown')).toBe(true); await settle();
+    expect(w.document.getElementById('skillPicker')!.hidden).toBe(false);
+    // Home moves the caret without an input event; the menu is still on screen.
+    composer(w).setSelectionRange(0, 0);
+    expect(press(w, 'ArrowUp')).toBe(false);
+    expect(composer(w).value).toBe('Use /zzz');
+  });
+
+  it('reads out the same message again when it is recalled in the next chat', async () => {
+    const other = { ...summary([]), id: '2026-10-17-other001', title: 'Other chat' };
+    const { w } = await boot(chat(), true, [], [], { sessions: [summary(chat()), other] });
+    const region = w.document.getElementById('recallAnnounce')!;
+    press(w, 'ArrowUp');
+    expect(region.textContent).toBe('Second question');
+    (w.document.querySelector(`#sessionList [data-id="${other.id}"]`) as HTMLElement).click(); await settle();
+    // The other chat's empty composer: the region must change before the same text can be read again.
+    expect(region.textContent).toBe('');
+    expect(press(w, 'ArrowUp')).toBe(true);
+    expect(region.textContent).toBe('Second question');
+  });
+
+  it('leaves the arrows to the caret until the outbox has been read', async () => {
+    let release!: () => void;
+    const { w, live } = await boot([...chat(), ask(7, 'Continue with the next step'), answer(8, 'Next step done.')], true, [], [], { holdInputs: new Promise<void>(resolve => { release = resolve; }) });
+    // Without the outbox the Goal continue would count as typed.
+    expect(press(w, 'ArrowUp')).toBe(false);
+    expect(composer(w).value).toBe('');
+    live.inputs = [sentInput('q-5'), sentInput('q-7', { finishOwner: { turnId: 't5', periodic: false, mode: 'goal' } })];
+    release(); await settle();
+    expect(press(w, 'ArrowUp')).toBe(true);
+    expect(composer(w).value).toBe('Second question');
+  });
+
+  it('skips an app send whose row this window read before its receipt, by the recorded input id', async () => {
+    const { w, live, append } = await boot([...chat(), ask(7, 'Continue with the next step', { inputId: 'goal-row' }), answer(8, 'Next step done.')]);
+    live.inputs = [sentInput('q-5'), sentInput('q-7', { id: 'goal-row', state: 'browser', messageId: undefined, deliveredAt: undefined, finishOwner: { turnId: 't5', periodic: false, mode: 'goal' } })];
+    await append([]);
+    expect(press(w, 'ArrowUp')).toBe(true);
+    expect(composer(w).value).toBe('Second question');
+  });
+
+  it.each([
+    ['a fresh-turn continue', 'Continue the task from where you are. (Chat On Steroids starts a fresh turn so the reply is not cut off.)'],
+    ['a Goal continue', 'Continue with the next step of the Goal.']
+  ])('skips %s whose row the outbox no longer keeps', async (_, value) => {
+    // The recorder keeps the input id and the sent text on the message, whoever wrote it.
+    const { w, live, append } = await boot([...chat(), ask(7, value, { inputId: 'trimmed-row', inputDelivery: 'confirmed', authoredText: value }), answer(8, 'Next step done.')]);
+    live.inputs = [sentInput('q-5')]; await append([]);
+    expect(press(w, 'ArrowUp')).toBe(true);
+    expect(composer(w).value).toBe('Second question');
+  });
+
+  // Mac release round, 2026-10-19: a Goal follow-up came back first. Its page types it, so it has
+  // no outbox row or input id at all; the recorder marks it `automatic` instead.
+  it('skips a Goal or Loop follow-up its page typed', async () => {
+    const { w, live, append } = await boot([...chat(), ask(7, 'Continue with step two of the goal', { automatic: true }), answer(8, 'Step two done.')]);
+    live.inputs = [sentInput('q-5')]; await append([]);
+    expect(press(w, 'ArrowUp')).toBe(true);
+    expect(composer(w).value).toBe('Second question');
+  });
+});
+
+describe('the finished-reply announcement', () => {
+  const ask = (seq: number, turnId: string): SessionEvent =>
+    ({ kind: 'user_message', seq, time: T0 + seq * 1000, source: 'extension', turnId, messageId: `q-${seq}`, message: text('Check the build') }) as SessionEvent;
+  const start = (seq: number, turnId: string): SessionEvent => ({ seq, time: T0 + seq * 1000, source: 'extension', kind: 'turn_start', turnId });
+  const end = (seq: number, turnId: string, outcome: 'completed' | 'stopped' = 'completed'): SessionEvent =>
+    ({ seq, time: T0 + seq * 1000, source: 'extension', kind: 'turn_end', turnId, outcome }) as SessionEvent;
+  const region = (w: JSDOM['window']) => w.document.getElementById('turnAnnounce')!;
+
+  it('reads out once that a reply finished in the open chat, when it is turned on', async () => {
+    const { w, append } = await boot([ask(1, 't1'), start(2, 't1')], true, [], [], { announceTurns: true });
+    expect(region(w).getAttribute('role')).toBe('status');
+    expect(region(w).getAttribute('aria-live')).toBe('polite');
+    expect(region(w).classList.contains('sr-only')).toBe(true);
+    expect(region(w).textContent).toBe('');
+    await append([end(3, 't1')]);
+    expect(region(w).textContent).toBe('Reply finished');
+    // The next turn empties it first, so the same words are read again when that one ends.
+    await append([ask(4, 't2'), start(5, 't2')]);
+    expect(region(w).textContent).toBe('');
+    await append([end(6, 't2')]);
+    expect(region(w).textContent).toBe('Reply finished');
+  });
+
+  it('reads out a reply that finished in the same read as the next turn started, even right after the last one', async () => {
+    const { w, append } = await boot([ask(1, 't1'), start(2, 't1')], true, [], [], { announceTurns: true });
+    const said: string[] = [];
+    new w.MutationObserver(() => said.push(region(w).textContent ?? '')).observe(region(w), { childList: true, characterData: true, subtree: true });
+    // A Goal or Loop continue can start the next turn within one coalesced read.
+    await append([end(3, 't1'), start(4, 't2')]);
+    expect(region(w).textContent).toBe('Reply finished');
+    // The region still holds those words: it is emptied first, so the second reply is read too.
+    said.length = 0;
+    await append([end(5, 't2'), start(6, 't3')]);
+    await settle(200);
+    expect(region(w).textContent).toBe('Reply finished');
+    expect(said).toEqual(['', 'Reply finished']);
+  });
+
+  it('drops a delayed repeat once the next question has emptied the region', async () => {
+    const { w, append } = await boot([ask(1, 't1'), start(2, 't1')], true, [], [], { announceTurns: true });
+    await append([end(3, 't1')]);
+    expect(region(w).textContent).toBe('Reply finished');
+    // Hold the 100 ms repeat so the next read lands before it.
+    const held: Array<() => void> = [], setTimer = w.setTimeout.bind(w);
+    vi.spyOn(w, 'setTimeout').mockImplementation(((fn: () => void, ms?: number, ...rest: unknown[]) =>
+      ms === 100 ? (held.push(fn), 0) : setTimer(fn, ms, ...rest)) as typeof w.setTimeout);
+    await append([ask(4, 't2'), start(5, 't2'), end(6, 't2')]);
+    expect(region(w).textContent).toBe('');
+    await append([ask(7, 't3'), start(8, 't3')]);
+    for (const fn of held.splice(0)) fn();
+    expect(region(w).textContent).toBe('');
+  });
+
+  it('drops a delayed repeat once a later reply has been read out at once', async () => {
+    const { w, append } = await boot([ask(1, 't1'), start(2, 't1')], true, [], [], { announceTurns: true });
+    await append([end(3, 't1')]);
+    const held: Array<() => void> = [], setTimer = w.setTimeout.bind(w);
+    vi.spyOn(w, 'setTimeout').mockImplementation(((fn: () => void, ms?: number, ...rest: unknown[]) =>
+      ms === 100 ? (held.push(fn), 0) : setTimer(fn, ms, ...rest)) as typeof w.setTimeout);
+    // A Loop continue: the region still says the words, so this read waits for its repeat.
+    await append([start(4, 't2'), end(5, 't2'), start(6, 't3')]);
+    expect(held).toHaveLength(1);
+    // The next reply finishes before that repeat, and the empty region takes the words at once.
+    await append([end(7, 't3')]);
+    expect(region(w).textContent).toBe('Reply finished');
+    const said: string[] = [];
+    new w.MutationObserver(() => said.push(region(w).textContent ?? '')).observe(region(w), { childList: true, characterData: true, subtree: true });
+    for (const fn of held.splice(0)) fn();
+    await settle();
+    expect(said).toEqual([]);
+  });
+
+  // The announcement's own timers (the 100 ms refill and the gap between replies) are held and
+  // run by hand, in order, so nothing here waits on the clock.
+  const holdTimers = (w: JSDOM['window']) => {
+    const held: Array<() => void> = [], setTimer = w.setTimeout.bind(w);
+    vi.spyOn(w, 'setTimeout').mockImplementation(((fn: () => void, ms?: number, ...rest: unknown[]) =>
+      ms === 100 || ms === 1000 ? (held.push(fn), 0) : setTimer(fn, ms, ...rest)) as typeof w.setTimeout);
+    return held;
+  };
+  const watch = (w: JSDOM['window']) => {
+    const said: string[] = [];
+    new w.MutationObserver(() => said.push(region(w).textContent ?? '')).observe(region(w), { childList: true, characterData: true, subtree: true });
+    return said;
+  };
+
+  it('reads out every reply that finished in one read, one after another', async () => {
+    const { w, append } = await boot([ask(1, 't1'), start(2, 't1')], true, [], [], { announceTurns: true });
+    const held = holdTimers(w), said = watch(w);
+    await append([end(3, 't1'), start(4, 't2'), end(5, 't2'), start(6, 't3'), end(7, 't3')]);
+    // The first is read at once; the others wait their turn.
+    expect(region(w).textContent).toBe('Reply finished');
+    expect(held).toHaveLength(1);
+    held.shift()!(); // the gap, then the region is emptied for the second
+    await settle();
+    expect(region(w).textContent).toBe('');
+    held.shift()!(); // refilled in a later task
+    await settle();
+    expect(region(w).textContent).toBe('Reply finished');
+    held.shift()!();
+    await settle();
+    held.shift()!();
+    await settle();
+    expect(held).toHaveLength(0);
+    expect(said).toEqual(['Reply finished', '', 'Reply finished', '', 'Reply finished']);
+  });
+
+  it('empties and refills for each reply when the region already held the words', async () => {
+    const { w, append } = await boot([ask(1, 't1'), start(2, 't1')], true, [], [], { announceTurns: true });
+    await append([end(3, 't1')]);
+    const held = holdTimers(w), said = watch(w);
+    await append([start(4, 't2'), end(5, 't2'), start(6, 't3'), end(7, 't3')]);
+    while (held.length > 0) { held.shift()!(); await settle(); }
+    expect(said).toEqual(['', 'Reply finished', '', 'Reply finished']);
+  });
+
+  it('drops the replies still waiting when the open chat changes', async () => {
+    const first = summary([]), second = { ...summary([]), id: '2026-09-02-test0002', title: 'Other session' };
+    const { w, append } = await boot([ask(1, 't1'), start(2, 't1')], true, [], [], { announceTurns: true, sessions: [first, second] });
+    const held = holdTimers(w);
+    await append([end(3, 't1'), start(4, 't2'), end(5, 't2'), start(6, 't3'), end(7, 't3')]);
+    expect(region(w).textContent).toBe('Reply finished');
+    expect(held).toHaveLength(1);
+    (w.document.querySelector(`#sessionList [data-id="${second.id}"]`) as HTMLElement).click();
+    await settle();
+    expect(region(w).textContent).toBe('');
+    const said = watch(w);
+    while (held.length > 0) { held.shift()!(); await settle(); }
+    expect(region(w).textContent).toBe('');
+    expect(said).toEqual([]);
+  });
+
+  it.each([
+    ['when it is off', false, end(3, 't1')],
+    ['for a stopped reply', true, end(3, 't1', 'stopped')]
+  ] as const)('stays quiet %s', async (_, announceTurns, last) => {
+    const { w, append } = await boot([ask(1, 't1'), start(2, 't1')], true, [], [], { announceTurns });
+    await append([last]);
+    expect(region(w).textContent).toBe('');
+  });
+
+  it('stays quiet for a chat whose reply had finished before it was opened', async () => {
+    const { w } = await boot([ask(1, 't1'), start(2, 't1'), end(3, 't1')], true, [], [], { announceTurns: true });
+    expect(region(w).textContent).toBe('');
+  });
+});
+
+describe('bookmarked answers', () => {
+  const chat = '6ad337fe-47a4-83ed-a21f-c2e24d5829a4';
+  const replyId = '2b06482d-0dc6-4847-bf7a-2e1a0f671e89';
+  const ask: SessionEvent = { kind: 'user_message', seq: 1, origin: 1, time: T0, source: 'extension', turnId: 'done-turn', messageId: 'ask', message: text('Plan the release') };
+  const reply: SessionEvent = { kind: 'assistant_message', seq: 2, time: T0 + 1_000, source: 'extension', turnId: 'done-turn', messageId: replyId, message: text('**Tag first**, then build.\n\nMore detail.'), final: true, state: 'final' };
+  const end: SessionEvent = { seq: 3, time: T0 + 2_000, source: 'extension', kind: 'turn_end', turnId: 'done-turn', outcome: 'completed' };
+  const mark = { messageId: replyId, excerpt: 'Tag first, then build.', messageTime: T0 + 1_000, at: T0 + 5_000 };
+
+  it('bookmarks an answer, lists it in the header and jumps back to it', async () => {
+    const { w } = await boot([ask, reply, end], true, [], [], { summary: { conversationId: chat } });
+    const api = (w as any).api;
+    api.setBookmark = vi.fn(async (_id: string, _messageId: string, _excerpt: string, _time: number, on: boolean) => ({ ok: true, data: on ? [mark] : [] }));
+    api.locateMessage = vi.fn(async () => ({ ok: true, data: { seq: 2, kind: 'assistant_message', messageId: replyId, position: 2 } }));
+    const header = w.document.getElementById('chatBookmarks') as HTMLButtonElement;
+    const toggle = w.document.querySelector<HTMLButtonElement>('.answer-actions .answer-bookmark')!;
+    expect(header.hidden).toBe(true);
+    expect(toggle.getAttribute('aria-pressed')).toBe('false');
+    expect(toggle.getAttribute('aria-label')).toBe('Bookmark answer');
+
+    toggle.click(); await settle();
+    expect(api.setBookmark).toHaveBeenCalledWith(summary([]).id, replyId, 'Tag first, then build.', T0 + 1_000, true);
+    expect(toggle.getAttribute('aria-pressed')).toBe('true');
+    expect(toggle.getAttribute('aria-label')).toBe('Remove bookmark');
+    expect(header.hidden).toBe(false);
+    expect(header.textContent!.trim()).toBe('1');
+    expect(header.getAttribute('aria-label')).toBe('1 bookmark in this chat');
+
+    header.click(); await settle();
+    expect(header.getAttribute('aria-expanded')).toBe('true');
+    const item = w.document.querySelector<HTMLButtonElement>('[data-row-action="bookmark"]')!;
+    expect(item.textContent).toContain('Tag first, then build.');
+    expect(item.closest('.row-menu')!.classList.contains('is-wide')).toBe(true);
+    expect(item.querySelector('.row-menu-hint')!.textContent).not.toBe('');
+    item.click(); await settle();
+    expect(api.locateMessage).toHaveBeenCalledWith(summary([]).id, replyId);
+    expect(header.getAttribute('aria-expanded')).toBe('false');
+
+    toggle.click(); await settle();
+    expect(api.setBookmark).toHaveBeenLastCalledWith(summary([]).id, replyId, 'Tag first, then build.', T0 + 1_000, false);
+    expect(toggle.getAttribute('aria-pressed')).toBe('false');
+    expect(header.hidden).toBe(true);
+  });
+
+  it('bookmarks an answer whose first paragraph is very long, with a short excerpt', async () => {
+    const long: SessionEvent = { ...reply, message: text(`${'word '.repeat(1_200)}end.`) };
+    const { w } = await boot([ask, long, end], true, [], [], { summary: { conversationId: chat } });
+    const api = (w as any).api;
+    api.setBookmark = vi.fn(async (_id: string, _messageId: string, _excerpt: string, _time: number, on: boolean) => ({ ok: true, data: on ? [mark] : [] }));
+    w.document.querySelector<HTMLButtonElement>('.answer-actions .answer-bookmark')!.click(); await settle();
+    const excerpt = api.setBookmark.mock.calls[0]![2] as string;
+    expect(excerpt.length).toBeLessThanOrEqual(BOOKMARK_EXCERPT_MAX);
+    expect(excerpt.startsWith('word word')).toBe(true);
+    expect(excerpt.endsWith('…')).toBe(true);
+  });
+
+  it('removes a bookmark whose answer is no longer in the chat when it is opened, never on a failed read', async () => {
+    // The answer's own button is gone with it, so the list is the only place left to remove it from.
+    const gone = { messageId: '7c1e0f9a-1d2b-4c3d-8e4f-5a6b7c8d9e0f', excerpt: 'An answer that is gone', messageTime: T0 + 500, at: T0 + 6_000 };
+    const { w } = await boot([ask, reply, end], true, [], [], { summary: { conversationId: chat } });
+    const api = (w as any).api;
+    api.listBookmarks = vi.fn(async () => ({ ok: true, data: [gone] }));
+    api.setBookmark = vi.fn(async () => ({ ok: true, data: [] }));
+    api.locateMessage = vi.fn(async () => ({ ok: false, error: 'The chat history could not be read' }));
+    w.document.getElementById('newChat')!.click(); await settle();
+    w.document.querySelector<HTMLElement>(`.sess[data-id="${summary([]).id}"]`)!.click(); await settle();
+    const header = w.document.getElementById('chatBookmarks') as HTMLButtonElement;
+    const open = async () => { header.click(); await settle(); w.document.querySelector<HTMLButtonElement>('[data-row-action="bookmark"]')!.click(); await settle(); };
+    // A history that could not be read says so and keeps the bookmark.
+    await open();
+    expect(api.setBookmark).not.toHaveBeenCalled();
+    expect(header.hidden).toBe(false);
+    // The answer is not in the recorded chat: its bookmark goes, and the person is told why.
+    api.locateMessage = vi.fn(async () => ({ ok: true, data: null }));
+    await open();
+    expect(api.setBookmark).toHaveBeenCalledWith(summary([]).id, gone.messageId, gone.excerpt, gone.messageTime, false);
+    expect(header.hidden).toBe(true);
+    expect(w.document.querySelector('.toast')!.textContent).toBe('This answer is no longer in the chat, so its bookmark was removed.');
+    // The hidden header button gives its focus to the message box rather than to nothing.
+    expect(w.document.activeElement).toBe(w.document.getElementById('chatInput'));
+  });
+
+  it('keeps a stale bookmark when removing it fails, and says nothing in another chat opened meanwhile', async () => {
+    const gone = { messageId: '7c1e0f9a-1d2b-4c3d-8e4f-5a6b7c8d9e0f', excerpt: 'An answer that is gone', messageTime: T0 + 500, at: T0 + 6_000 };
+    const { w } = await boot([ask, reply, end], true, [], [], { summary: { conversationId: chat } });
+    const api = (w as any).api;
+    api.listBookmarks = vi.fn(async () => ({ ok: true, data: [gone] }));
+    api.locateMessage = vi.fn(async () => ({ ok: true, data: null }));
+    w.document.getElementById('newChat')!.click(); await settle();
+    w.document.querySelector<HTMLElement>(`.sess[data-id="${summary([]).id}"]`)!.click(); await settle();
+    const header = w.document.getElementById('chatBookmarks') as HTMLButtonElement;
+    const open = async () => { header.click(); await settle(); w.document.querySelector<HTMLButtonElement>('[data-row-action="bookmark"]')!.click(); await settle(); };
+    // A removal that throws still ends with a message, and the bookmark stays listed.
+    api.setBookmark = vi.fn(async () => { throw new Error('disk gone'); });
+    await open();
+    expect(header.hidden).toBe(false);
+    expect(w.document.querySelector('.toast')!.textContent).toBe('This answer is no longer in the chat.');
+    w.document.querySelector('.toast')!.remove();
+    // The person opens a new chat while the removal is still on its way: no message there.
+    let finish!: (value: unknown) => void;
+    api.setBookmark = vi.fn(() => new Promise(resolve => { finish = resolve; }));
+    await open();
+    w.document.getElementById('newChat')!.click(); await settle();
+    finish({ ok: true, data: [] }); await settle();
+    expect(w.document.querySelector('.toast')).toBeNull();
+  });
+
+  it('shows a chat\'s saved bookmarks when it is opened', async () => {
+    const { w } = await boot([ask, reply, end], true, [], [], { summary: { conversationId: chat } });
+    const api = (w as any).api;
+    api.listBookmarks = vi.fn(async () => ({ ok: true, data: [mark] }));
+    // Open another view and come back: the chat loads its marks again.
+    w.document.getElementById('newChat')!.click(); await settle();
+    w.document.querySelector<HTMLElement>(`.sess[data-id="${summary([]).id}"]`)!.click(); await settle();
+    expect(api.listBookmarks).toHaveBeenCalledWith(summary([]).id);
+    expect((w.document.getElementById('chatBookmarks') as HTMLButtonElement).hidden).toBe(false);
+    expect(w.document.querySelector('.answer-actions .answer-bookmark')!.getAttribute('aria-pressed')).toBe('true');
+  });
+});
+
+describe('a formula in an answer', () => {
+  const answer = (seq: number, body: string): SessionEvent => ({
+    seq, origin: 1, time: T0, source: 'extension', kind: 'assistant_message', messageId: 'math-answer', message: text(body),
+    state: 'streaming', final: false });
+  const rightClick = (w: any, target: Element) => {
+    const event = new w.MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 40, clientY: 60 });
+    target.dispatchEvent(event);
+    return event.defaultPrevented;
+  };
+
+  it('copies its LaTeX source and its MathML from a right click, also on a block a later revision adds', async () => {
+    const tex = String.raw`x=\frac{-b\pm\sqrt{b^2-4ac}}{2a}`;
+    const first = ['Solve:', '', String.raw`\[`, tex, String.raw`\]`, '', String.raw`with \(a\neq 0\).`, '', 'More'].join('\n');
+    const { w, append } = await boot([answer(1, first)]);
+    const writeClipboard = vi.fn(async () => ({ ok: true, data: true }));
+    (w as any).api.writeClipboard = writeClipboard;
+    const display = w.document.querySelector('.ev-assistant_message .math-display')!;
+    // Anywhere in the drawing, not only on its outer box.
+    expect(rightClick(w, display.querySelector('.katex-html .mord')!)).toBe(true);
+    expect([...w.document.querySelectorAll<HTMLElement>('.row-menu .row-menu-item')].map(item => item.textContent)).toEqual(['Copy LaTeX', 'Copy MathML']);
+    menuItem(w, 'copy-latex').click();
+    await vi.waitFor(() => expect(writeClipboard).toHaveBeenLastCalledWith(tex));
+    expect(w.document.querySelector('.row-menu')).toBeNull();
+
+    rightClick(w, w.document.querySelector('.ev-assistant_message .math-inline')!);
+    menuItem(w, 'copy-mathml').click();
+    await vi.waitFor(() => expect(writeClipboard).toHaveBeenCalledTimes(2));
+    const mathml = String((writeClipboard.mock.calls as unknown as string[][])[1]![0]);
+    expect(mathml).toMatch(/^<math xmlns="http:\/\/www\.w3\.org\/1998\/Math\/MathML">/);
+    expect(mathml).toContain(String.raw`<annotation encoding="application/x-tex">a\neq 0</annotation>`);
+
+    await append([answer(2, [first, '', String.raw`\[`, String.raw`e^{i\pi}+1=0`, String.raw`\]`, '', 'End'].join('\n'))]);
+    rightClick(w, w.document.querySelectorAll('.ev-assistant_message .math-display')[1]!);
+    menuItem(w, 'copy-latex').click();
+    await vi.waitFor(() => expect(writeClipboard).toHaveBeenLastCalledWith(String.raw`e^{i\pi}+1=0`));
+  });
+
+  it('leaves a right click on prose, or on LaTeX it could not draw, without a formula menu', async () => {
+    const { w } = await boot([answer(1, String.raw`Plain words and \(\frac{1}{\) as written.`)]);
+    const paragraph = w.document.querySelector('.ev-assistant_message .msg.rich p')!;
+    expect(rightClick(w, paragraph)).toBe(false);
+    expect(rightClick(w, paragraph.querySelector('.math-inline.is-source')!)).toBe(false);
+    expect(w.document.querySelector('.row-menu')).toBeNull();
+  });
 });

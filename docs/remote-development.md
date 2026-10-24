@@ -9,6 +9,8 @@ ChatGPT → 一条 tunnel → Mac CoS Core → SSH 私有连接 → Linux CoS �
 
 CodexPro 是独立工具，不参与这条链路。远程项目不需要 Chat On Steroids Plugins 或额外的 Plugins tunnel。原有可选 Plugins、Desktop 功能仍保持独立。
 
+同步的新上游还提供直接 SSH/SFTP 项目，入口是“添加项目”菜单中的“Folder on a server (SSH)”。它使用系统 SSH 连接，不需要安装 CoS 执行服务。本文的“连接 Linux 开发机”入口继续使用已有执行服务、令牌与受管映射。两种连接按项目明确区分，已有项目 ID、会话与连接记录保持原有归属。
+
 ## 本地与远程并存，以及第三方插件
 
 执行位置属于会话的项目或插件自己的连接，不是整个应用的全局二选一开关。
@@ -29,7 +31,7 @@ Plugins 连接器也不影响本地或远程 Core 开发。缓存的工具数量
 
 ## Linux：构建和启动
 
-使用 Node 22.22.2 或与锁定依赖兼容的版本，在本 fork 的源码目录执行：
+使用 Node 22.23.4 或与锁定依赖兼容的版本，在本 fork 的源码目录执行：
 
 ```bash
 npm ci
@@ -100,7 +102,7 @@ Host my-dev
 - 断线不会回退到 Mac，也不会自动重发文件修改、补丁或命令。结果不明时先检查已有工作。
 - 已完成的后台输出保留在 Linux，按准确会话交付。丢失的传输回执只会导致输出重新提供，不会重跑命令。
 
-Files、Review 和手动终端仍是本机面板。远程项目操作通过 Core 聊天工具完成；需要手动交互终端时使用 SSH。
+对于 CoS 执行服务项目，Files、Review 和手动终端仍是本机面板，远程操作通过 Core 聊天工具完成。直接 SSH/SFTP 项目则沿用上游的远端 Files 浏览、预览和 SSH 终端；Files 界面不提供远端文件编辑，修改由 Core 工具完成。
 
 ## 本地开发和验证
 

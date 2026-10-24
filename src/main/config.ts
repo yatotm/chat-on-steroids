@@ -1,8 +1,10 @@
+import { DEFAULT_HELPER_CHAT_MODEL, SUPERSEDED_HELPER_CHAT_MODELS } from '../shared/chat-models.js';
 import { UI_LANGUAGES } from '../shared/ui-language.js';
-import { REASONING_EFFORTS } from '../shared/session.js';
+import { DEFAULT_RECORDING_STORAGE_GIB, REASONING_EFFORTS, RECORDING_STORAGE_LIMITS_GIB, type RecordingStorageLimitGiB } from '../shared/session.js';
 import { appearanceSchema } from './appearance-schema.js';
 import { BROWSER_BRIDGE_PORTS } from '../shared/browser-bridge.js';
 import { CONNECTOR_SUFFIX_MAX, CONNECTOR_SUFFIX_PATTERN } from '../shared/connector-names.js';
+import { CUSTOM_CONTINUE_MAX_CHARS } from '../shared/recovery.js';
 /**
  * Non-secret settings, stored as one small JSON file in the app's userData folder.
  * No database: there are at most a handful of roots and a dozen booleans.
@@ -42,7 +44,8 @@ import {
   SUPERSEDED_GOAL_SYSTEM_PROMPTS
 } from '../shared/goal.js';
 import { DEFAULT_HANDOFF_LENGTH, DEFAULT_HANDOFF_PROMPT, HANDOFF_LENGTHS, MAX_HANDOFF_PROMPT_CHARS } from '../shared/handoff.js';
-import { logError } from './logger.js';
+import { logError, logWarn } from './logger.js';
+import { APP_VERSION } from './version.js';
 import { RESERVED_ROOT_NAMES } from './sandbox.js';
 import { capabilitiesForPlatform } from './platform.js';
 import {
@@ -93,6 +96,11 @@ export const browserBridgePortSchema = z.union([z.literal('auto'), z.literal(BRO
  * and the size of what is attached.
  */
 const DEFAULT_CONTEXT_WINDOW = 400_000;
+/** Only the sizes Settings offers; anything else in a hand-edited file falls back to the default. */
+const recordingStorageLimit = z.number()
+  .refine(size => (RECORDING_STORAGE_LIMITS_GIB as readonly number[]).includes(size))
+  .transform(size => size as RecordingStorageLimitGiB);
+
 const DEFAULT_SESSIONS: SessionSettings = {
   record: true,
   retainDays: 0,
@@ -100,7 +108,8 @@ const DEFAULT_SESSIONS: SessionSettings = {
   // Derived, never typed. The Chat panel writes `limit = threshold × 4/3` on every save,
   // so a default that did not already satisfy that relation would be a state the UI cannot
   // produce: the red line would move the first time anyone opened the panel and saved.
-  limitTokens: Math.round((DEFAULT_CONTEXT_WINDOW * 4) / 3)
+  limitTokens: Math.round((DEFAULT_CONTEXT_WINDOW * 4) / 3),
+  storageLimitGiB: DEFAULT_RECORDING_STORAGE_GIB
 };
 
 /**
@@ -145,7 +154,7 @@ const DEFAULT_GOAL: GoalSettings = {
   loopBackend: 'chatgpt',
   impulseMinutes: 0,
   includeToolCalls: false,
-  helperModel: 'gpt-5.6-sol',
+  helperModel: DEFAULT_HELPER_CHAT_MODEL,
   helperReasoning: 'high',
   enabled: false,
   // The mode a fresh install runs the moment somebody flips the switch. Goal, because it is
@@ -176,9 +185,13 @@ const DEFAULT_MULTI_AGENT: MultiAgentSettings = {
   // Off: waiting for a run's own workers before its next automatic step is a deliberate choice.
   // A chat that delegated nothing, and a chat with no run, never wait either way.
   waitForSubAgents: false,
+  // Off by default on both fresh and migrated installs: Git workspace creation is opt-in.
+  autoWorktrees: false,
   // Off: ending an OS process is a real side effect even though the worker identity survives.
   // The user must opt in before sleeping-worker runtime maintenance can terminate anything.
-  endSleepingWorkerProcesses: false
+  endSleepingWorkerProcesses: false,
+  // Off: archiving changes the user's ChatGPT chat list, so it is opt-in (#1460).
+  archiveWorkerChats: false
 };
 /** Fresh-install exposure. Kept separate from migration defaults on purpose. */
 const ALL_FIRST_LAUNCH_CAPABILITIES: Capabilities = Object.fromEntries(
@@ -204,7 +217,13 @@ const rootSchema = z.object({
     .min(1)
     .max(32)
     .regex(/^[a-z0-9][a-z0-9._-]*$/, 'Root names are lowercase letters, digits, dot, dash, underscore'),
-  path: z.string().min(2).max(4096)
+  path: z.string().min(2).max(4096),
+  // A folder on a server (#1469): the same address rules as parseRemote, and an absolute path.
+  remote: z.object({
+    host: z.string().min(1).max(255).regex(/^(?:[A-Za-z0-9_][A-Za-z0-9._-]*@)?(?:[A-Za-z0-9_][A-Za-z0-9._-]*|[0-9A-Fa-f:.]+)$/),
+    port: z.number().int().min(1).max(65535).optional(),
+    path: z.string().min(1).max(4096).regex(/^\//)
+  }).optional()
 });
 
 /**
@@ -271,7 +290,7 @@ const capabilitiesSchema = z
  * honour in front of the model.
  */
 export const MAX_MCP_INSTRUCTIONS_CHARS = 4000;
-const DEFAULT_MCP = { instructions: '' } as const;
+const DEFAULT_MCP = { instructions: '', persistentUrls: false } as const;
 /** Off for fresh installs and for every config written before the switches existed. */
 const DEFAULT_CONTROL_API = { enabled: false, allowActions: false } as const;
 const DEFAULT_COMMAND_ALLOWLIST = { enabled: false, mode: 'allow', rules: [] } as const;
@@ -320,28 +339,52 @@ const configSchema = z.object({
     defaultChatModel: z.string().trim().min(1).max(80).optional().catch(undefined),
     defaultChatReasoning: z.enum(REASONING_EFFORTS).optional().catch(undefined),
     chatBrowser: z.enum(CHAT_BROWSERS).optional().default('chrome'),
+    /** Where a minimized built-in browser window goes. */
+    cosBrowserMinimize: z.enum(['taskbar', 'tray']).optional().default('taskbar'),
     developerMode: z.boolean().optional(),
     playfulStatus: z.boolean().optional(),
+    playfulContinue: z.boolean().optional(),
+    announceTurns: z.boolean().optional(),
+    // Empty, too long or damaged falls back to the built-in Continue phrases.
+    customContinue: z.string().trim().min(1).max(CUSTOM_CONTINUE_MAX_CHARS).optional().catch(undefined),
     /** Keep the chat at its end while it grows, in the app and on ChatGPT, until the reader scrolls up. */
     followOutput: z.boolean().optional().default(true),
     mentionCore: z.boolean().optional().default(true),
+    mentionPlugins: z.boolean().optional().default(false),
     language: z.enum(UI_LANGUAGES).optional(),
+    // The version this install last started as; What's New shows once per real update (#1172).
+    lastSeenVersion: z.string().trim().min(1).max(40).optional().catch(undefined),
     browserPreferences: z.object({ overwrite: z.boolean(), durations: z.boolean() }).strict().optional(),
     cosBrowserTrayHint: z.boolean().optional(),
     finishTool: z.boolean().optional(),
     planBackend: z.enum(['chatgpt', 'api']).optional(),
     finishAction: z.enum(['notify', 'goal']).optional(),
+    finishHoldOnStop: z.boolean().optional(),
     finishLeadMinutes: z.number().int().min(3).max(5).optional(),
     backgroundChats: z.boolean().optional().default(true),
+    backgroundPlacement: z.enum(['window', 'group']).optional().default('window').catch('window'),
+    followUp: z.enum(['steer', 'queue']).optional().default('steer').catch('steer'),
+    enterSends: z.boolean().optional().default(true),
     browserBridgePort: browserBridgePortSchema.optional().default('auto'),
     browserOnly: z.boolean().optional().default(false),
     autoRefreshPlugins: z.boolean().optional().default(false),
+    autoRefreshPluginsAsked: z.boolean().optional().default(false),
     autoSelectSkills: z.boolean().optional().default(false),
     tabsToKeepOpen: z.number().int().min(1).max(50).optional(),
     minimizeToTray: z.boolean(),
     autoConnect: z.boolean(),
     startAtLogin: z.boolean().optional().default(false),
+    turnNotifications: z.boolean().optional().default(true),
+    // #1402: a fresh turn after this many minutes of one (0 = off). A malformed value keeps the default.
+    rotateTurnMinutes: z.number().int().min(0).max(120).optional().default(30).catch(30),
+    rotateStopFallback: z.boolean().optional().default(false).catch(false),
+    // Reading Codex's and Claude Code's own logs for the Usage page (#482). Missing means on.
+    localAppUsage: z.boolean().optional().default(true),
+    keepAwake: z.boolean().optional().default(true),
+    keepScreenAwake: z.boolean().optional().default(false),
     privacyScreenshots: z.boolean().optional().default(false),
+    // Masking credentials in tool output before ChatGPT sees them (#1797). On unless turned off.
+    secretsShield: z.boolean().optional().default(true),
     // Dark is the design the app is drawn for, and a config written before the theme
     // existed has no stored answer to override — so it is the default rather than the
     // fallback. An explicit `light` is somebody's own choice and is never touched.
@@ -361,14 +404,15 @@ const configSchema = z.object({
         .max(4_000_000)
         .optional()
         .default(DEFAULT_SESSIONS.advisoryTokens),
-      limitTokens: z.number().int().min(10_000).max(4_000_000).optional().default(DEFAULT_SESSIONS.limitTokens)
+      limitTokens: z.number().int().min(10_000).max(4_000_000).optional().default(DEFAULT_SESSIONS.limitTokens),
+      storageLimitGiB: recordingStorageLimit.catch(DEFAULT_RECORDING_STORAGE_GIB)
     })
     // `record` and `retainDays` remain readable for old configs and wire compatibility, but
     // they are no longer user choices. Normalizing here covers disk load, renderer saves,
     // extension/config writers and direct updateConfig callers at one boundary.
     .transform((sessions) => ({ ...sessions, record: true, retainDays: 0 }))
     .optional()
-    .default({ ...DEFAULT_SESSIONS }),
+    .default({ ...DEFAULT_SESSIONS, storageLimitGiB: DEFAULT_RECORDING_STORAGE_GIB }),
   compaction: z
     .object({
       auto: z.boolean().optional().default(DEFAULT_COMPACTION.auto),
@@ -406,7 +450,9 @@ const configSchema = z.object({
       strictChatAllowlist: z.boolean().optional().default(DEFAULT_MULTI_AGENT.strictChatAllowlist ?? false),
       recoverAgentTabs: z.boolean().optional().default(DEFAULT_MULTI_AGENT.recoverAgentTabs),
       waitForSubAgents: z.boolean().optional().default(DEFAULT_MULTI_AGENT.waitForSubAgents ?? false),
-      endSleepingWorkerProcesses: z.boolean().optional().default(DEFAULT_MULTI_AGENT.endSleepingWorkerProcesses ?? false)
+      autoWorktrees: z.boolean().optional().default(DEFAULT_MULTI_AGENT.autoWorktrees ?? false),
+      endSleepingWorkerProcesses: z.boolean().optional().default(DEFAULT_MULTI_AGENT.endSleepingWorkerProcesses ?? false),
+      archiveWorkerChats: z.boolean().optional().default(DEFAULT_MULTI_AGENT.archiveWorkerChats ?? false)
     })
     .optional()
     .default({
@@ -417,7 +463,9 @@ const configSchema = z.object({
       strictChatAllowlist: DEFAULT_MULTI_AGENT.strictChatAllowlist ?? false,
       recoverAgentTabs: DEFAULT_MULTI_AGENT.recoverAgentTabs,
       waitForSubAgents: DEFAULT_MULTI_AGENT.waitForSubAgents ?? false,
-      endSleepingWorkerProcesses: DEFAULT_MULTI_AGENT.endSleepingWorkerProcesses ?? false
+      autoWorktrees: DEFAULT_MULTI_AGENT.autoWorktrees ?? false,
+      endSleepingWorkerProcesses: DEFAULT_MULTI_AGENT.endSleepingWorkerProcesses ?? false,
+      archiveWorkerChats: DEFAULT_MULTI_AGENT.archiveWorkerChats ?? false
     }),
   // An empty model id is repaired rather than rejected: the id is free text from a
   // provider listing that changes weekly, and a config that lost it must still load with
@@ -429,7 +477,7 @@ const configSchema = z.object({
       enabled: z.boolean().optional().default(DEFAULT_GOAL.enabled),
       backend: z.enum(['api', 'chatgpt', 'templates']).optional().default('chatgpt'),
       loopBackend: z.enum(['api', 'chatgpt']).optional().default('chatgpt'),
-      helperModel: z.string().trim().min(1).max(80).optional().default('gpt-5.6-sol').catch('gpt-5.6-sol'),
+      helperModel: z.string().trim().min(1).max(80).optional().default(DEFAULT_HELPER_CHAT_MODEL).catch(DEFAULT_HELPER_CHAT_MODEL),
       helperReasoning: z.enum(REASONING_EFFORTS).optional().default('high').catch('high'),
       // Repaired rather than rejected for the same reason `reasoning` below is: a config
       // written by a version that knows one more mode than this one must not send every root
@@ -496,7 +544,7 @@ const configSchema = z.object({
         .catch(DEFAULT_GOAL.loopPrompt)
     })
     .optional()
-    .default({ ...DEFAULT_GOAL, backend: 'chatgpt', loopBackend: 'chatgpt', impulseMinutes: 0, includeToolCalls: false, helperModel: 'gpt-5.6-sol', helperReasoning: 'high' }),
+    .default({ ...DEFAULT_GOAL, backend: 'chatgpt', loopBackend: 'chatgpt', impulseMinutes: 0, includeToolCalls: false, helperModel: DEFAULT_HELPER_CHAT_MODEL, helperReasoning: 'high' }),
   mcp: z
     .object({
       // Repaired rather than rejected, like the Goal prompts above: this is free text a person
@@ -507,7 +555,9 @@ const configSchema = z.object({
         .optional()
         .default(DEFAULT_MCP.instructions)
         .transform((value) => value.slice(0, MAX_MCP_INSTRUCTIONS_CHARS).trim())
-        .catch(DEFAULT_MCP.instructions)
+        .catch(DEFAULT_MCP.instructions),
+      // Opt-in only: a malformed value repairs to off, the rotating default.
+      persistentUrls: z.boolean().optional().default(false).catch(false)
     })
     .optional()
     .default({ ...DEFAULT_MCP })
@@ -547,7 +597,10 @@ export function defaultConfig(platform: NodeJS.Platform = process.platform, rele
     readOnly: false,
     commandAllowlist: { ...DEFAULT_COMMAND_ALLOWLIST, rules: [] },
     tunnel: { kind: 'openai', tunnelId: '', desktopTunnelId: '', binaryPath: '' },
-    ui: { minimizeToTray: true, autoConnect: false, startAtLogin: false, privacyScreenshots: false, theme: 'dark', autoRefreshPlugins: false, autoSelectSkills: false, backgroundChats: true, browserBridgePort: 'auto', autoContinue: true, followOutput: true, mentionCore: true,
+    // Fresh installs refresh changed connector tools on their own: a permission chosen in Setup
+    // changes the tool list, and nothing else tells a new user to refresh the plugin in ChatGPT.
+    // Older configs keep the schema default (off).
+    ui: { minimizeToTray: true, autoConnect: false, startAtLogin: false, keepAwake: true, keepScreenAwake: false, cosBrowserMinimize: 'taskbar', turnNotifications: true, rotateTurnMinutes: 30, rotateStopFallback: false, localAppUsage: true, privacyScreenshots: false, secretsShield: true, theme: 'dark', autoRefreshPlugins: true, autoSelectSkills: false, backgroundChats: true, backgroundPlacement: 'window', followUp: 'steer', enterSends: true, browserBridgePort: 'auto', autoContinue: true, followOutput: true, mentionCore: true, mentionPlugins: false,
       // The built-in browser is opt-in: Chrome with the companion stays the default for new and
       // existing installs alike, and the built-in one runs only once someone chooses it.
       chatBrowser: 'chrome' },
@@ -575,7 +628,7 @@ function conservativeRecoveryConfig(): Config {
     readOnly: true,
     multiAgent: { ...DEFAULT_MULTI_AGENT },
     // Damage is not a choice of browser either: keep the one every older config reads as.
-    ui: { ...defaultConfig().ui, autoContinue: false, chatBrowser: 'chrome' },
+    ui: { ...defaultConfig().ui, autoContinue: false, autoRefreshPlugins: false, chatBrowser: 'chrome' },
     // A config file that could not be trusted is not consent to have a second model typing
     // into the user's chat, whatever the unreadable file said.
     goal: { ...DEFAULT_GOAL }
@@ -601,11 +654,21 @@ function adoptCurrentGoalPrompt(config: Config): Config {
   if (SUPERSEDED_GOAL_LOOP_SYSTEM_PROMPTS.includes(goal.loopPrompt)) {
     goal.loopPrompt = DEFAULT_GOAL_LOOP_SYSTEM_PROMPT;
   }
+  // The same fence for the helper model: only the exact shipped value moves. GPT-5.6 Sol is no longer
+  // in ChatGPT's catalog, so a config still holding it fell back to ChatGPT's selection on every decision.
+  if (goal.helperModel && SUPERSEDED_HELPER_CHAT_MODELS.includes(goal.helperModel)) goal.helperModel = DEFAULT_HELPER_CHAT_MODEL;
   return { ...config, goal };
 }
 
 let configPath = '';
 let current: Config = defaultConfig();
+// This run started from conservativeRecoveryConfig. Setup says so beside its access choice, because
+// read-only with no reason given reads as a broken app. Lasts until read-only is switched off.
+let recovered = false;
+
+export function settingsRecovered(): boolean {
+  return recovered;
+}
 // Every UI mutation ultimately lands in the same tiny JSON file. Keep those
 // read-modify-write transactions strictly ordered so two fast checkbox/root changes
 // cannot race on config.json.tmp or overwrite each other's newer state.
@@ -615,13 +678,70 @@ export function initConfigPath(userDataDir: string): void {
   configPath = path.join(userDataDir, 'config.json');
 }
 
-export async function loadConfig(): Promise<Config> {
+/**
+ * Keeps an unusable settings file before recovery defaults can replace it.
+ *
+ * The next save after a failed read writes the recovery settings over the file. Found on the
+ * Windows test VM (2026-10-06): a settings file with a byte-order mark lost its folders and tunnel
+ * that way within a second. The copy keeps the original bytes next to the file; failing to write it
+ * is logged and never blocks starting.
+ */
+async function keepUnreadable(raw: string): Promise<void> {
+  const copy = `${configPath}.unreadable-${new Date().toISOString().replace(/[:.]/g, '-')}`;
   try {
-    const raw = await fs.readFile(configPath, 'utf8');
-    const parsed = configSchema.safeParse(JSON.parse(raw));
+    await fs.writeFile(copy, raw, 'utf8');
+    logError(`The settings file could not be used; its original was kept as ${path.basename(copy)}`);
+  } catch (error) {
+    logError(`Could not keep a copy of the unusable settings file: ${(error as Error).message}`);
+  }
+}
+
+/**
+ * Drops the preferences this version cannot read and parses again (2.1.39). A newer app may save a
+ * value an older one does not know — 2.1.38's Firefox as the ChatGPT browser made 2.1.37 throw the
+ * whole file away, folders and tunnel included (VM, 2026-10-15). Only keys under `ui` are dropped,
+ * each falling back to its default; anything about folders, permissions or the tunnel still sends
+ * the file to the conservative recovery below.
+ */
+function withoutUnreadablePreferences(value: unknown): { config: Config; dropped: string[] } | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const draft = structuredClone(value) as Record<string, unknown>;
+  const dropped: string[] = [];
+  for (let pass = 0; pass < 8; pass++) {
+    const parsed = configSchema.safeParse(draft);
+    if (parsed.success) return dropped.length ? { config: parsed.data, dropped } : null;
+    let progressed = false;
+    for (const issue of parsed.error.issues) {
+      const [section, key] = issue.path;
+      const ui = draft.ui;
+      if (section !== 'ui' || typeof key !== 'string' || !ui || typeof ui !== 'object' || Array.isArray(ui) || !(key in ui)) return null;
+      delete (ui as Record<string, unknown>)[key];
+      dropped.push(`ui.${key}`);
+      progressed = true;
+    }
+    if (!progressed) return null;
+  }
+  return null;
+}
+
+export async function loadConfig(): Promise<Config> {
+  let raw: string | null = null;
+  try {
+    raw = await fs.readFile(configPath, 'utf8');
+    // Windows PowerShell 5.1 and older Notepad start UTF-8 files with a byte-order mark; it is not JSON.
+    const value: unknown = JSON.parse(raw.replace(/^\uFEFF/, ''));
+    let parsed = configSchema.safeParse(value);
+    const salvaged = parsed.success ? null : withoutUnreadablePreferences(value);
+    if (salvaged) {
+      logWarn(`Settings kept; these preferences held values this version does not know and use their defaults: ${salvaged.dropped.join(', ')}`);
+      await keepUnreadable(raw);
+      parsed = { success: true, data: salvaged.config } as typeof parsed;
+    }
     if (!parsed.success) {
       logError('Settings file was invalid and has been reset to defaults');
+      await keepUnreadable(raw);
       current = conservativeRecoveryConfig();
+      recovered = true;
     } else {
       current = adoptCurrentGoalPrompt(adoptWiderWindow(adoptAutoCompaction(recalibrateTokens(parsed.data))));
       // Duplicate root names would make a virtual path ambiguous.
@@ -636,9 +756,12 @@ export async function loadConfig(): Promise<Config> {
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
       logError(`Could not read settings: ${(err as Error).message}`);
+      if (raw !== null) await keepUnreadable(raw);
       current = conservativeRecoveryConfig();
+      recovered = true;
     } else {
-      current = defaultConfig();
+      // A fresh install has nothing new to show: it records its own version before anything can.
+      current = { ...defaultConfig(), ui: { ...defaultConfig().ui, lastSeenVersion: APP_VERSION } };
     }
   }
   return current;
@@ -739,6 +862,7 @@ async function persistConfig(parsed: Config): Promise<Config> {
   // Only publish the new in-memory state after the durable write succeeded. A disk
   // error must not leave the UI believing settings were saved when they were not.
   current = parsed;
+  if (!parsed.readOnly) recovered = false;
   return current;
 }
 

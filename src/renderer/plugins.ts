@@ -1,10 +1,11 @@
-import { ui, t } from './i18n.js';
+import { ui, t, tn } from './i18n.js';
 import type { AppState } from '../shared/types.js';
 import type { SettingsPatch } from '../preload/index.js';
 import type { PluginSnapshot, PluginView, PluginCatalogEntry, PluginSource } from '../shared/plugins.js';
 import { pluginExecutionHost } from '../shared/plugins.js';
 import { connectorConfigured, connectorCreated } from '../shared/connector-setup.js';
 import { $, disclosureChevron, el, run, toast } from './dom.js';
+import { paintSharedTunnel } from './tunnel-warning.js';
 
 let snapshot: PluginSnapshot = { plugins: [], catalog: [], schemaRevision: 0 };
 let epoch = 0;
@@ -53,8 +54,8 @@ async function mutate(work: ReturnType<typeof window.api.pluginsSnapshot>, notif
   if (!result) return false;
   if (own === epoch) { snapshot = result; renderInstalled(); }
   if (notify) toast(pluginsConfigured()
-    ? t("Plugin settings saved. Refresh the {0} connector in ChatGPT to update its tools.", [pluginsConnectorName()])
-    : t("Plugin settings saved. Enable the optional Plugins connector when you want to use these tools in ChatGPT."));
+    ? t("Plugin settings saved. Refresh {0} in ChatGPT to update its tools.", [pluginsConnectorName()])
+    : t("Plugin settings saved. Enable the optional Plugins plugin when you want to use these tools in ChatGPT."));
   return true;
 }
 /** This computer's Plugins connector name, which carries its suffix when one is set. */
@@ -77,23 +78,23 @@ export function applyPluginsState(next: AppState): void {
   const contacted = !!surface && connectorCreated(surface);
   const configured = pluginsConfigured();
   $('pluginsSetupTitle').closest('.plugin-connection')!.classList.toggle('is-configured', configured);
-  ui($('pluginsSetupTitle'), 'textContent', () => configured ? t("Your Plugins connector") : t("Optional third-party plugins"));
+  ui($('pluginsSetupTitle'), 'textContent', () => configured ? t("Chat On Steroids Plugins in ChatGPT") : t("Optional third-party plugins"));
   ui($('pluginsSetupHint'), 'textContent', () => configured
-    ? t("Your enabled plugins share one connector in ChatGPT. Manage its connection here.")
+    ? t("Your enabled plugins reach ChatGPT through one plugin there: Chat On Steroids Plugins. Manage its connection here.")
     : t("Local and remote project files and commands use Core. To use the third-party tools below in ChatGPT, configure {0} separately.", [pluginsConnectorName()]));
   ui($('pluginsSetupLink'), 'textContent', () => configured ? t("Plugin setup") : t("Enable third-party plugins"));
   ui($('pluginsRefreshName'), 'textContent', pluginsConnectorName);
   $('pluginsSetupLink').classList.remove('btn-solid');
   ui(status, 'textContent', () => !configured ? t("Optional · not enabled") : surface?.state === 'live'
-    ? contacted ? t("Connected to ChatGPT") : t("Connector online · waiting for ChatGPT")
-    : surface?.state === 'error' ? t('Plugins connector error') : surface?.state === 'starting' ? t('Connecting…') : t("Plugins connector offline"));
+    ? contacted ? t("Connected to ChatGPT") : t("Plugin online · waiting for ChatGPT")
+    : surface?.state === 'error' ? t('Plugins connection error') : surface?.state === 'starting' ? t('Connecting…') : t("Chat On Steroids Plugins offline"));
   status.dataset.live = String(surface?.state === 'live');
   status.dataset.error = String(configured && surface?.state === 'error');
   ui(status, 'title', () => configured ? t(surface?.detail ?? '') : '');
   $('pluginsRefreshGuide').hidden = !configured;
   const setupStatus = document.getElementById('pluginSetupStatus');
   if (setupStatus) ui(setupStatus, 'textContent', () => surface?.state === 'live'
-    ? t("{0} tools available · {1}", [surface.tools.length, surface.lastRequestAt ? t("Connected to ChatGPT") : t("Ready to add in ChatGPT")])
+    ? tn("{0} tool available · {1}", "{0} tools available · {1}", surface.tools.length, [surface.tools.length, surface.lastRequestAt ? t("Connected to ChatGPT") : t("Ready to add in ChatGPT")])
     : surface?.state === 'error' ? t(surface.detail) : t("Save your connection below to make enabled plugins available in ChatGPT."));
 }
 function showConnection(): void {
@@ -101,7 +102,7 @@ function showConnection(): void {
   const { config, hasApiKey, status } = appState;
   const surface = status.surfaces.find(item => item.id === 'plugins');
   const { body } = dialog(() => t("Plugin setup"));
-  body.append(el('p', '', () => t("Connect once. Your enabled plugins share this connector in ChatGPT.")));
+  body.append(el('p', '', () => t("Connect once. Your enabled plugins share this one plugin in ChatGPT.")));
   const connectionStatus = el('p', 'plugin-setup-status'); connectionStatus.id = 'pluginSetupStatus'; body.append(connectionStatus);
   const copy = (label: string, value: string) => {
     const input = field(body, label, value); input.readOnly = true;
@@ -113,17 +114,21 @@ function showConnection(): void {
     body.append(button(() => t("Open Tunnels"), async () => { await run(window.api.openLink('https://platform.openai.com/settings/organization/tunnels')); }));
     tunnel = field(body, () => t("Plugins tunnel ID"), config.tunnel.pluginsTunnelId ?? '', false, () => t("Create a dedicated tunnel in the same workspace you use in ChatGPT."));
     tunnel.id = 'pluginsTunnelId'; tunnel.spellcheck = false; tunnel.autocomplete = 'off';
+    const shared = el('p', 'hint is-required'); shared.id = 'pluginsTunnelIdShared'; shared.setAttribute('role', 'status');
+    tunnel.closest('label')!.after(shared);
+    const paintShared = () => paintSharedTunnel(shared, { ...config.tunnel, pluginsTunnelId: tunnel!.value }, 'plugins');
+    tunnel.addEventListener('input', paintShared); paintShared();
     if (hasApiKey) body.append(el('p', 'hint', () => t("Your stored tunnel API key is already available.")));
-    else key = field(body, () => t("Tunnel API key"), '', true, () => t("Use a restricted key with Tunnels: Read and Tunnels: Use. It is stored securely and shared with your other connectors."));
+    else key = field(body, () => t("Tunnel API key"), '', true, () => t("Use a restricted key with Tunnels: Read and Tunnels: Use. It is stored securely and shared with Core and Desktop."));
   }
   // Values needed for ChatGPT setup stay copyable; tool lists belong to each plugin.
-  copy(t("Connector name"), surface?.connectorName ?? 'Chat On Steroids Plugins');
+  copy(t("Name in ChatGPT"), surface?.connectorName ?? 'Chat On Steroids Plugins');
   copy(t("Description"), surface?.description ?? 'Tools from your enabled Chat On Steroids plugins.');
   const url = surface?.publicUrl ?? (config.tunnel.kind === 'manual' ? surface?.localUrl : null);
   if (url) copy(t("MCP server URL"), url);
   body.append(el('p', 'hint', () => config.tunnel.kind === 'openai'
-    ? t("In ChatGPT, add this connector with Tunnel and select your Plugins tunnel. Refresh its tools after adding or changing plugins.")
-    : t("In ChatGPT, add this connector using its MCP server URL. Refresh its tools after adding or changing plugins.")));
+    ? t("In ChatGPT, add this as a plugin with Tunnel and select your Plugins tunnel. Refresh it after adding or changing plugins.")
+    : t("In ChatGPT, add this as a plugin using its MCP server URL. Refresh it after adding or changing plugins.")));
   const actions = el('div', 'plugin-setup-actions');
   actions.append(button(() => t("Open ChatGPT plugins"), async () => { await run(window.api.openLink('https://chatgpt.com/plugins')); }), button(() => t("Save & connect"), async () => {
     if (!appState) return;
@@ -142,7 +147,7 @@ function showConnection(): void {
 }
 function renderInstalled(): void {
   const list = $('pluginsInstalled');
-  list.replaceChildren(); ui($('pluginsCount'), 'textContent', () => String(snapshot.plugins.length));
+  list.replaceChildren(); ui($('pluginsCount'), 'textContent', () => tn("{0} installed", "{0} installed", snapshot.plugins.length));
   const query = $<HTMLInputElement>('pluginsSearch').value.trim().toLowerCase();
   const matches = (name: string, description = '') => `${name} ${description}`.toLowerCase().includes(query);
   if (!snapshot.plugins.length) {
@@ -161,7 +166,7 @@ function renderInstalled(): void {
     const available = plugin.enabled && plugin.status === 'ready' ? plugin.tools.filter(tool => tool.enabled && tool.published !== false).length : 0;
     const foot = el('div', 'plugin-card-foot');
     foot.append(el('span', `pill${plugin.status === 'ready' && plugin.tools.length ? ' is-live' : plugin.status === 'error' ? ' is-error' : ''}`, status));
-    if (plugin.error) foot.append(el('span', 'plugin-card-error', plugin.error));
+    if (plugin.error) foot.append(el('span', 'plugin-card-error', () => t(plugin.error!)));
     foot.append(el('span', 'plugin-tool-count', () => t('{0} tools available · {1} discovered', [available, plugin.tools.length])));
     title.append(el('p', 'muted plugin-runtime', () => executionDescription(plugin.source)), foot); open.append(art(recipe?.icon ?? plugin.catalogId ?? 'custom'), title);
     const menu = document.createElement('details'); menu.className = 'plugin-menu';
@@ -201,7 +206,7 @@ function renderCatalog(parent: HTMLElement, query = ''): void {
 }
 function renderPluginTools(parent: HTMLElement, plugin: PluginView): void {
     const published = plugin.tools.filter(tool => tool.published).length;
-    const publication = plugin.tools.some(tool => tool.published !== undefined) ? t(" · {0} available in ChatGPT", [published]) : '';
+    const publication = plugin.tools.some(tool => tool.published !== undefined) ? tn(" · {0} available in ChatGPT", " · {0} available in ChatGPT", published) : '';
     parent.replaceChildren();
     if (plugin.status === 'needs-auth' || plugin.status === 'authenticating') {
       const auth = el('div', 'plugin-auth');
@@ -212,7 +217,7 @@ function renderPluginTools(parent: HTMLElement, plugin: PluginView): void {
       parent.append(auth);
     }
     parent.append(el('h3', '', () => t("Tools")), el('p', 'plugin-tools-summary', () => t("{0}/{1} enabled{2} · This plugin only · Refresh ChatGPT after changes", [plugin.tools.filter(tool => tool.enabled).length, plugin.tools.length, publication])));
-    if (plugin.error) parent.append(el('p', 'plugin-error', plugin.error));
+    if (plugin.error) parent.append(el('p', 'plugin-error', () => t(plugin.error!)));
     const tools = el('div', 'plugin-tools');
     for (const tool of plugin.tools) {
       const row = el('label', 'plugin-tool'); const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.checked = tool.enabled; checkbox.disabled = !plugin.enabled;
@@ -240,7 +245,16 @@ function showPlugin(plugin: PluginView): void {
 }
 function showUninstall(plugin: PluginView): void {
   const { box, body } = dialog(() => t("Uninstall {0}?", [plugin.name]));
-  body.append(el('p', '', () => t("This stops its connection and deletes the installation, its CoS-managed local data and stored credentials. Back up any plugin data you need first. External application data is not removed.")), button(() => t("Uninstall plugin"), async () => { if (await mutate(window.api.pluginsUninstall(plugin.id))) box.close(); }, true));
+  // The same shape as removing a skill or a pet: Cancel first and focused, the destructive step last.
+  box.classList.add('pet-delete-dialog');
+  const actions = el('div', 'pet-delete-actions');
+  const cancel = el('button', 'btn btn-solid pet-delete-cancel', () => t('Cancel')) as HTMLButtonElement;
+  cancel.type = 'button'; cancel.addEventListener('click', () => box.close());
+  const uninstall = button(() => t("Uninstall plugin"), async () => { if (await mutate(window.api.pluginsUninstall(plugin.id))) box.close(); });
+  uninstall.classList.add('plugin-destructive', 'pet-delete-confirm');
+  actions.append(cancel, uninstall);
+  body.append(el('p', '', () => t("This stops its connection and deletes the installation, its CoS-managed local data and stored credentials. Back up any plugin data you need first. External application data is not removed.")), actions);
+  cancel.focus();
 }
 function showConfigure(plugin: PluginView): void {
   const { box, body } = dialog(() => t("Configure {0}", [plugin.name])); const config = new Map<string, HTMLInputElement>(); const secrets = new Map<string, HTMLInputElement>();
@@ -252,19 +266,31 @@ function showConfigure(plugin: PluginView): void {
   const source = field(body, () => t("Server configuration (JSON)"), JSON.stringify(plugin.source), false, () => t("Keep credentials in the secure fields, not in command arguments or URLs."));
   const extraConfig = field(body, () => t("Additional configuration (JSON object)"), '{}', false, () => t("Non-secret settings and environment variables only."));
   const extraKey = field(body, () => t("Additional credential name (optional)"), '', false, () => t("Environment variable for local servers; header name for remote servers.")); const extraValue = field(body, () => t("Additional credential value"), '', true);
-  body.append(button(() => t("Save and reconnect"), async () => {
+  const longestCall = field(body, () => t("Longest call (seconds)"), String(plugin.longestCallSeconds ?? 120), false, () => t("1–1800 seconds per call; default 120. Changing only this limit does not restart the plugin."));
+  longestCall.type = 'number'; longestCall.min = '1'; longestCall.max = '1800'; longestCall.step = '1';
+  body.append(button(() => t("Save"), async () => {
+    const longestCallSeconds = Number(longestCall.value);
+    if (!longestCall.value.trim() || !Number.isInteger(longestCallSeconds) || longestCallSeconds < 1 || longestCallSeconds > 1800) {
+      longestCall.focus(); throw new Error(t("Enter a whole number from 1 to 1800 seconds."));
+    }
     const credentials = Object.fromEntries([...secrets].filter(([, input]) => input.value).map(([key, input]) => [key, input.value]));
     if (extraKey.value.trim() && extraValue.value) credentials[extraKey.value.trim()] = extraValue.value;
     const additions: unknown = JSON.parse(extraConfig.value);
     if (!additions || typeof additions !== 'object' || Array.isArray(additions) || !Object.values(additions).every((value) => typeof value === 'string')) throw new Error(t("Additional configuration must be an object of string values."));
     const configuredSource = JSON.parse(source.value) as PluginSource;
-    if (await mutate(window.api.pluginsConfigure(plugin.id, { name: name.value,
-      ...(JSON.stringify(configuredSource) !== JSON.stringify(plugin.source) ? { source: configuredSource } : {}),
-      config: { ...Object.fromEntries([...config].map(([key, input]) => [key, input.value])), ...additions as Record<string,string> }, credentials }))) box.close();
+    const configuredValues = { ...Object.fromEntries([...config].map(([key, input]) => [key, input.value])), ...additions as Record<string,string> };
+    const sourceChanged = JSON.stringify(configuredSource) !== JSON.stringify(plugin.source);
+    const otherChanges = name.value !== plugin.name || sourceChanged || Object.keys(credentials).length > 0 ||
+      Object.entries(configuredValues).some(([key, value]) => value !== (plugin.config[key] ?? '') ||
+        (Object.hasOwn(additions, key) && !Object.hasOwn(plugin.config, key)));
+    const limitOnly = longestCallSeconds !== (plugin.longestCallSeconds ?? 120) && !otherChanges;
+    if (await mutate(window.api.pluginsConfigure(plugin.id, limitOnly ? { longestCallSeconds } : { name: name.value,
+      ...(sourceChanged ? { source: configuredSource } : {}),
+      config: configuredValues, credentials, longestCallSeconds }), !limitOnly)) box.close();
   }, true));
 }
 function showCatalog(): void {
-  const { body } = dialog(() => t("Add a plugin")); body.append(el('p', 'muted', () => t("Independent integrations, one shared connector. Review each plugin’s access and setup before installing.")));
+  const { body } = dialog(() => t("Add a plugin")); body.append(el('p', 'muted', () => t("Independent integrations, one shared plugin in ChatGPT. Review each plugin’s access and setup before installing.")));
   const grid = el('div', 'plugin-catalog'); grid.dataset.pluginCatalog = ''; renderCatalog(grid);
   body.append(grid, el('h3', '', () => t("Bring your own server"))); const custom = el('div', 'plugin-actions');
   custom.append(button(() => t("Import MCPB bundle"), async () => { const path = await run(window.api.pluginsImportBundle()); if (path) showCustom('mcpb', path); }), button(() => t("npm / Python / executable"), () => showCustom('npm')), button(() => t("Remote MCP URL"), () => showCustom('remote')), button(() => t("GitHub repository"), () => showCustom('github')));

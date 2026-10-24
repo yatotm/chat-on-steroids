@@ -40,6 +40,7 @@ interface Descriptor {
   hidden: number;
   localCount: number | null;
   answered: boolean;
+  own?: boolean;
 }
 
 // ------------------------------------------------------------------ fixtures
@@ -243,6 +244,7 @@ interface TurnCall {
 
 interface TurnEvidence {
   index: number;
+  sightings?: Array<{ requestId: string; appId: string; linkId: string | null; appName: string | null }>;
   turnId: string | null;
   conversationId?: string | null;
   conversationConflict?: boolean;
@@ -283,7 +285,8 @@ interface TurnFixture {
   viewItems?: any[];
   viewStatus?: string;
   /** A visible `.markdown` block: its text, or markup when the test is about the markup. */
-  rendered?: Array<string | { html: string; nativeId?: string; fiberProps?: Record<string, unknown>; fiber?: Fiber; staleMessageStamp?: string; pillFibers?: Fiber[] }>;
+  rendered?: Array<string | { html: string; nativeId?: string; selectedMessageId?: string; selectedConversationId?: string;
+    fiberProps?: Record<string, unknown>; fiber?: Fiber; staleMessageStamp?: string; pillFibers?: Fiber[] }>;
   activities?: Array<{ label: string; fiber: Fiber; staleThoughtStamp?: string; v5?: boolean }>;
   images?: Array<{ assetId: string; clones?: number }>;
   staleStamp?: string;
@@ -298,7 +301,9 @@ async function scan(
   turnSections: TurnFixture[] = [],
   repeatStableScan = false,
   /** This install's connector names, as the content script passes them with every ask. */
-  apps?: unknown
+  apps?: unknown,
+  /** This install's proven connector apps ({ surface, appId, linkId, name }), passed the same way. */
+  appIds?: unknown
 ): Promise<{
   rows: Descriptor[];
   version: number;
@@ -388,7 +393,13 @@ async function scan(
           if (entry.pillFibers?.[at]) (pill as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = entry.pillFibers[at];
         });
       }
-      section.append(block);
+      if (typeof entry !== 'string' && entry.selectedMessageId) {
+        const selection = document.createElement('div');
+        selection.setAttribute('data-chatgpt-selection-message-id', entry.selectedMessageId);
+        if (entry.selectedConversationId) selection.setAttribute('data-chatgpt-selection-conversation-id', entry.selectedConversationId);
+        selection.append(block);
+        section.append(selection);
+      } else section.append(block);
     }
     for (const entry of turn.activities ?? []) {
       const row = document.createElement(entry.v5 ? 'div' : 'span');
@@ -442,7 +453,7 @@ async function scan(
   // Dispatched rather than posted: jsdom's own postMessage does not set `source`, and the
   // helper refuses any message that did not come from this window.
   window.dispatchEvent(
-    new window.MessageEvent('message', { data: { source: 'clf-fiber-ask', nonce, ...(apps === undefined ? {} : { apps }) }, source: window })
+    new window.MessageEvent('message', { data: { source: 'clf-fiber-ask', nonce, ...(apps === undefined ? {} : { apps }), ...(appIds === undefined ? {} : { appIds }) }, source: window })
   );
 
   const data = await reply;
@@ -569,6 +580,53 @@ describe('reading a row out of the page', () => {
       answered: true, requestId: 'wfr_01a009', createTime: 1786873669.5 }]);
   });
 
+  describe('a connector renamed in ChatGPT (app id, 2026-10-11)', () => {
+    const NAMES = ['Chat On Steroids Core', 'Chat On Steroids Desktop', 'Chat On Steroids Plugins'];
+    const pair = (app: string, requestId: string, uri?: string) => {
+      const asked = request(`${requestId}-ask`, 'read', { app });
+      asked.metadata!.request_id = requestId;
+      const result = answer(`${requestId}-res`, asked.id, 'read', app);
+      result.metadata!.request_id = requestId;
+      result.author.name = 'api_tool.call_tool';
+      if (uri) (result.metadata!.invoked_resource as Record<string, unknown>).resource_uri = uri;
+      return [asked, result];
+    };
+
+    it('treats a renamed connector as ours by its learned app id and link', async () => {
+      const messages = pair('My tools', 'q1');
+      const { rows, turns } = await scan([rowInTurn(messages, messages)], [{ id: 'renamed-turn', messages }], false, NAMES,
+        [{ surface: 'core', appId: ASDK, linkId: LINK, name: 'My tools' }]);
+      expect(turns[0]!.calls.map(call => call.tool)).toEqual(['read']);
+      expect(rows[0]).toMatchObject({ own: true });
+    });
+
+    it('does not claim a same-named app once the real app id is learned', async () => {
+      const messages = pair(APP, 'q2', '/asdk_app_foreign/link_foreign/read');
+      const content = messages[0]!.content as Record<string, string>;
+      content['text'] = content['text']!.replace(LINK, 'link_foreign');
+      const { rows, turns } = await scan([rowInTurn(messages, messages)], [{ id: 'foreign-turn', messages }], false, NAMES,
+        [{ surface: 'core', appId: ASDK, linkId: LINK, name: APP }]);
+      expect(turns[0]?.calls ?? []).toEqual([]);
+      expect(rows[0]).toMatchObject({ own: false });
+    });
+
+    it('falls back to the names while nothing is learned', async () => {
+      const messages = pair(APP, 'q3');
+      const { rows, turns } = await scan([rowInTurn(messages, messages)], [{ id: 'names-turn', messages }], false, NAMES, []);
+      expect(turns[0]!.calls.map(call => call.tool)).toEqual(['read']);
+      expect(rows[0]).toMatchObject({ own: true });
+    });
+
+    it('reports a sighting for every connector result row, ours or not', async () => {
+      const messages = [...pair('My tools', 'q4'), ...pair('Gmail', 'q5', '/asdk_app_gmail/link_g/search')];
+      const { turns } = await scan([], [{ id: 'sighting-turn', messages }], false, NAMES, []);
+      expect(turns[0]!.sightings).toEqual([
+        { requestId: 'q4', appId: ASDK, linkId: LINK, appName: 'My tools' },
+        { requestId: 'q5', appId: 'asdk_app_gmail', linkId: 'link_g', appName: 'Gmail' }
+      ]);
+    });
+  });
+
   it.each(['Chat On Steroids Core', 'Chat On Steroids Desktop', 'Chat On Steroids Plugins', 'Chat On Steroids Backup', 'Gmail'])(
     'keeps result-only metadata scoped to the exact supported connector %s', async app => {
       const result = answer('result-scope', 'unused', 'read', app);
@@ -632,8 +690,8 @@ describe('reading a row out of the page', () => {
 
   it('keeps the version it was built for on the reply', async () => {
     const { version, rows } = await scan([row([request('req-1', 'read_file')])]);
-    expect(version).toBe(21);
-    expect(rows[0]!.v).toBe(21);
+    expect(version).toBe(22);
+    expect(rows[0]!.v).toBe(22);
   });
   it('counts only TobisComputer requests in the complete turn, not api_tool metadata calls', async () => {
     const mine1 = request('req-1', 'read_file');
@@ -863,6 +921,21 @@ describe('the calls a turn says it made', () => {
     expect(turns[0]!.messages[0]).toMatchObject({ role: 'user', rawText: authored_ });
   });
 
+  it.each([
+    ['marked', { serialization_metadata: { render_format: 'markdown' } }, true],
+    ['unmarked', {}, false],
+    ['marked with another format', { serialization_metadata: { render_format: 'plain' } }, false]
+  ] as const)('reports ChatGPT\'s own Markdown storage mark on a user message (%s)', async (_case, metadata, markdown) => {
+    const message = { ...authored('stored-user-message', 'Run \\`echo two\\`'), author: { role: 'user' } };
+    const { turns } = await scan([], [{
+      id: 'stored-user', messages: [{ ...message, metadata: { ...(message as { metadata?: object }).metadata, ...metadata } }],
+      conversationProps: { conversation: { id: THREAD } }
+    }]);
+    // The raw stored text stays for exact comparisons; the mark tells readers how ChatGPT shows it.
+    expect(turns[0]!.messages[0]).toMatchObject({ role: 'user', rawText: 'Run \\`echo two\\`' });
+    expect((turns[0]!.messages[0] as { markdown?: boolean }).markdown === true).toBe(markdown);
+  });
+
   it('keeps an ordinary Markdown link a user wrote', async () => {
     const { turns } = await scan([], [{
       id: 'link-user', messages: [{ ...authored('link-user-message', 'See [the docs](https://example.com/app) first.'), author: { role: 'user' } }],
@@ -960,6 +1033,35 @@ describe('the calls a turn says it made', () => {
         renderedHtml: ''
       }
     ]);
+  });
+
+  it('retains the end of a long final from an exact GPT-6 DIL selection wrapper', async () => {
+    const id = '6d83d23a-24b5-474d-b0a6-410f875ac985';
+    const prose = `TASK: keep every requirement.\n${'Synthetic handoff detail. '.repeat(6_500)}\nEND_OF_BRIEF`;
+    const html = `<div data-decor="${'z'.repeat(50_000)}">${prose}</div>`;
+    expect(html.length).toBeGreaterThan(120_000);
+    const result = await scan([], [{ id: 'large-final', messages: [authored(id, prose, { endTurn: true, status: 'finished_successfully' })],
+      rendered: [{ html, selectedMessageId: id, selectedConversationId: THREAD }] }]);
+    const message = result.turns[0]!.messages[0]!;
+    expect(message.rawText).toBe(prose);
+    expect(result.turns[0]!.endMessageId).toBe(id);
+    expect(message.renderedHtml.length).toBeGreaterThan(120_000);
+    expect(message.renderedHtml).toContain('END_OF_BRIEF');
+    expect(message.renderedHtml).not.toContain('data-decor');
+  });
+
+  it('does not give an unowned or foreign long block the larger final allowance', async () => {
+    const id = 'large-native-final';
+    const prose = 'TASK: synthetic verified content';
+    const html = `<div>${'Unrelated visible text '.repeat(7_000)}</div>`;
+    for (const rendered of [
+      [{ html }],
+      [{ html, selectedMessageId: id, selectedConversationId: 'another-conversation' }],
+      [{ html, selectedMessageId: id, selectedConversationId: THREAD }, { html, selectedMessageId: id, selectedConversationId: THREAD }]
+    ]) {
+      const result = await scan([], [{ id: 'large-final', messages: [authored(id, prose, { endTurn: true, status: 'finished_successfully' })], rendered }]);
+      expect(result.turns[0]!.messages[0]!.renderedHtml).toBe('');
+    }
   });
 
   it('keeps public preambles complete when ChatGPT visually hides them during streaming and reload', async () => {
@@ -1697,6 +1799,7 @@ describe('what may leave the page', () => {
         'index',
         'localCount',
         'messageId',
+        'own',
         'path',
         'resource',
         'tool',

@@ -1,6 +1,9 @@
 import { defineConfig, externalizeDepsPlugin } from 'electron-vite';
 import { resolve } from 'node:path';
 
+/** Fonts always ship as files; anything else keeps Vite's default inlining. */
+export const rendererAssetsInlineLimit = (file: string): boolean | undefined => /\.(?:woff2?|ttf|otf|eot)$/i.test(file) ? false : undefined;
+
 const nixNodeModules = process.env.npmDeps ? resolve(process.env.npmDeps, 'node_modules') : null;
 
 export default defineConfig({
@@ -39,10 +42,14 @@ export default defineConfig({
         }
       : undefined,
     build: {
+      // The window's policy allows fonts from the app only (font-src 'self'). Vite inlines small
+      // assets as data: URLs, which that policy blocks, so a few KaTeX fonts never loaded.
+      assetsInlineLimit: rendererAssetsInlineLimit,
       rollupOptions: {
         input: {
           index: resolve(__dirname, 'src/renderer/index.html'),
           'pet-overlay': resolve(__dirname, 'src/renderer/pet-overlay.html'),
+          'update-progress': resolve(__dirname, 'src/renderer/update-progress.html'),
           'cos-browser': resolve(__dirname, 'src/renderer/cos-browser.html'),
           'cos-browser-sign-in': resolve(__dirname, 'src/renderer/cos-browser-sign-in.html')
         }

@@ -19,7 +19,7 @@ const observation = z.object({
 const progress = z.object({
   nonce: z.string().uuid(),
   waiting: z.enum(['generating', 'input_busy', 'draft', 'attachments', 'composer_missing', 'composer_hidden',
-    'inspection_busy', 'page_unreachable', 'page_changed', 'opening', 'inspecting', 'inspection_failed', 'result_unconfirmed'])
+    'inspection_busy', 'page_unreachable', 'page_changed', 'opening', 'inspecting', 'inspection_failed', 'result_unconfirmed', 'picker_unreadable'])
 }).strict();
 const waitingReasons: Record<z.infer<typeof progress>['waiting'], string> = {
   generating: 'ChatGPT is still generating. The running response is left untouched.',
@@ -29,12 +29,13 @@ const waitingReasons: Record<z.infer<typeof progress>['waiting'], string> = {
   composer_missing: 'Waiting for the ChatGPT composer to finish loading.',
   composer_hidden: 'The ChatGPT composer is hidden. Close native settings or dialogs to use this tab.',
   inspection_busy: 'The native model picker is already being inspected.',
-  page_unreachable: 'The browser companion has not answered the page readiness check.',
+  page_unreachable: 'The browser extension has not answered the page readiness check.',
   page_changed: 'The discovery page changed or closed. Retry to start a new inspection.',
   opening: 'Opening one separate discovery page. Existing chats are left untouched.',
   inspecting: 'Reading the native model versions and restoring the original selection.',
   inspection_failed: 'The browser model inspection did not complete.',
-  result_unconfirmed: 'The model inspection returned without an accepted catalog.'
+  result_unconfirmed: 'The model inspection returned without an accepted catalog.',
+  picker_unreadable: 'The open chats show no readable model picker. Refresh opens a separate discovery page.'
 };
 let lastProblem: string | null = null;
 let catalog: ChatModelCatalog = { state: 'unknown', requestedAt: null, observedAt: null, models: [] };
@@ -62,7 +63,7 @@ function scheduleDeadline(at: number): void {
 function expire(): void {
   if (request && Date.now() >= request.expiresAt) {
     logInfo(`model discovery expired id=${request.nonce}`); request = null;
-    failed(`Model discovery timed out. ${lastProblem ?? catalog.waiting ?? 'Check the browser companion and the signed-in ChatGPT page, then retry.'}`);
+    failed(`Model discovery timed out. ${lastProblem ?? catalog.waiting ?? 'Check the browser extension and the signed-in ChatGPT page, then retry.'}`);
   }
 }
 export function getChatModels(): ChatModelCatalog {

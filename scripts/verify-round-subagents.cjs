@@ -50,13 +50,13 @@ const fixture = `(() => {
   selectedModel:{conversationId:'worker-chat-'+n,model:'gpt-6-sol',reasoningEffort:'high',observedAt:now}}));
  const history=Array.from({length:48},(_,i)=>({seq:i+1,time:now+i,source:'extension',kind:'assistant_message',
   messageId:'worker-result-'+i,message:stored('Verification step '+(i+1)+': checked selection, history refresh, keyboard navigation and narrow layout. The prime composer remains intact.'),final:true,state:'final'}));
- window.workerReads=[];
+ window.workerReads=[]; window.workerViews=[];
  window.appendPrimeOutput=()=>{f.events.push(prose('Additional live prime output: verification is continuing.'));f.emit('onSessionChanged',{allTranscripts:true});};
  window.refreshWorker=()=>{workers[0].updatedAt++;f.emit('onSessionChanged',{sessionIds:[workers[0].id]});};
  const methods={
   getState:async()=>{const r=await old.getState();r.data.config=fixtureMerge(fixtureDefaults,r.data.config);return r;},
   listSessions:()=>ok({sessions:[{...f.summary,events:f.events.length},...workers],activeId:f.summary.id,pressure:[]}),
-  getSession:(id,options)=>{if(id.startsWith('worker-local-')){window.workerReads.push(id);return ok({summary:workers.find(w=>w.id===id),events:history,total:history.length,nextFrom:history.length+1});}return old.getSession(id,options);}
+  getSession:(id,options)=>{if(id.startsWith('worker-local-')){window.workerReads.push(id);window.workerViews.push(options?.actions?'activity':'conversation');return ok({summary:workers.find(w=>w.id===id),events:history,total:history.length,nextFrom:history.length+1});}return old.getSession(id,options);}
  };
  window.api=new Proxy(methods,{get:(target,key)=>key in target?target[key]:old[key]});
 })();`;
@@ -106,7 +106,12 @@ app.whenReady().then(async () => {
   await js(`document.querySelectorAll('#timeline .activity-workers')[1].click()`);
   assert.deepEqual(await js(`[...document.querySelectorAll('#workDockRight .is-round-worker')].map(r=>r.dataset.workerSession)`),['worker-local-1']);
   await js(`document.querySelector('#workDockRight .is-round-worker').click()`);
+  // A worker opens on its Activity (#105), read as tool calls only; its conversation is one tab away.
+  await until(`document.querySelector('#workDockRight .agent-panel-view[aria-selected="true"]')?.dataset.view==='activity'&&!!document.querySelector('#workDockRight .agent-activity-heading')`);
+  assert.deepEqual(await js(`workerViews`),['activity']);
+  await js(`document.querySelector('#workDockRight .agent-panel-view[data-view="conversation"]').click()`);
   await until(`document.querySelectorAll('#workDockRight .ev-assistant_message').length===48`);
+  assert.deepEqual(await js(`workerViews`),['activity','conversation']);
   const mainTop=await js(`document.getElementById('chatBody').scrollTop`);
   await js(`document.querySelector('#workDockRight .agent-panel-body').scrollTop=300`);
   const workerTop=await js(`document.querySelector('#workDockRight .agent-panel-body').scrollTop`);
@@ -114,11 +119,37 @@ app.whenReady().then(async () => {
   await until(`document.getElementById('timeline').textContent.includes('Additional live prime output')`);
   assert.ok(Math.abs(await js(`document.getElementById('chatBody').scrollTop`)-mainTop)<=2,'Prime output does not pull the reader');
   assert.equal(await js(`document.querySelector('#workDockRight .agent-panel-body').scrollTop`),workerTop);
-  await js(`refreshWorker()`);await until(`workerReads.length===2`);await settle();
+  await js(`refreshWorker()`);await until(`workerReads.length===3`);await settle();
+  assert.equal(await js(`workerViews[2]`),'conversation','A refresh reloads the view being read');
   assert.equal(await js(`document.querySelector('#workDockRight .agent-panel-body').scrollTop`),workerTop,'Worker refresh preserves reading position');
   assert.equal(await js(`document.getElementById('chatInput').value`),'Keep the prime draft');
   assert.equal(await js(`document.querySelector('.sess.is-sel').dataset.id`),'composer-preview');
   await capture('after-history.png');
+  // The sidebar's sub-agent arrow, clicked with the pointer resting on its row: the list repaints, and
+  // the new row keeps its hover look, so the arrow stays aside for the menu instead of jumping back
+  // into the menu's column and sliding out again. When the pointer leaves, the row lets go.
+  const arrow=`document.querySelector('#sessionList .sess[data-id="composer-preview"] > .worker-toggle')`;
+  const arrowX=()=>js(`Math.round(new DOMMatrix(getComputedStyle(${arrow}).transform).m41)`);
+  const rowPoint=await js(`(()=>{const r=${arrow}.parentElement.getBoundingClientRect();return {x:Math.round(r.left+r.width/3),y:Math.round(r.top+r.height/2)}})()`);
+  win.webContents.sendInputEvent({type:'mouseMove',...rowPoint}); await pause(150); await settle();
+  // Hovered, the arrow has slid aside: aim at where it is now.
+  const arrowPoint=await js(`(()=>{const r=${arrow}.getBoundingClientRect();return {x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)}})()`);
+  win.webContents.sendInputEvent({type:'mouseMove',...arrowPoint}); await pause(150);
+  // Its tooltip is the same one throughout: a repaint does not blink it away and back.
+  await until(`!!document.getElementById('sessionTooltip')`);
+  await js(`window.tipsMade=0;new MutationObserver(ms=>{for(const m of ms)for(const n of m.addedNodes)if(n.id==='sessionTooltip')window.tipsMade++;}).observe(document.body,{childList:true})`);
+  for (const expanded of ['true','false']) {
+    const before=await arrowX();
+    win.webContents.sendInputEvent({type:'mouseDown',button:'left',clickCount:1,...arrowPoint});
+    win.webContents.sendInputEvent({type:'mouseUp',button:'left',clickCount:1,...arrowPoint});
+    await until(`${arrow}.getAttribute('aria-expanded')==='${expanded}'`);
+    assert.equal(await arrowX(),before,'The arrow keeps its place through the repaint ('+expanded+')');
+  }
+  await pause(200);
+  assert.deepEqual(await js(`({made:window.tipsMade,shown:!!document.getElementById('sessionTooltip')})`),{made:0,shown:true},'The tooltip stays through the repaints');
+  win.webContents.sendInputEvent({type:'mouseMove',x:900,y:600});
+  await until(`!document.querySelector('#sessionList .sess.is-pointed')`); await settle();
+  assert.ok(await arrowX()>0,'At rest again once the pointer has left');
   await js(`document.getElementById('rightDockToggle').click();document.getElementById('jumpLatest').click()`);
   await until(`Math.abs(document.getElementById('chatBody').scrollHeight-document.getElementById('chatBody').clientHeight-document.getElementById('chatBody').scrollTop)<=2`);
   win.setContentSize(760,960);await until('innerWidth===760');await settle();

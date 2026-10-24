@@ -20,7 +20,7 @@ vi.mock('electron', () => ({
   },
   BrowserWindow: class {},
   clipboard: { readText: () => '', writeText: () => undefined },
-  dialog: { showOpenDialog: vi.fn(async () => ({ canceled: true, filePaths: [] as string[] })), showSaveDialog: vi.fn(async () => ({ canceled: true })) },
+  dialog: { showOpenDialog: vi.fn(async () => ({ canceled: true, filePaths: [] as string[] })), showSaveDialog: vi.fn(async () => ({ canceled: true })), showMessageBox: vi.fn(async () => ({ response: 0 })) },
   shell: { openExternal: vi.fn(async () => undefined), openPath: vi.fn(async () => ''), showItemInFolder: vi.fn() },
   nativeTheme: { themeSource: 'system' },
   safeStorage: {
@@ -29,12 +29,16 @@ vi.mock('electron', () => ({
     encryptStringAsync: vi.fn(async (value: string) => Buffer.from(value, 'utf8')),
     decryptStringAsync: vi.fn(async (buffer: Buffer) => ({ result: buffer.toString('utf8'), shouldReEncrypt: false }))
   },
-  app: { on: vi.fn(), getPath: (_name: string) => '', getLocale: () => 'en-US', getVersion: vi.fn(() => '0.0.0'), getAppPath: () => process.cwd(), isPackaged: false }
+  app: { on: vi.fn(), once: vi.fn(), getPath: (_name: string) => '', getLocale: () => 'en-US', getVersion: vi.fn(() => '0.0.0'), getAppPath: () => process.cwd(), isPackaged: false }
 }));
 
 // This suite owns IPC behavior, not Electron's packaged-vs-checkout path discovery.
 vi.mock('../src/main/extension-path.js', () => ({ extensionDir: () => process.cwd(), shippedExtensionBuild: () => null, extensionUpdateOffer: () => null, prepareExtensionUpdate: () => null }));
 vi.mock('../src/main/browser.js', () => ({ openInPreferredBrowser: vi.fn(async () => 'chrome.exe') }));
+const surfacePaths = vi.hoisted(() => ({ forget: vi.fn(async () => undefined) }));
+vi.mock('../src/main/mcp/persistent-paths.js', () => ({
+  loadSurfaceTokens: vi.fn(async () => ({})), rememberSurfaceTokens: vi.fn(async () => true), forgetSurfaceTokens: surfacePaths.forget
+}));
 
 const { defaultConfig, getConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
 const { initSecretsPath, resetSecretsCacheForTests } = await import('../src/main/secrets.js');
@@ -64,6 +68,7 @@ const {
 } = await import('../src/main/agents.js');
 const { registerIpc, cleanSessionName } = await import('../src/main/ipc.js');
 const { openInPreferredBrowser } = await import('../src/main/browser.js');
+const bridgeModule = await import('../src/main/bridge.js');
 const { app, nativeTheme, safeStorage, shell, dialog } = await import('electron');
 const { extensionDownloadUrl } = await import('../src/main/version.js');
 const { resetWorkspaces, setWorkspaceFor, workspaceEntries } = await import('../src/main/workspace.js');
@@ -100,7 +105,7 @@ it('keeps the reported interface language and the extension preferences through 
   expect(getConfig().ui.browserPreferences).toEqual({ overwrite: false, durations: true });
 });
 
-it.each(['playfulStatus', 'followOutput'] as const)('saves the %s display switch from Settings', async key => {
+it.each(['playfulStatus', 'playfulContinue', 'followOutput', 'announceTurns'] as const)('saves the %s display switch from Settings', async key => {
   // Both are plain ui booleans saved by the general Settings save. The save schema dropped keys
   // it did not list, so a switch that was not listed reverted on the next state push.
   const base = getConfig();
@@ -119,6 +124,18 @@ it('saves Auto-select Skills through Settings and preserves it across a stale un
   expect(getConfig().ui.autoSelectSkills).toBe(wanted);
   expect(await save({ ...base, ui: { ...base.ui, theme: base.ui.theme === 'light' ? 'dark' : 'light' } }, base)).toMatchObject({ ok: true });
   expect(getConfig().ui.autoSelectSkills).toBe(wanted);
+});
+
+it('saves the Continue prompt from Settings, keeps it through a stale save, and clears it when emptied', async () => {
+  const base = getConfig();
+  expect(await save({ ...base, ui: { ...base.ui, customContinue: '  Keep going, and run the tests at the end.  ' } }, base)).toMatchObject({ ok: true });
+  expect(getConfig().ui.customContinue).toBe('Keep going, and run the tests at the end.');
+  expect(await save({ ...base, ui: { ...base.ui, theme: base.ui.theme === 'light' ? 'dark' : 'light' } }, base)).toMatchObject({ ok: true });
+  expect(getConfig().ui.customContinue).toBe('Keep going, and run the tests at the end.');
+  const saved = getConfig();
+  expect(await save({ ...saved, ui: { ...saved.ui, customContinue: 'x'.repeat(501) } }, saved)).toMatchObject({ ok: false });
+  expect(await save({ ...saved, ui: { ...saved.ui, customContinue: '   ' } }, saved)).toMatchObject({ ok: true });
+  expect(getConfig().ui.customContinue).toBeUndefined();
 });
 
 it('names a chat with one clean line, and clears the name for an empty one (#1107)', async () => {
@@ -344,19 +361,25 @@ it('publishes Goal draft progress through the session refresh channel without a 
 });
 
 it('publishes the exact transcript owners of one recorder burst and an explicit global invalidation', async () => {
-  const { recordNote } = await import('../src/main/session/recorder.js');
+  const { notifyChanged, recordNote } = await import('../src/main/session/recorder.js');
   const first = await createSession({ title: 'Changed A', conversationId: 'ipc-changed-a' });
   const second = await createSession({ title: 'Changed B', conversationId: 'ipc-changed-b' });
   const send = vi.fn();
   currentWindow = { setBackgroundColor: vi.fn(), setTitleBarOverlay: vi.fn(), isDestroyed: () => false, webContents: { send } };
+  const changes = () => send.mock.calls.filter(([channel]) => channel === 'session:changed').map(([, change]) => change as { sessionIds: string[] });
+  // One burst names each owner once. Driven directly: three awaited disk writes can outlast the
+  // 400 ms burst on a busy machine and legitimately publish twice.
+  notifyChanged(first.id); notifyChanged(second.id); notifyChanged(first.id);
+  await vi.waitFor(() => expect(changes()).toHaveLength(1), { timeout: 5_000 });
+  expect(changes()[0]!.sessionIds).toEqual(expect.arrayContaining([first.id, second.id]));
+  expect(new Set(changes()[0]!.sessionIds).size).toBe(changes()[0]!.sessionIds.length);
+  send.mockClear();
+  // Recorder writes publish their owners, each publish naming an owner at most once.
   await recordNote(first.id, 'first owner');
   await recordNote(second.id, 'second owner');
   await recordNote(first.id, 'first owner again');
-  await vi.waitFor(() => expect(send.mock.calls.filter(([channel]) => channel === 'session:changed')).toHaveLength(1));
-  const [, change] = send.mock.calls.find(([channel]) => channel === 'session:changed')!;
-  // Earlier fixtures may share this burst; each owner is still named exactly once.
-  expect(change.sessionIds).toEqual(expect.arrayContaining([first.id, second.id]));
-  expect(new Set(change.sessionIds).size).toBe(change.sessionIds.length);
+  await vi.waitFor(() => expect(changes().flatMap(change => change.sessionIds)).toEqual(expect.arrayContaining([first.id, second.id])), { timeout: 5_000 });
+  for (const change of changes()) expect(new Set(change.sessionIds).size).toBe(change.sessionIds.length);
   send.mockClear();
   expect(await handlers.get('sessions:clearImageStorage')!(null, { mode: 'all' })).toMatchObject({ ok: true });
   expect(send).toHaveBeenCalledWith('session:changed', { allTranscripts: true });
@@ -391,6 +414,17 @@ it('publishes the owning session when delivered input history is revised in plac
     await writeDurableNow('session-input', previous ?? []);
     input.resetInputForTests();
   }
+});
+
+// #924: turning stable connector URLs off forgets the stored tokens; turning it on keeps the running ones.
+it('forgets the stored connector URL tokens when the option is turned off', async () => {
+  surfacePaths.forget.mockClear();
+  expect(await save({ ...getConfig(), mcp: { instructions: getConfig().mcp.instructions, persistentUrls: true } })).toMatchObject({ ok: true });
+  expect(getConfig().mcp.persistentUrls).toBe(true);
+  expect(surfacePaths.forget).not.toHaveBeenCalled();
+  expect(await save({ ...getConfig(), mcp: { instructions: getConfig().mcp.instructions, persistentUrls: false } })).toMatchObject({ ok: true });
+  expect(getConfig().mcp.persistentUrls).toBe(false);
+  expect(surfacePaths.forget).toHaveBeenCalledTimes(1);
 });
 
 it('stages clipboard image bytes with a preview through the general attachment owner', async () => {
@@ -509,6 +543,13 @@ it('adds picker-selected projects, reuses containing approval, and leaves cancel
   const uncolored = await handlers.get('projects:color')!(null, { id: first.data.id, color: null }) as any;
   expect(uncolored).toMatchObject({ ok: true, data: { id: first.data.id } });
   expect(uncolored.data.color).toBeUndefined();
+  // #1797: the secrets shield's per-project switch.
+  const shieldOff = await handlers.get('projects:secrets-shield')!(null, { id: first.data.id, off: true }) as any;
+  expect(shieldOff).toMatchObject({ ok: true, data: { id: first.data.id, secretsShieldOff: true } });
+  expect(await handlers.get('projects:secrets-shield')!(null, { id: first.data.id, off: 'yes' })).toMatchObject({ ok: false });
+  expect(await handlers.get('projects:secrets-shield')!(null, { id: first.data.id })).toMatchObject({ ok: false });
+  const shieldOn = await handlers.get('projects:secrets-shield')!(null, { id: first.data.id, off: false }) as any;
+  expect(shieldOn.data.secretsShieldOff).toBeUndefined();
   const removed = await handlers.get('projects:remove')!(null, { id: first.data.id }) as any;
   expect(removed).toMatchObject({ ok: true, data: { id: first.data.id, ungrouped: true } });
   expect(getConfig().roots).toHaveLength(1);
@@ -596,6 +637,7 @@ afterAll(async () => {
 beforeEach(async () => {
   currentWindow = null;
   vi.mocked(dialog.showOpenDialog).mockResolvedValue({ canceled: true, filePaths: [] });
+  vi.mocked(dialog.showMessageBox).mockReset().mockResolvedValue({ response: 0 } as never);
   nativeTheme.themeSource = 'system';
   vi.mocked(safeStorage.isAsyncEncryptionAvailable).mockResolvedValue(true);
   vi.mocked(shell.openPath).mockReset().mockResolvedValue('');
@@ -650,6 +692,7 @@ describe('explicit settings replace the published tool contract', () => {
       const before = snapshot();
       const beforeState = await handlers.get('state:get')!(null, undefined) as any;
       expect(beforeState.data.connectorSchemas.core).toBe(before.schemaId);
+      expect(beforeState.data.connectorRefresh.core).toEqual({ schemaId: before.schemaId, state: 'unknown' });
       const tool = kind === 'finish' ? 'session_finish' : 'exec_command';
       expect(before.tools.map(row => row.name)).toContain(tool);
       expect(before.tools.map(row => row.name)).not.toContain('session');
@@ -884,6 +927,18 @@ describe('ChatGPT browser settings', () => {
 });
 
 describe('settings writes from more than one UI', () => {
+  it("keeps the version whose What's New was seen when a setting changes", async () => {
+    // Every settings save rebuilt \`ui\` without it, so What's New came back at the next start after
+    // any changed setting (2.1.41 pass, Windows VM).
+    const base = defaultConfig(); await saveConfig({ ...base, ui: { ...base.ui, lastSeenVersion: '2.1.40' } });
+    const current = getConfig();
+    const { lastSeenVersion: _seen, ...formUi } = current.ui;
+    expect((await save({ ...current, ui: { ...formUi, theme: 'dark' } }, { ...current, ui: formUi })).ok).toBe(true);
+    expect(getConfig().ui.theme).toBe('dark');
+    expect(getConfig().ui.lastSeenVersion).toBe('2.1.40');
+    expect(JSON.parse(await fs.readFile(path.join(dir, 'config.json'), 'utf8')).ui.lastSeenVersion).toBe('2.1.40');
+  });
+
   it('validates and persists the Plugins tunnel id through Settings, including explicit clearing', async () => {
     const base = defaultConfig(); await saveConfig(base);
     const tunnelId = `tunnel_${'a'.repeat(32)}`;
@@ -954,14 +1009,14 @@ describe('settings writes from more than one UI', () => {
     const base = defaultConfig(); await saveConfig(base);
     const wanted = { ...base, mcp: { instructions: 'Use the approved project only.' }, ui: { ...base.ui, browserOnly: true } };
     expect((await save(wanted, base)).ok).toBe(true);
-    expect(JSON.parse(await fs.readFile(path.join(dir, 'config.json'), 'utf8')).mcp).toEqual(wanted.mcp);
+    expect(JSON.parse(await fs.readFile(path.join(dir, 'config.json'), 'utf8')).mcp).toEqual({ ...wanted.mcp, persistentUrls: false });
     expect(getConfig().ui.browserOnly).toBe(true);
     expect((await save({ ...base, ui: { ...base.ui, minimizeToTray: !base.ui.minimizeToTray } }, base)).ok).toBe(true);
-    expect(getConfig().mcp).toEqual(wanted.mcp);
+    expect(getConfig().mcp).toEqual({ ...wanted.mcp, persistentUrls: false });
     expect(getConfig().ui.browserOnly).toBe(true);
     const legacy = { ...base } as any; delete legacy.mcp;
     expect((await save(legacy, legacy)).ok).toBe(true);
-    expect(getConfig().mcp).toEqual(wanted.mcp);
+    expect(getConfig().mcp).toEqual({ ...wanted.mcp, persistentUrls: false });
     const current = getConfig();
     expect((await save({ ...current, mcp: { instructions: '' } }, current)).ok).toBe(true);
     expect(getConfig().mcp.instructions).toBe('');
@@ -1045,6 +1100,21 @@ describe('settings writes from more than one UI', () => {
     expect(result.ok, result.error).toBe(true);
     expect(getConfig().ui.tabsToKeepOpen).toBe(6);
     expect(getConfig().goal).toMatchObject({ helperModel: 'account-helper', helperReasoning: 'medium', model: base.goal.model });
+  });
+  it('saves the secrets shield switch, and keeps it when a form without it saves (#1797)', async () => {
+    const base = defaultConfig();
+    await saveConfig(base);
+    expect(getConfig().ui.secretsShield).toBe(true);
+    expect((await save({ ...base, ui: { ...base.ui, secretsShield: false } }, base)).ok).toBe(true);
+    expect(getConfig().ui.secretsShield).toBe(false);
+    // An older window's form has no such field; saving it must not turn the shield back on.
+    const off = getConfig();
+    const { secretsShield: _, ...olderUi } = off.ui;
+    expect((await save({ ...off, ui: { ...olderUi, followOutput: false } }, off)).ok).toBe(true);
+    expect(getConfig().ui).toMatchObject({ secretsShield: false, followOutput: false });
+    const now = getConfig();
+    expect((await save({ ...now, ui: { ...now.ui, secretsShield: true } }, now)).ok).toBe(true);
+    expect(getConfig().ui.secretsShield).toBe(true);
   });
   it('persists and clears ordinary new-chat defaults independently through settings merge', async () => {
     const base = defaultConfig();
@@ -1301,6 +1371,34 @@ describe('every link the window offers', () => {
     }
   });
 
+  it("hands Setup's extensions address over by clipboard, because browsers ignore their own pages from outside", async () => {
+    const { clipboard } = await import('electron');
+    const write = vi.spyOn(clipboard, 'writeText');
+    try {
+      for (const browser of ['chrome', 'edge', 'brave'] as const) {
+        write.mockClear();
+        vi.mocked(openInPreferredBrowser).mockClear();
+        expect(await handlers.get('browser:setupOpen')!(null, { browser, page: 'extensions' })).toEqual({ ok: true, data: true });
+        expect(write).toHaveBeenCalledWith(`${browser}://extensions`);
+        // Only a blank tab to paste into: the browser would open its internal page as a new tab instead.
+        expect(openInPreferredBrowser).toHaveBeenCalledWith('about:blank', { browser, reveal: true });
+      }
+      // A copy that fails is reported, and no browser comes up for an address that is not there.
+      write.mockClear();
+      vi.mocked(openInPreferredBrowser).mockClear();
+      write.mockRejectedValueOnce(new Error('clipboard unavailable') as never);
+      expect(await handlers.get('browser:setupOpen')!(null, { browser: 'chrome', page: 'extensions' })).toMatchObject({ ok: false });
+      expect(openInPreferredBrowser).not.toHaveBeenCalled();
+      write.mockClear();
+      vi.mocked(openInPreferredBrowser).mockClear();
+      await handlers.get('browser:setupOpen')!(null, { browser: 'edge', page: 'chatgpt' });
+      expect(openInPreferredBrowser).toHaveBeenCalledWith('https://chatgpt.com/', { browser: 'edge', reveal: true });
+      expect(write).not.toHaveBeenCalled();
+    } finally {
+      write.mockRestore();
+    }
+  });
+
   it('serializes non-Error throws into a real IPC error string', async () => {
     vi.mocked(shell.openExternal).mockRejectedValueOnce('Windows shell refused the request');
     const reply = (await handlers.get('link:open')!(null, {
@@ -1318,6 +1416,53 @@ describe('every link the window offers', () => {
  * press that closed the window and installed nothing would be worse than no button at all.
  */
 describe('installing a downloaded update on request', () => {
+  it('reports the failed app check after requesting the running connectors without quitting or changing settings', async () => {
+    const updater = await import('../src/main/update.js');
+    const connections = await import('../src/main/connection.js');
+    const refresh = await import('../src/main/plugin-refresh.js');
+    const connected = vi.spyOn(connections, 'connect').mockResolvedValue(undefined);
+    const requested = vi.spyOn(refresh, 'requestPluginRefreshes').mockResolvedValue(undefined);
+    const checked = vi.spyOn(updater, 'checkForUpdates').mockResolvedValue(undefined);
+    const status = vi.spyOn(updater, 'updateStatus').mockReturnValue({ current: '2.1.31', latest: null, stage: 'failed', checkedAt: null, error: 'Network unavailable' });
+    const before = structuredClone(getConfig()), quits = quitToInstallCalls;
+    try {
+      const reply = await handlers.get('update:all')!(null, undefined);
+      expect(reply).toEqual({ ok: false, error: 'Network unavailable' });
+      expect(checked).toHaveBeenCalledTimes(1);
+      expect(connected).toHaveBeenCalledTimes(1);
+      expect(requested).toHaveBeenCalledWith('2.1.31', expect.arrayContaining(['core']));
+      expect(quitToInstallCalls).toBe(quits); expect(getConfig()).toEqual(before);
+    } finally { checked.mockRestore(); status.mockRestore(); connected.mockRestore(); requested.mockRestore(); }
+  });
+  it.each([
+    ['unapproved', undefined], ['other-version', '98.0.0'], ['approve', '99.0.0'], ['changed-installer', '99.0.0']
+  ] as const)('restarts only for the version the app approved: %s', async (outcome, approved) => {
+    // The question is asked in the app's own dialog; the window calls again with that version.
+    const updater = await import('../src/main/update.js');
+    const refresh = await import('../src/main/plugin-refresh.js');
+    const checked = vi.spyOn(updater, 'checkForUpdates').mockResolvedValue(undefined);
+    const status = vi.spyOn(updater, 'updateStatus').mockReturnValue({ current: '2.1.35', latest: '99.0.0', stage: 'ready', checkedAt: 1, error: null });
+    const marked = vi.spyOn(updater, 'markInstallOnQuit').mockReturnValue(outcome !== 'changed-installer');
+    const requested = vi.spyOn(refresh, 'requestPluginRefreshes').mockResolvedValue(undefined);
+    const quits = quitToInstallCalls;
+    try {
+      const reply = await handlers.get('update:all')!(null, approved);
+      expect(dialog.showMessageBox).not.toHaveBeenCalled();
+      if (outcome === 'unapproved' || outcome === 'other-version') {
+        expect(reply).toEqual({ ok: true, data: 'confirm' });
+        expect(requested).not.toHaveBeenCalled(); expect(marked).not.toHaveBeenCalled(); expect(quitToInstallCalls).toBe(quits);
+      } else {
+        expect(marked).toHaveBeenCalledExactlyOnceWith('99.0.0');
+        if (outcome === 'approve') {
+          expect(reply).toEqual({ ok: true, data: 'restarting' }); expect(quitToInstallCalls).toBe(quits + 1);
+        } else {
+          expect(reply).toMatchObject({ ok: false }); expect(quitToInstallCalls).toBe(quits);
+        }
+      }
+    } finally {
+      checked.mockRestore(); status.mockRestore(); marked.mockRestore(); requested.mockRestore();
+    }
+  });
   it('refuses, and does not quit, when nothing has been downloaded', async () => {
     const before = quitToInstallCalls;
     const reply = (await handlers.get('update:install')!(null, undefined)) as { ok: boolean; error: string };
@@ -1993,6 +2138,70 @@ describe('session IPC contracts', () => {
     expect(refused.ok).toBe(false);
     expect(refused.error).toMatch(/no valid ChatGPT conversation/i);
   });
+
+  it.each([
+    ['cos', true],
+    ['cos', false],
+    ['chrome', true],
+    ['chrome', false],
+    ['edge', true],
+    ['edge', false],
+    ['brave', true],
+    ['brave', false]
+  ] as const)(
+    'routes history chat with preference %s when extension claim is %s',
+    async (browser, extensionClaimsChat) => {
+      const original = getConfig();
+      const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+      const session = await createSession({ title: 'route by browser preference', conversationId });
+      const reveal = vi.spyOn(bridgeModule, 'revealChatInBrowser').mockResolvedValue(extensionClaimsChat);
+      try {
+        await saveConfig({ ...original, ui: { ...original.ui, chatBrowser: browser } });
+        vi.mocked(openInPreferredBrowser).mockClear();
+
+        const reply = await handlers.get('sessions:openChat')!(null, { id: session.id }) as any;
+
+        expect(reply.ok, reply.error).toBe(true);
+        const url = `https://chatgpt.com/c/${conversationId}`;
+        if (browser === 'cos') {
+          expect(reveal).not.toHaveBeenCalled();
+          expect(openInPreferredBrowser).toHaveBeenCalledWith(url, { reveal: true });
+        } else if (extensionClaimsChat) {
+          expect(reveal).toHaveBeenCalledWith(conversationId);
+          expect(openInPreferredBrowser).not.toHaveBeenCalled();
+        } else {
+          expect(reveal).toHaveBeenCalledWith(conversationId);
+          expect(openInPreferredBrowser).toHaveBeenCalledWith(url, { reveal: true });
+        }
+      } finally {
+        reveal.mockRestore();
+        await saveConfig(original);
+      }
+    }
+  );
+});
+
+it('follows only the newest chat selection when an earlier lookup finishes last (#1249, #1267)', async () => {
+  const bridge = await import('../src/main/bridge.js');
+  const store = await import('../src/main/session/store.js');
+  const first = await createSession({ title: 'first', conversationId: 'aaaaaaaa-1111-4222-8333-444444444444' });
+  const second = await createSession({ title: 'second', conversationId: 'bbbbbbbb-1111-4222-8333-444444444444' });
+  const followed = vi.spyOn(bridge, 'followChatInBackground').mockImplementation(() => undefined);
+  const lookup = store.getSession;
+  let releaseFirst: () => void = () => undefined;
+  const firstHeld = new Promise<void>(resolve => { releaseFirst = resolve; });
+  const slow = vi.spyOn(store, 'getSession').mockImplementation(async (id, ...rest) => {
+    if (id === first.id) await firstHeld;
+    return lookup(id, ...rest);
+  });
+  try {
+    const earlier = handlers.get('sessions:followTab')!(null, { id: first.id });
+    const later = await handlers.get('sessions:followTab')!(null, { id: second.id }) as any;
+    expect(later.ok, later.error).toBe(true);
+    releaseFirst();
+    expect(((await earlier) as any).ok).toBe(true);
+    expect(followed.mock.calls).toEqual([['bbbbbbbb-1111-4222-8333-444444444444']]);
+  } finally { slow.mockRestore(); followed.mockRestore(); }
 });
 
 it('saves this computer\'s connector suffix normalized, refuses an invalid one, and keeps a newer one through an older form', async () => {
@@ -2093,4 +2302,330 @@ it('saves a diagnostics report through the renderer channel without personal det
   expect(report).toMatch(/open '~[\\/]<p:[0-9a-f]{4}>[\\/]<p:[0-9a-f]{4}>\.xlsx'/);
   for (const personal of ['home-jane', 'Acme', 'invoice', 'jane@example.com', 'Quarterly tax return']) expect(report).not.toContain(personal);
   expect(shell.showItemInFolder).toHaveBeenCalledWith(target);
+});
+
+it('saves a code block where the save dialog says, offering only its bare name in Downloads', async () => {
+  const save = (payload: unknown) => handlers.get('code:save')!(null, payload);
+  const getPath = app.getPath;
+  const target = path.join(dir, 'chosen.ts');
+  (app as { getPath: (name: string) => string }).getPath = (name: string) => path.join(dir, name);
+  vi.mocked(dialog.showSaveDialog).mockResolvedValueOnce({ canceled: false, filePath: target } as never);
+  try {
+    expect(await save({ text: 'const answer = 42;\n', name: 'snippet.ts' })).toEqual({ ok: true, data: { done: 'saved', name: 'chosen.ts' } });
+  } finally {
+    (app as { getPath: typeof getPath }).getPath = getPath;
+  }
+  expect(vi.mocked(dialog.showSaveDialog).mock.lastCall!.at(-1)).toMatchObject({
+    defaultPath: path.join(dir, 'downloads', 'snippet.ts'),
+    filters: [{ name: 'Text files', extensions: ['ts'] }]
+  });
+  expect(await fs.readFile(target, 'utf8')).toBe('const answer = 42;\n');
+  // The renderer suggests a name, never a place: anything but a bare `name.ext` is refused before any dialog.
+  vi.mocked(dialog.showSaveDialog).mockClear();
+  for (const name of ['../snippet.ts', 'C:\\Users\\you\\snippet.ts', '/home/you/snippet.ts', 'snippet']) {
+    expect(await save({ text: 'x', name })).toMatchObject({ ok: false });
+  }
+  expect(dialog.showSaveDialog).not.toHaveBeenCalled();
+  vi.mocked(dialog.showSaveDialog).mockResolvedValueOnce({ canceled: true } as never);
+  expect(await save({ text: 'x', name: 'snippet.txt' })).toEqual({ ok: true, data: { done: 'cancelled' } });
+});
+
+it('leaves a code file the person chose to replace whole when writing the new one fails', async () => {
+  const folder = path.join(dir, 'code-replace');
+  const target = path.join(folder, 'kept.ts');
+  await fs.mkdir(folder, { recursive: true });
+  await fs.writeFile(target, 'const kept = true;\n', 'utf8');
+  vi.mocked(dialog.showSaveDialog).mockResolvedValueOnce({ canceled: false, filePath: target } as never);
+  const writeFile = fs.writeFile.bind(fs);
+  // The disk fills up partway: whatever file is being written ends up cut short.
+  const write = vi.spyOn(fs, 'writeFile').mockImplementationOnce(async (file) => {
+    await writeFile(file, 'const half', 'utf8');
+    throw Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
+  });
+  try {
+    expect(await handlers.get('code:save')!(null, { text: 'const replaced = true;\n', name: 'snippet.ts' })).toMatchObject({ ok: false });
+  } finally {
+    write.mockRestore();
+  }
+  expect(await fs.readFile(target, 'utf8')).toBe('const kept = true;\n');
+  expect(await fs.readdir(folder)).toEqual(['kept.ts']);
+  const { getLog } = await import('../src/main/logger.js');
+  expect(getLog().at(-1)).toMatchObject({ level: 'warn', message: 'code save: refused, the file could not be written or replaced (ENOSPC)' });
+});
+
+it.runIf(process.platform !== 'win32')('keeps a replaced script runnable when a code block is saved over it', async () => {
+  const target = path.join(dir, 'run.sh');
+  await fs.writeFile(target, 'echo old\n', 'utf8');
+  await fs.chmod(target, 0o750);
+  vi.mocked(dialog.showSaveDialog).mockResolvedValueOnce({ canceled: false, filePath: target } as never);
+  expect(await handlers.get('code:save')!(null, { text: 'echo new\n', name: 'snippet.sh' })).toEqual({ ok: true, data: { done: 'saved', name: 'run.sh' } });
+  expect(await fs.readFile(target, 'utf8')).toBe('echo new\n');
+  expect((await fs.stat(target)).mode & 0o777).toBe(0o750);
+});
+
+it.runIf(process.platform !== 'win32')('never leaves the new text of a private file readable to others while a code block is saved over it', async () => {
+  const target = path.join(dir, 'private.env');
+  await fs.writeFile(target, 'TOKEN=old\n', 'utf8');
+  await fs.chmod(target, 0o600);
+  vi.mocked(dialog.showSaveDialog).mockResolvedValueOnce({ canceled: false, filePath: target } as never);
+  const writeFile = fs.writeFile.bind(fs);
+  let modeWhileWriting: number | undefined;
+  const write = vi.spyOn(fs, 'writeFile').mockImplementationOnce(async (file, data, options) => {
+    await writeFile(file, data, options);
+    modeWhileWriting = (await fs.stat(String(file))).mode & 0o777;
+  });
+  try {
+    expect(await handlers.get('code:save')!(null, { text: 'TOKEN=new\n', name: 'snippet.env' })).toMatchObject({ ok: true });
+  } finally {
+    write.mockRestore();
+  }
+  expect(modeWhileWriting).toBe(0o600);
+  expect((await fs.stat(target)).mode & 0o777).toBe(0o600);
+});
+
+it.runIf(process.platform !== 'win32')('leaves a code file alone when its permissions cannot be read', async () => {
+  const folder = path.join(dir, 'code-unreadable-mode');
+  const target = path.join(folder, 'run.sh');
+  await fs.mkdir(folder, { recursive: true });
+  await fs.writeFile(target, 'echo old\n', 'utf8');
+  await fs.chmod(target, 0o750);
+  vi.mocked(dialog.showSaveDialog).mockResolvedValueOnce({ canceled: false, filePath: target } as never);
+  const stat = vi.spyOn(fs, 'stat').mockRejectedValueOnce(Object.assign(new Error('i/o error'), { code: 'EIO' }));
+  try {
+    expect(await handlers.get('code:save')!(null, { text: 'echo new\n', name: 'snippet.sh' })).toMatchObject({ ok: false });
+  } finally {
+    stat.mockRestore();
+  }
+  expect(await fs.readFile(target, 'utf8')).toBe('echo old\n');
+  expect((await fs.stat(target)).mode & 0o777).toBe(0o750);
+  expect(await fs.readdir(folder)).toEqual(['run.sh']);
+  const { getLog } = await import('../src/main/logger.js');
+  expect(getLog().at(-1)).toMatchObject({ level: 'warn', message: "code save: refused, the chosen file's permissions could not be read (EIO)" });
+});
+
+it.runIf(process.platform !== 'win32')('writes through a symlink chosen in the save dialog instead of replacing the link', async () => {
+  const folder = path.join(dir, 'code-symlink');
+  const real = path.join(folder, 'real.ts');
+  const link = path.join(folder, 'link.ts');
+  await fs.mkdir(folder, { recursive: true });
+  await fs.writeFile(real, 'const old = true;\n', 'utf8');
+  await fs.symlink('real.ts', link);
+  vi.mocked(dialog.showSaveDialog).mockResolvedValueOnce({ canceled: false, filePath: link } as never);
+  expect(await handlers.get('code:save')!(null, { text: 'const fresh = true;\n', name: 'snippet.ts' })).toEqual({ ok: true, data: { done: 'saved', name: 'link.ts' } });
+  expect((await fs.lstat(link)).isSymbolicLink()).toBe(true);
+  expect(await fs.readFile(real, 'utf8')).toBe('const fresh = true;\n');
+  expect((await fs.readdir(folder)).sort()).toEqual(['link.ts', 'real.ts']);
+  // A link to nothing has no file to keep whole: the save stops and says why.
+  const dangling = path.join(folder, 'dangling.ts');
+  await fs.symlink('missing.ts', dangling);
+  vi.mocked(dialog.showSaveDialog).mockResolvedValueOnce({ canceled: false, filePath: dangling } as never);
+  expect(await handlers.get('code:save')!(null, { text: 'x', name: 'snippet.ts' })).toMatchObject({ ok: false });
+  expect((await fs.lstat(dangling)).isSymbolicLink()).toBe(true);
+  expect((await fs.readdir(folder)).sort()).toEqual(['dangling.ts', 'link.ts', 'real.ts']);
+  const { getLog } = await import('../src/main/logger.js');
+  expect(getLog().at(-1)).toMatchObject({ level: 'warn', message: 'code save: refused, the chosen file could not be resolved (ENOENT)' });
+});
+
+it('refuses a usage export without a positive, finite divisor, and logs why', async () => {
+  const { getLog } = await import('../src/main/logger.js');
+  const dialogs = vi.mocked(dialog.showSaveDialog).mock.calls.length;
+  for (const payload of [null, {}, { divisor: 0 }, { divisor: -2 }, { divisor: Number.POSITIVE_INFINITY }, { divisor: '2' }]) {
+    const before = getLog().length;
+    expect(await handlers.get('usage:export')!(null, payload)).toMatchObject({ ok: false });
+    expect(getLog().slice(before)).toEqual([expect.objectContaining({ level: 'warn', message: 'usage export: refused, the page sent no positive, finite token divisor' })]);
+  }
+  expect(vi.mocked(dialog.showSaveDialog).mock.calls.length).toBe(dialogs);
+});
+
+describe('native worker checkout cleanup confirmation', () => {
+  const offer = {
+    runId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+    agentId: 'worker-1',
+    createdAt: 1723456789000,
+    reason: 'cleared' as const,
+    label: 'Review API'
+  };
+  const preview = {
+    ...offer,
+    workspace: '/approved/.chat-on-steroids-worktrees/owned/checkout',
+    branch: 'cos/worker-1',
+    headOid: 'a'.repeat(40),
+    dirty: true,
+    ignoredFiles: false,
+    uniqueCommits: false,
+    changes: ['M tracked.txt'],
+    blockers: ['tracked-changes'],
+    canOfferRemoval: false,
+    hasWorkerCommits: false,
+    branchIntegratedIntoSource: true,
+    trackedChangesCount: 1,
+    untrackedFilesCount: 0,
+    ignoredFilesCount: 0,
+    changesTruncated: false,
+    contentFingerprint: 'f'.repeat(64)
+  };
+  const invoke = (channel: string, payload?: unknown) => handlers.get(channel)!(null, payload) as Promise<any>;
+
+  async function withPreview(run: (spies: {
+    list: ReturnType<typeof vi.spyOn>;
+    dispose: ReturnType<typeof vi.spyOn>;
+  }) => Promise<void>): Promise<void> {
+    const agents = await import('../src/main/agents.js');
+    const worktrees = await import('../src/main/worktrees/index.js');
+    const offers = vi.spyOn(agents, 'managedWorktreeCleanupOffers').mockReturnValue([offer]);
+    const acknowledge = vi.spyOn(agents, 'acknowledgeManagedWorktreeCleanupOffer').mockReturnValue(true);
+    const list = vi.spyOn(worktrees, 'listOfferedWorkerWorktrees').mockResolvedValue([preview] as never);
+    const dispose = vi.spyOn(worktrees, 'disposeOfferedWorkerWorktree').mockResolvedValue({
+      removed: true, branchRemoved: false, branch: preview.branch, changes: []
+    });
+    try { await run({ list, dispose }); }
+    finally {
+      dispose.mockRestore();
+      list.mockRestore();
+      acknowledge.mockRestore();
+      offers.mockRestore();
+    }
+  }
+
+  it('sends only UI-safe summary data and defaults to keeping the checkout', async () => {
+    await withPreview(async ({ dispose }) => {
+      const listing = await invoke('swarm:worktreeCleanupList');
+      expect(listing).toMatchObject({ ok: true, data: [expect.objectContaining({ agentId: offer.agentId, dirty: true })] });
+      expect(JSON.stringify(listing)).not.toContain(preview.contentFingerprint);
+      expect(JSON.stringify(listing)).not.toContain(preview.headOid);
+      expect(JSON.stringify(listing)).not.toContain(preview.changes[0]);
+      expect(await invoke('swarm:worktreeCleanupRemove', { runId: offer.runId, agentId: offer.agentId }))
+        .toEqual({ ok: true, data: { removed: false, branchPreserved: true } });
+      expect(dialog.showMessageBox).toHaveBeenCalledWith(expect.objectContaining({
+        defaultId: 0, cancelId: 0, buttons: ['Keep checkout', 'Remove checkout; preserve Git branch']
+      }));
+      expect(dispose).not.toHaveBeenCalled();
+    });
+  });
+
+  it('accepts the renderer\'s whole set of main-process texts', async () => {
+    // The channel's size bound once stayed at 32 while the set grew past it, and a refused set
+    // left the tray, notices and dialogs English in every language.
+    const { MAIN_TEXTS } = await import('../src/shared/main-texts.js');
+    const { mainText, setMainTextTranslations } = await import('../src/main/main-texts.js');
+    try {
+      expect(await invoke('ui:mainTexts', Object.fromEntries(MAIN_TEXTS.map(source => [source, `«${source}»`]))))
+        .toMatchObject({ ok: true });
+      expect(mainText('Quit')).toBe('«Quit»');
+      expect(mainText('Attach files')).toBe('«Attach files»');
+    } finally { setMainTextTranslations({}); }
+  });
+
+  it('asks in the interface language before removing a worker checkout', async () => {
+    const { setMainTextTranslations } = await import('../src/main/main-texts.js');
+    setMainTextTranslations({
+      'Remove worker Git checkout?': 'Worker-Git-Checkout entfernen?',
+      'Keep checkout': 'Checkout behalten',
+      'Checkout: {0}': 'Checkout: {0}',
+      'Uncommitted or ignored paths that would be discarded ({0}):': 'Nicht committete oder ignorierte Pfade, die verworfen würden ({0}):'
+    });
+    try {
+      await withPreview(async ({ dispose }) => {
+        await invoke('swarm:worktreeCleanupRemove', { runId: offer.runId, agentId: offer.agentId });
+        const options = vi.mocked(dialog.showMessageBox).mock.calls.at(-1)?.at(-1) as Electron.MessageBoxOptions;
+        expect(options.title).toBe('Worker-Git-Checkout entfernen?');
+        expect(options.buttons).toEqual(['Checkout behalten', 'Remove checkout; preserve Git branch']);
+        expect(options.detail).toContain(`Checkout: ${preview.workspace}`);
+        expect(options.detail).toContain('Nicht committete oder ignorierte Pfade, die verworfen würden (1):');
+        expect(dispose).not.toHaveBeenCalled();
+      });
+    } finally { setMainTextTranslations({}); }
+  });
+
+  it('rejects a same-path, same-status and same-size content edit made while the dialog is open', async () => {
+    await withPreview(async ({ list, dispose }) => {
+      // A fingerprint is the sole differing field; Git status/path/count and file sizes
+      // would all still look the same to the existing IPC comparison.
+      list.mockResolvedValueOnce([preview] as never)
+        .mockResolvedValueOnce([{ ...preview, contentFingerprint: 'e'.repeat(64) }] as never);
+      vi.mocked(dialog.showMessageBox).mockResolvedValueOnce({ response: 1 } as never);
+      const result = await invoke('swarm:worktreeCleanupRemove', { runId: offer.runId, agentId: offer.agentId });
+      expect(result).toEqual({ ok: false, error: 'The checkout changed while you were reviewing it. No files were removed.' });
+      expect(list).toHaveBeenCalledTimes(2);
+      expect(dispose).not.toHaveBeenCalled();
+    });
+  });
+
+  it('refuses missing/truncated fingerprints and unreadable post-dialog inspections', async () => {
+    await withPreview(async ({ list, dispose }) => {
+      list.mockResolvedValueOnce([{ ...preview, contentFingerprint: null }] as never);
+      expect((await invoke('swarm:worktreeCleanupRemove', { runId: offer.runId, agentId: offer.agentId })).ok).toBe(false);
+      expect(dialog.showMessageBox).not.toHaveBeenCalled();
+      list.mockResolvedValueOnce([{ ...preview, changesTruncated: true }] as never);
+      expect((await invoke('swarm:worktreeCleanupRemove', { runId: offer.runId, agentId: offer.agentId })).ok).toBe(false);
+      expect(dialog.showMessageBox).not.toHaveBeenCalled();
+      list.mockResolvedValueOnce([preview] as never).mockResolvedValueOnce([] as never);
+      vi.mocked(dialog.showMessageBox).mockResolvedValueOnce({ response: 1 } as never);
+      expect((await invoke('swarm:worktreeCleanupRemove', { runId: offer.runId, agentId: offer.agentId })).error)
+        .toBe('The checkout changed while you were reviewing it. No files were removed.');
+      expect(dispose).not.toHaveBeenCalled();
+    });
+  });
+
+  it('passes the approved fingerprint to the manager, including its last-moment mismatch guard', async () => {
+    const { WorkerWorktreeError } = await import('../src/main/worktrees/index.js');
+    await withPreview(async ({ dispose }) => {
+      vi.mocked(dialog.showMessageBox).mockResolvedValueOnce({ response: 1 } as never);
+      const accepted = await invoke('swarm:worktreeCleanupRemove', { runId: offer.runId, agentId: offer.agentId });
+      expect(accepted).toEqual({ ok: true, data: { removed: true, branchPreserved: true } });
+      expect(dispose).toHaveBeenCalledWith(expect.any(Array), expect.objectContaining({
+        runId: offer.runId, agentId: offer.agentId
+      }), expect.any(Array), preview.contentFingerprint);
+
+      dispose.mockRejectedValueOnce(new WorkerWorktreeError('WORKTREE_CONTENT_CHANGED', 'file bytes changed after approval'));
+      vi.mocked(dialog.showMessageBox).mockResolvedValueOnce({ response: 1 } as never);
+      const refused = await invoke('swarm:worktreeCleanupRemove', { runId: offer.runId, agentId: offer.agentId });
+      expect(refused).toEqual({ ok: false, error: 'The checkout changed while you were reviewing it. No files were removed.' });
+    });
+  });
+});
+
+it('projects reloaded unreadable ledger health through state:get and recovers only through explicit reset', async () => {
+  const file = path.join(dir, 'state', 'plugin-refresh.json');
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, '{broken');
+  initDurableStore(dir);
+  const broken: any = await handlers.get('state:get')!(null, undefined);
+  expect(broken).toMatchObject({ ok: true, data: { pluginRefreshUnreadable: true } });
+  expect(await fs.readFile(file, 'utf8')).toBe('{broken');
+  const reset: any = await handlers.get('plugin-refresh:reset')!(null, undefined);
+  expect(reset).toMatchObject({ ok: true, data: { pluginRefreshUnreadable: false } });
+  expect(await readDurable('plugin-refresh')).toEqual([]);
+  const backups = (await fs.readdir(path.dirname(file))).filter(name => name.startsWith('plugin-refresh.recovery-'));
+  expect(await fs.readFile(path.join(path.dirname(file), backups.at(-1)!), 'utf8')).toBe('{broken');
+});
+
+// #1406: the recording store held a fixed 2 GB. Settings now offers larger sizes, applied at once.
+it('saves the recording storage size and applies it to the store', async () => {
+  const store = await import('../src/main/session/store.js');
+  await save({ ...getConfig(), sessions: { ...getConfig().sessions, storageLimitGiB: 10 } });
+  expect(getConfig().sessions.storageLimitGiB).toBe(10);
+  expect(await store.getImageStorage()).toMatchObject({ limitBytes: 10 * 2 ** 30 });
+  // Only offered sizes are accepted.
+  expect(await save({ ...getConfig(), sessions: { ...getConfig().sessions, storageLimitGiB: 3 } })).toMatchObject({ ok: false, error: 'Invalid input' });
+  expect(getConfig().sessions.storageLimitGiB).toBe(10);
+  await save({ ...getConfig(), sessions: { ...getConfig().sessions, storageLimitGiB: 2 } });
+  expect(await store.getImageStorage()).toMatchObject({ limitBytes: 2 * 2 ** 30 });
+});
+
+// Most installs from before Automatic plugin refresh existed have it saved as off without ever
+// choosing that. The app asks once; the answer is kept either way, and a settings save keeps it.
+it('records the one-time answer to the automatic plugin refresh offer', async () => {
+  await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoRefreshPlugins: false } });
+  expect(getConfig().ui.autoRefreshPluginsAsked).toBe(false);
+  const declined: any = await handlers.get('pluginRefresh:offer')!(null, { turnOn: false });
+  expect(declined).toMatchObject({ ok: true, data: { config: { ui: { autoRefreshPlugins: false, autoRefreshPluginsAsked: true } } } });
+  // A later settings save from the window does not bring the question back.
+  await save({ ...getConfig(), ui: { ...getConfig().ui, theme: 'light' } });
+  expect(getConfig().ui.autoRefreshPluginsAsked).toBe(true);
+
+  await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoRefreshPlugins: false } });
+  const accepted: any = await handlers.get('pluginRefresh:offer')!(null, { turnOn: true });
+  expect(accepted).toMatchObject({ ok: true, data: { config: { ui: { autoRefreshPlugins: true, autoRefreshPluginsAsked: true } } } });
+  expect(await handlers.get('pluginRefresh:offer')!(null, { turnOn: 'yes' })).toMatchObject({ ok: false });
 });

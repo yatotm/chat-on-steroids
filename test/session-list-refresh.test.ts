@@ -8,6 +8,7 @@ import { JSDOM } from 'jsdom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   appendEvent,
+  bindSessionProject,
   flushSessions,
   getSession,
   setSessionOrigin,
@@ -154,6 +155,37 @@ describe('session summary pages', () => {
     expect(second.nextCursor).toBeNull();
     expect(new Set([...first.sessions, ...second.sessions].map((entry) => entry.id)).size).toBe(65);
   });
+
+  // #1190: a project's chats older than the newest global page could only be reached by paging
+  // the whole history. A project's own pages cost what the project holds.
+  it("pages one project's chats by themselves, however much other history lies between them", async () => {
+    const project = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', other = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
+    const mine: string[] = [];
+    for (let index = 0; index < 70; index++) {
+      const session = await createSession({ title: `history-${index}`, conversationId: null });
+      if (index % 20 === 0) { await bindSessionProject(session.id, project); mine.push(session.id); }
+      if (index === 5) await bindSessionProject(session.id, other);
+      await endSession(session.id);
+    }
+    resetSessionStoreForTests();
+
+    const first = await listSessionPage({ limit: 3, projectId: project });
+    expect(first.sessions.every(entry => entry.projectId === project)).toBe(true);
+    expect(first.sessions).toHaveLength(3);
+    expect(first.nextCursor).not.toBeNull();
+    // The total stays the whole retained history: it is what the sidebar's own paging counts.
+    expect(first.total).toBe(70);
+    const second = await listSessionPage({ limit: 3, projectId: project, cursor: first.nextCursor ?? undefined });
+    expect(second.sessions).toHaveLength(1);
+    expect(second.nextCursor).toBeNull();
+    expect([...first.sessions, ...second.sessions].map(entry => entry.id).sort()).toEqual([...mine].sort());
+
+    // A session still open (not yet written out) belongs to its project's page too.
+    const live = await createSession({ title: 'live', conversationId: null });
+    await bindSessionProject(live.id, project);
+    expect((await listSessionPage({ limit: 60, projectId: project })).sessions.map(entry => entry.id)).toContain(live.id);
+    expect((await listSessionPage({ limit: 60, projectId: 'cccccccc-dddd-4eee-8fff-000000000000' })).sessions).toEqual([]);
+  });
 });
 
 function summary(id: string, updatedAt: number, events: number): SessionSummary {
@@ -229,7 +261,8 @@ describe('visible Chat refresh', () => {
             nextCursor: null
           });
         },
-        getSession: (id: string, options?: any) => {
+        turnTraces: () => ok({}),
+      getSession: (id: string, options?: any) => {
           detailCalls.push({ id, options });
           detailRound += 1;
           return detailRound === 1
@@ -310,6 +343,7 @@ describe('visible Chat refresh', () => {
             : ok({ sessions: all.slice(60), activeId: all[0]!.id, pressure: [], total: 65, nextCursor: null });
         },
         getSession: (id: string) => ok({ summary: all.find((entry) => entry.id === id), events: [], total: 0, nextFrom: 0 }),
+        turnTraces: () => ok({}),
         getSwarm: () => ok({ running: false, runId: null, agents: [], maxWorkers: 2, pendingReports: 0 }),
         onSessionChanged: () => () => undefined,
         onSwarmChanged: () => () => undefined
@@ -369,6 +403,7 @@ describe('scoped session change refresh', () => {
         const sessions = state.listed ? [state.a, state.b] : [state.b];
         return ok({ sessions, activeId: null, pressure: [], total: sessions.length, nextCursor: null, blocked: [] });
       },
+      turnTraces: () => ok({}),
       getSession: (id: string, options?: any) => {
         state.detailCalls.push({ id, options });
         const seq = 100 + state.detailCalls.length - 1;

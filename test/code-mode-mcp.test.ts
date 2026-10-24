@@ -372,11 +372,17 @@ it('delivers completed terminal output on the outer result even when code filter
   const started = await call(who.requestId, `text(await tools.exec_command({cmd:${JSON.stringify(command)},workdir:"/workspace",yield_time_ms:25}));`);
   const id = Number(text(started).match(/Process running with session ID (\d+)/)?.[1]);
   expect(Number.isInteger(id), text(started)).toBe(true);
-  await vi.waitFor(() => expect(unifiedExecManager.exitedUnread(new Set([id]))).toHaveLength(1), { timeout: 5_000 });
+  // A busy Windows runner can take more than 5 s to report the PowerShell child's exit (3 of 15
+  // runs on a freshly installed test VM; about 1 s once idle), so wait for the exit itself.
+  await vi.waitFor(() => expect(unifiedExecManager.exitedUnread(new Set([id]))).toHaveLength(1), { timeout: 20_000, interval: 50 });
   const full = await call(who.requestId, 'text("x".repeat(39_900));');
   expect(Buffer.byteLength(text(full)), text(full).slice(0, 400)).toBe(39_900);
   expect(text(full)).not.toContain('OUTER_AUTO_RESULT');
-  expect(unifiedExecManager.exitedUnread(new Set([id]))).toHaveLength(1);
+  // Seen once on Windows CI (2026-10-22): the exited session was no longer unread here. Say where it went.
+  expect(unifiedExecManager.exitedUnread(new Set([id])), JSON.stringify({
+    listed: unifiedExecManager.listProcesses().map(entry => entry.processId === id ? entry : null).filter(Boolean),
+    state: unifiedExecManager.backgroundState(new Set([id]))
+  })).toHaveLength(1);
   const response = await call(who.requestId, 'await Promise.all([tools.read({paths:["/workspace/alpha.txt"]}),tools.read({paths:["/workspace/beta.txt"]})]); text("filtered children");');
   expect(text(response)).toContain('OUTER_AUTO_RESULT');
   expect(text(response)).toContain('Exit code: 7');
@@ -385,7 +391,7 @@ it('delivers completed terminal output on the outer result even when code filter
   const receipt = await call(who.requestId, 'text("receipt");');
   expect(text(receipt)).not.toContain('OUTER_AUTO_RESULT');
   expect(unifiedExecManager.exitedUnread(new Set([id]))).toEqual([]);
-});
+}, 60_000);
 
 it('rejects missing proof, foreign tools, invalid child arguments and nested lifecycle calls', async () => {
   const config = getConfig();
@@ -508,4 +514,12 @@ it('uses existing process custody for nested exec and write_stdin across a conve
   observeRequestCorrelation({ requestId, conversationId: replacement, sessionId: a.session.id, messageId: randomUUID(), tool: 'exec', observedAt: Date.now() });
   const continued = await call(requestId, `text(await tools.write_stdin({session_id:${processId},chars:"owner\\r",yield_time_ms:1000}));`);
   expect(text(continued)).toContain('OWNED_RESULT');
+});
+
+it('explains a "not a function" from another connector\'s tool in a Core script (#1287)', async () => {
+  const who = await identity();
+  const response = await call(who.requestId, 'try { await tools.read_clipboard({}); } catch (error) { text(String(error)); }');
+  const all = text(response);
+  expect(all).toContain('not a function');
+  expect(all).toContain('UNKNOWN_TOOL_NAMES: this script used tools.read_clipboard (a Chat On Steroids Desktop tool), which Chat On Steroids Core does not offer');
 });

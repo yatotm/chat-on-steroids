@@ -40,7 +40,6 @@ import {
   type Hunk,
   type PatchPathResolver
 } from '../codex/apply-patch/index.js';
-import { DEFAULT_APPLY_PATCH_FILE_UPDATE_MODE } from '../codex/apply-patch/mode.js';
 import { maybeParseApplyPatchForExec } from '../codex/apply-patch/invocation.js';
 import { composeCommandBatch, parseCommandBatchSections } from '../codex/command-batch.js';
 import { formatExecOutputForModel, newStreamOutput } from '../codex/exec-output.js';
@@ -85,6 +84,7 @@ import {
   normalizePowerShellOperators,
   normalizeShellCommand,
   repairPowerShellQuoting,
+  execNotesText,
   withExecNotes
 } from '../exec-hints.js';
 import { childEnv } from '../exec.js';
@@ -106,7 +106,9 @@ import { firstTaskRoot } from '../skill-access.js';
 import { remoteProcessHandleSchema } from '../../shared/remote-execution.js';
 
 
-/** 两种部署共用相同执行实现；只有身份、路径上下文与发布生命周期由宿主提供。 */
+import { fsForRoot, localFs, type ProjectFs } from '../remote/project-fs.js';
+import { remoteCommand, sshArgs, sshProgram } from '../remote/ssh.js';
+import os from 'node:os';
 export interface CoreExecutionHost {
   custody: ProcessCustody;
   manager: UnifiedExecProcessManager;
@@ -114,6 +116,7 @@ export interface CoreExecutionHost {
   commandPolicy(): Config['commandAllowlist'];
   workspace(): { virtual: string; real: string } | null;
   requiresWorkspace(): boolean;
+  validateWorkspace?(): Promise<{ virtual: string; real: string } | null>;
   processHandle?(id: number): string | number;
   permissionRoots?(): readonly string[];
   route?(name: string, args: unknown, local: () => Promise<ToolResult>): Promise<ToolResult>;
@@ -121,7 +124,7 @@ export interface CoreExecutionHost {
   guard(name: string, run: () => Promise<ToolResult>): Promise<ToolResult>;
   friendlyError(error: unknown): string;
   failIdentity(message: string): ToolResult;
-  resolveIn(roots: readonly Root[], requested: string, options?: { allowMissing?: boolean; base?: string | null; access?: 'read' }): Promise<Resolved>;
+  resolveIn(roots: readonly Root[], requested: string, options?: { allowMissing?: boolean; base?: string | null; access?: 'read'; remote?: boolean }): Promise<Resolved>;
   resolveCwd(ctx: ToolContext, path: string | undefined): Promise<ResolvedCwd>;
 }
 export type ExecutionRegistrar = Pick<SurfaceRegistrar, 'ctx' | 'caps' | 'exposedCaps' | 'findExposed' | 'register' | 'guarded'>;
@@ -159,17 +162,17 @@ const excludeFolderPattern = z
 
 const unifiedExecOutputSchema = z
   .object({
-    chunk_id: z.string().optional().describe('Chunk identifier.'),
-    wall_time_seconds: z.number().describe('Seconds waited.'),
-    exit_code: z.number().optional().describe('Exit code, when finished.'),
+    chunk_id: z.string().optional().describe('Output chunk identifier.'),
+    wall_time_seconds: z.number().describe('Seconds spent waiting for output.'),
+    exit_code: z.number().optional().describe('Process exit code when the command finished during this call.'),
     session_id: z.union([z.number(), remoteProcessHandleSchema])
       .optional()
       .describe('Session ID while running.'),
-    completed_session_id: z.union([z.number(), remoteProcessHandleSchema]).optional().describe('Completed ID for write_stdin replay.'),
-    benign_exit: z.boolean().optional().describe('Expected non-zero exit.'),
-    output_replayed: z.boolean().optional().describe('Replay; command not rerun.'),
-    original_token_count: z.number().optional().describe('Estimated tokens before truncation.'),
-    output: z.string().describe('Output, possibly truncated.'),
+    completed_session_id: z.union([z.number(), remoteProcessHandleSchema]).optional().describe('Use as write_stdin session_id to reread completed output.'),
+    expected_exit: z.boolean().optional().describe('Non-zero exit is an expected result, not a failure.'),
+    output_replayed: z.boolean().optional().describe('Retained output; command was not run again.'),
+    original_token_count: z.number().optional().describe('Approximate token count before output truncation.'),
+    output: z.string().describe('Command output text, possibly truncated.'),
     supplemental_context: z.string().optional().describe('App context, not process output.')
   })
   .strict();
@@ -203,6 +206,8 @@ function execChildEnvironment(): NodeJS.ProcessEnv {
   return applyUnifiedExecEnv(env);
 }
 
+const SERVER_SHELL = { shellType: 'sh', shellPath: 'sh' } as const;
+
 export function registerExecutionTools(reg: ExecutionRegistrar, host: CoreExecutionHost): void {
   if (host.route) {
     const registrar = reg;
@@ -212,8 +217,9 @@ export function registerExecutionTools(reg: ExecutionRegistrar, host: CoreExecut
   }
   const { guard, friendlyError, failIdentity, resolveIn, resolveCwd, manager: unifiedExecManager } = host;
   const processHandle = host.processHandle ?? ((id: number) => id);
-  const { backgroundExecObligations, execOwnershipFailure, forgetExecOwner, noteExecAttended, noteExecOwner } = host.custody;
+  const { backgroundExecObligations, execOwnershipFailure, forgetExecOwner, noteExecAttended, noteExecOwner, runningIdenticalExec } = host.custody;
   const { ctx, caps, exposedCaps } = reg;
+  const validatedWorkspace = host.validateWorkspace ?? (async () => host.workspace());
   // Named from the live roots, never from a `/project` that may not exist: a worked example the
   // model cannot act on costs a refused call and a retry. What followed the root had the same
   // problem and cost more of them. `/<root>/src/main.ts` is a project's shape, so it read as a
@@ -229,7 +235,7 @@ export function registerExecutionTools(reg: ExecutionRegistrar, host: CoreExecut
     virtualRoots.length > 0
       ? `Paths inside the live approved roots: ${virtualRoots.join(', ')}. A root is an approved folder, usually a parent of the project rather than the project itself, so name every folder between the root and the file — the same path exec_command takes as workdir. Reading a root lists it one level deep. ` +
         'Absolute native paths copied from command output are also accepted when they resolve inside one of these roots; globs work in either spelling.'
-      : 'Local paths require an approved root in the form /<root>/...; no local root is currently approved. For a connected remote project, use /project or its native directory; its execution service validates the remote roots.';
+      : 'Paths require an approved virtual root in the form /<root>/...; no root is currently approved. Globs are supported after a root is approved.';
 
   // ------------------------------------------------------------------- read
 
@@ -418,9 +424,9 @@ export function registerExecutionTools(reg: ExecutionRegistrar, host: CoreExecut
               'TOOL_DISABLED: view_image is disabled by the current Chat On Steroids permissions. Ask the user to enable reading in the app.'
             );
           }
-          const resolved = await resolveIn(ctx.roots, path, { access: 'read' });
+          const resolved = await resolveIn(ctx.roots, path, { access: 'read', remote: true });
           try {
-            const image = await viewImage(resolved.real, null, undefined, resolved.virtual);
+            const image = await viewImage(resolved.real, null, undefined, resolved.virtual, undefined, fsForRoot(resolved.root));
             logInfo(`tool view_image ${resolved.virtual} (${formatBytes(image.bytes)})`);
             return {
               content: [{ type: 'image' as const, data: image.base64, mimeType: image.mimeType }]
@@ -490,11 +496,20 @@ export function registerExecutionTools(reg: ExecutionRegistrar, host: CoreExecut
         reg.guarded('search', 'find', async () => {
           const limit = Math.min(500, Math.max(1, Math.floor(max_results ?? 50)));
           const deadline = Date.now() + 10_000;
-          const scopes: Array<{ real: string; virtual: string }> = [];
+          const scopes: Array<{ real: string; virtual: string; server?: ProjectFs }> = [];
+          /** Server folders a search over every folder could not reach; the rest is still searched. */
+          const unreachable: string[] = [];
           if (p) {
-            const resolved = await resolveIn(ctx.roots, p, { access: 'read' });
-            const stat = await fs.stat(resolved.real);
-            if (stat.isFile()) {
+            const resolved = await resolveIn(ctx.roots, p, { access: 'read', remote: true });
+            const server = resolved.root.remote ? fsForRoot(resolved.root) : undefined;
+            let isFile: boolean, isDirectory: boolean;
+            if (server) ({ isFile, isDirectory } = await server.getMetadata(resolved.real));
+            else {
+              const stat = await fs.stat(resolved.real);
+              isFile = stat.isFile();
+              isDirectory = stat.isDirectory();
+            }
+            if (isFile) {
               const outcome = await searchOneFile(resolved.real, resolved.virtual, {
                 query,
                 mode: mode ?? 'name',
@@ -502,7 +517,8 @@ export function registerExecutionTools(reg: ExecutionRegistrar, host: CoreExecut
                 caseSensitive: case_sensitive === true,
                 regex: regex === true,
                 maxResults: limit,
-                deadline
+                deadline,
+                ...(server ? { server } : {})
               });
               const hits = outcome.hits.map((hit) =>
                 hit.line === undefined ? hit.path : `${hit.path}:${hit.line}: ${hit.text}`
@@ -516,10 +532,19 @@ export function registerExecutionTools(reg: ExecutionRegistrar, host: CoreExecut
               }
               return ok(hits.length === 0 ? 'No matches' : `${hits.length} matches\n${hits.join('\n')}`);
             }
-            if (!stat.isDirectory()) return fail(`${resolved.virtual} is not a regular file or folder`);
-            scopes.push({ real: resolved.real, virtual: resolved.virtual });
+            if (!isDirectory) return fail(`${resolved.virtual} is not a regular file or folder`);
+            scopes.push({ real: resolved.real, virtual: resolved.virtual, ...(server ? { server } : {}) });
           } else {
             for (const root of ctx.roots) {
+              if (root.remote) {
+                try {
+                  const resolved = await resolvePath(ctx.roots, `/${root.name}`, { remote: true });
+                  scopes.push({ real: resolved.real, virtual: resolved.virtual, server: fsForRoot(root) });
+                } catch (error) {
+                  unreachable.push(`/${root.name} (${friendlyError(error)})`);
+                }
+                continue;
+              }
               const resolved = await resolvePath(ctx.roots, `/${root.name}`);
               scopes.push({ real: resolved.real, virtual: resolved.virtual });
             }
@@ -536,7 +561,7 @@ export function registerExecutionTools(reg: ExecutionRegistrar, host: CoreExecut
               break;
             }
             if (hits.length >= limit) break;
-            const outcome = await search({
+            const request = {
               realDir: scope.real,
               virtualDir: scope.virtual,
               query,
@@ -546,8 +571,18 @@ export function registerExecutionTools(reg: ExecutionRegistrar, host: CoreExecut
               caseSensitive: case_sensitive === true,
               regex: regex === true,
               maxResults: limit - hits.length,
-              deadline
-            });
+              deadline,
+              ...(scope.server ? { server: scope.server } : {})
+            };
+            let outcome;
+            try {
+              outcome = await search(request);
+            } catch (error) {
+              // A server that drops away mid-search costs its own folder, not the whole answer.
+              if (!scope.server || p) throw error;
+              unreachable.push(`${scope.virtual} (${friendlyError(error)})`);
+              continue;
+            }
             scanned += outcome.filesScanned;
             elapsedMs += outcome.elapsedMs;
             if (outcome.stoppedBecause) stopReasons.add(outcome.stoppedBecause);
@@ -558,7 +593,8 @@ export function registerExecutionTools(reg: ExecutionRegistrar, host: CoreExecut
           noteCount(hits.length);
           const reason = stopReasons.size > 0 ? `\ntruncated: ${[...stopReasons].join(',')}` : '';
           const contentLimit = (mode ?? 'name') === 'content' ? `\ncontent_file_limit: ${formatBytes(MAX_CONTENT_FILE_BYTES)}` : '';
-          const meta = `\n\nfiles_scanned: ${scanned}\nelapsed_ms: ${elapsedMs}\nresults_returned: ${hits.length}${contentLimit}${reason}`;
+          const skipped = unreachable.length > 0 ? `\nnot_searched: ${unreachable.join('; ')}` : '';
+          const meta = `\n\nfiles_scanned: ${scanned}\nelapsed_ms: ${elapsedMs}\nresults_returned: ${hits.length}${contentLimit}${reason}${skipped}`;
           if (hits.length === 0) return ok(`No matches${meta}`);
           return ok(`${hits.length} matches\n${hits.join('\n')}${meta}`);
         })
@@ -599,7 +635,9 @@ export function registerExecutionTools(reg: ExecutionRegistrar, host: CoreExecut
           if (args.environmentId !== null) {
             return fail('apply_patch environment selection is unavailable for this turn');
           }
-          const workspace = host.workspace();
+          // apply_patch previously read the synchronous cwd cache, bypassing the managed
+          // lease check shared by resolveIn/resolveCwd. Validate before patch base selection.
+          const workspace = await validatedWorkspace();
           const hasRelativePath = args.hunks.some(hunk => {
             const paths = hunk.kind === 'update_file' && hunk.movePath !== null
               ? [hunk.path, hunk.movePath]
@@ -616,7 +654,8 @@ export function registerExecutionTools(reg: ExecutionRegistrar, host: CoreExecut
           if (baseVirtual === null) {
             return fail('No folder is approved, so there is nowhere to apply the patch.');
           }
-          const base = await resolveIn(ctx.roots, baseVirtual);
+          const base = await resolveIn(ctx.roots, baseVirtual, { remote: true });
+          await validatedWorkspace();
           return (await runParsedPatch(args, ctx.roots, base, caps)).result;
         })
     );
@@ -667,7 +706,10 @@ export function registerExecutionTools(reg: ExecutionRegistrar, host: CoreExecut
               );
             }
           }
-          const shell = input.shell === undefined ? defaultUserShell() : getShellByModelProvidedPath(input.shell, dir.real);
+          const server = dir.remote;
+          const shell = server
+            ? SERVER_SHELL
+            : input.shell === undefined ? defaultUserShell() : getShellByModelProvidedPath(input.shell, dir.real);
           if (!shell) {
             return fail(
               `SHELL_NOT_FOUND: the explicitly requested shell ${JSON.stringify(input.shell)} could not be resolved. ` +
@@ -711,8 +753,17 @@ export function registerExecutionTools(reg: ExecutionRegistrar, host: CoreExecut
           // line PowerShell can actually parse, and a line it cannot repair is left exactly
           // as written for the shell to refuse and the hint to explain.
           const commandNotes: string[] = [];
+          if (server && input.shell !== undefined) {
+            commandNotes.push('shell was ignored: in a server folder commands run in the server account\'s login shell.');
+          }
           const normalizedCommands: string[] = [];
           const boundCommands = rawCommands.map((rawCommand, index) => {
+            // These repairs answer this computer's shells and its bundled ripgrep. A server's
+            // login shell gets the command exactly as written.
+            if (server) {
+              normalizedCommands.push(rawCommand);
+              return rawCommand;
+            }
             const repaired = repairPowerShellQuoting(rawCommand, shell.shellType);
             const normalized = normalizeShellCommand(repaired.cmd, shell.shellType, (relativeDirectory = '.') =>
               nodeFs.readdirSync(nodePath.resolve(dir.real, relativeDirectory))
@@ -760,6 +811,7 @@ export function registerExecutionTools(reg: ExecutionRegistrar, host: CoreExecut
           const useLoginShell = input.login ?? process.platform !== 'win32';
           const command = deriveExecArgs(shell, boundCommand, useLoginShell);
           try {
+            await validatedWorkspace();
             // Current Codex intercepts an explicit `apply_patch` shell invocation before spawning
             // the shell process. The parser is the port of apply-patch/src/invocation.rs and uses
             // the same tree-sitter-bash grammar/query as upstream.
@@ -804,15 +856,32 @@ export function registerExecutionTools(reg: ExecutionRegistrar, host: CoreExecut
               );
             }
 
+            // Read before this launch registers, so the new copy never names itself.
+            const identical = runningIdenticalExec(owner, commandDetail, dir.virtual);
+            if (identical.length) {
+              const ids = identical.map((row) => row.processId).join(', ');
+              const ageS = Math.max(0, Math.round((Date.now() - identical[0]!.startedAt) / 1000));
+              commandNotes.push(
+                `The same command in this folder is still running from earlier in this chat as session${identical.length > 1 ? 's' : ''} ${ids} ` +
+                  `(started ${ageS} s ago); this call started another copy. If this was a retry of a lost answer, ` +
+                  `read the running one with write_stdin(session_id=${identical[0]!.processId}, chars="") instead of starting more.`
+              );
+            }
+
             const processId = unifiedExecManager.allocateProcessId();
             // Process ids are deliberately small/reusable, while chat ownership lives in a
             // separate registry. Clear any stale row at the allocation boundary so a recycled
             // id cannot briefly authorize its previous chat before this call publishes the new owner.
             forgetExecOwner(processId);
 
-            const ripgrep = locateRipgrep();
-            const executionCommand = deriveExecArgs(shell,
-              withPosixPathPrefix(boundCommand, shell.shellType, ripgrep ? nodePath.dirname(ripgrep) : null), useLoginShell);
+            const ripgrep = server ? null : locateRipgrep();
+            // A server command is one ssh connection of its own; the folder and login shell are
+            // set up on the server by `remoteCommand`, so the local side only needs somewhere to run.
+            const executionCommand = server
+              ? [sshProgram(), ...sshArgs(server, [(input.tty ?? DEFAULT_TTY) ? '-tt' : '-T'], [remoteCommand(dir.real, boundCommand)])]
+              : deriveExecArgs(shell,
+                withPosixPathPrefix(boundCommand, shell.shellType, ripgrep ? nodePath.dirname(ripgrep) : null), useLoginShell);
+            await validatedWorkspace();
             const output = await unifiedExecManager.execCommand({
               permissionRoots: host.permissionRoots?.(),
               classifyExit: (exitCode, rawOutput) => {
@@ -830,7 +899,7 @@ export function registerExecutionTools(reg: ExecutionRegistrar, host: CoreExecut
               yieldTimeMs: input.yield_time_ms ?? DEFAULT_EXEC_YIELD_TIME_MS,
               maxOutputTokens: undefined,
               truncationPolicy: EXEC_OUTPUT_CEILING_POLICY,
-              cwd: dir.real,
+              cwd: server ? os.tmpdir() : dir.real,
               displayCwd: dir.virtual,
               env: execChildEnvironment(),
               tty: input.tty ?? DEFAULT_TTY
@@ -912,9 +981,16 @@ export function registerExecutionTools(reg: ExecutionRegistrar, host: CoreExecut
                   ? execRecoveryHints(rawCommands[0] ?? '', responseText, shell.shellType)
                   : [])
             ];
+            // ChatGPT gives the model this tool's structuredContent, not its text, so notes that
+            // only follow the text never reached it (a live retry asked to quote the repeated-
+            // command note quoted nothing, 2026-10-10). They travel in `supplemental_context`,
+            // the schema's field for app context that is not process output.
             return {
               content: [{ type: 'text' as const, text: withExecNotes(responseText, notes) }],
-              structuredContent: execCommandStructuredOutput(output, processHandle)
+              structuredContent: {
+                ...execCommandStructuredOutput(output, processHandle),
+                ...(notes.length > 0 ? { supplemental_context: execNotesText(notes) } : {})
+              }
             };
           } catch (error) {
             const detail = error instanceof UnifiedExecError ? error.debug() : friendlyError(error);
@@ -939,7 +1015,7 @@ export function registerExecutionTools(reg: ExecutionRegistrar, host: CoreExecut
       })),
       async (input) =>
         reg.guarded('command', 'write_stdin', async () => {
-          if (typeof input.session_id !== 'number') return fail('REMOTE_PROCESS_REQUIRED: Select the remote project that owns this process handle. No input was sent.');
+          if (typeof input.session_id !== 'number') return fail('REMOTE_SESSION_REQUIRED: Use the owning remote project for this session_id.');
           // The ownership registry decides both admission and the reason for refusal.
           // A request-scoped caller can continue a process it opened before proof. Another
           // request must wait for exact correlation; a numeric process id is not custody.
@@ -957,9 +1033,13 @@ export function registerExecutionTools(reg: ExecutionRegistrar, host: CoreExecut
               unidentified: 'EXEC_CALLER_UNIDENTIFIED: The current request has not been proven to own this process, so it cannot access it yet. After exact identity recovers, retry this same session_id once; do not launch a replacement command.',
               'different-owner': 'EXEC_SESSION_OWNER_MISMATCH: This process belongs to a different local session. Only its owning session can poll it or send input; use a process id returned to this session.'
             }[denied];
-            const message = `write_stdin failed for session ${processHandle(input.session_id)}: ${reason} No input was sent and no output was read. This refusal concerns this process id, not Read-only mode or permission to edit files or launch other authorized work.`;
+            const message = `write_stdin failed for session ${input.session_id}: ${reason} No input was sent and no output was read. This refusal concerns this process id, not Read-only mode or permission to edit files or launch other authorized work.`;
             return denied === 'unidentified' ? failIdentity(message) : fail(message);
           }
+          // A worker can keep an interactive shell running after its Git worktree has been
+          // replaced. Verify the exact current allocation before forwarding even empty polls:
+          // stdin may execute writes in the shell's now user-owned directory.
+          await validatedWorkspace();
           // Both sides of the wait. An empty poll blocks for seconds by design, and a caller
           // sitting in one is attending its session rather than neglecting it.
           noteExecAttended(input.session_id);
@@ -980,7 +1060,7 @@ export function registerExecutionTools(reg: ExecutionRegistrar, host: CoreExecut
               benignExit: output.benignExit,
               durationMs: output.wallTimeMs
             });
-            logInfo(`tool write_stdin ${processHandle(input.session_id)} (${(input.chars ?? '').length} chars)`);
+            logInfo(`tool write_stdin ${input.session_id} (${(input.chars ?? '').length} chars)`);
             return {
               content: [{ type: 'text' as const, text: execCommandResponseText(output, processHandle) }],
               structuredContent: execCommandStructuredOutput(output, processHandle)
@@ -989,7 +1069,7 @@ export function registerExecutionTools(reg: ExecutionRegistrar, host: CoreExecut
             const message = error instanceof Error ? error.message : String(error);
             const retry =
               error instanceof UnifiedExecError && error.kind === 'write_to_stdin'
-                ? ` Retry this same session_id (${processHandle(input.session_id)}); do not replace it with a new command.`
+                ? ` Retry this same session_id (${input.session_id}); do not replace it with a new command.`
                 : '';
             return fail(`write_stdin failed: ${message}${retry}`);
           }
@@ -997,609 +1077,666 @@ export function registerExecutionTools(reg: ExecutionRegistrar, host: CoreExecut
     );
   }
 
+function applyPatchErrorText(error: unknown, includeSourceContext = false): string {
+  if (error instanceof ApplyPatchError && includeSourceContext && error.sourceContext) {
+    return `${error.message}\n\n${error.sourceContext}`;
+  }
+  return error instanceof PatchParseError || error instanceof ApplyPatchError ? error.message : friendlyError(error);
+}
 
-  function applyPatchErrorText(error: unknown, includeSourceContext = false): string {
-    if (error instanceof ApplyPatchError && includeSourceContext && error.sourceContext) {
-      return `${error.message}\n\n${error.sourceContext}`;
+interface ParsedPatchRun {
+  result: ToolResult;
+  content: string | null;
+  exitCode: number | null;
+}
+
+/** Existing bytes kept so a failed model-facing patch can restore its pre-call state. */
+interface PatchRollbackSnapshot {
+  virtual: string;
+  bytes: Buffer | null;
+}
+
+/** Keep the connector's atomicity promise bounded even when many large files are patched. */
+const MAX_PATCH_ROLLBACK_BYTES = 64 * 1024 * 1024;
+
+async function readOptionalPatchBytes(real: string, projectFs: ProjectFs): Promise<Buffer | null> {
+  try {
+    if (projectFs !== localFs) {
+      const metadata = await projectFs.getMetadata(real);
+      if (metadata.isSymlink || !metadata.isFile) throw new Error('apply_patch target changed from a file before execution');
+      return await projectFs.readFile(real);
     }
-    return error instanceof PatchParseError || error instanceof ApplyPatchError ? error.message : friendlyError(error);
+    const stat = await fs.lstat(real);
+    if (!stat.isFile()) throw new Error('apply_patch target changed from a file before execution');
+    return await fs.readFile(real);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
   }
+}
 
-  interface ParsedPatchRun {
-    result: ToolResult;
-    content: string | null;
-    exitCode: number | null;
+async function capturePatchRollbackSnapshots(resolution: PatchResolution): Promise<Map<string, PatchRollbackSnapshot>> {
+  const snapshots = new Map<string, PatchRollbackSnapshot>();
+  let total = 0;
+  for (const [real, virtual] of resolution.virtualPaths) {
+    const bytes = await readOptionalPatchBytes(real, resolution.fs);
+    total += bytes?.length ?? 0;
+    if (total > MAX_PATCH_ROLLBACK_BYTES) {
+      throw new Error(
+        `apply_patch touches more than ${formatBytes(MAX_PATCH_ROLLBACK_BYTES)} of existing file data; split it into smaller patches so atomic rollback stays bounded.`
+      );
+    }
+    snapshots.set(real, { virtual, bytes });
   }
+  return snapshots;
+}
 
-  /** Existing bytes kept so a failed model-facing patch can restore its pre-call state. */
-  interface PatchRollbackSnapshot {
-    virtual: string;
-    bytes: Buffer | null;
+function samePatchState(left: Buffer | null, right: Buffer | null): boolean {
+  if (left === null || right === null) return left === right;
+  return left.equals(right);
+}
+
+function expectedPatchStates(
+  snapshots: ReadonlyMap<string, PatchRollbackSnapshot>,
+  delta: AppliedPatchDelta
+): Map<string, Buffer | null> {
+  const expected = new Map<string, Buffer | null>();
+  for (const [real, snapshot] of snapshots) expected.set(real, snapshot.bytes);
+  for (const { path: real, change } of delta.changes) {
+    if (change.kind === 'add') {
+      expected.set(real, Buffer.from(change.content, 'utf8'));
+    } else if (change.kind === 'delete') {
+      expected.set(real, null);
+    } else if (change.movePath === null) {
+      expected.set(real, Buffer.from(change.newContent, 'utf8'));
+    } else {
+      expected.set(real, null);
+      expected.set(change.movePath, Buffer.from(change.newContent, 'utf8'));
+    }
   }
+  return expected;
+}
 
-  /** Keep the connector's atomicity promise bounded even when many large files are patched. */
-  const MAX_PATCH_ROLLBACK_BYTES = 64 * 1024 * 1024;
+/**
+ * Best-effort transaction rollback for the connector's stronger contract around raw Codex.
+ *
+ * Only a path still equal to the state recorded in the runtime delta is rewritten. If another
+ * process changed it concurrently, leave that user's newer data alone and report rollback as
+ * incomplete instead of "restoring" over an identity we can no longer prove belongs to us.
+ */
+async function rollbackFailedPatch(
+  snapshots: Map<string, PatchRollbackSnapshot>,
+  delta: AppliedPatchDelta,
+  projectFs: ProjectFs
+): Promise<{ complete: boolean; note: string }> {
+  const expected = expectedPatchStates(snapshots, delta);
+  const problems: string[] = [];
 
-  async function readOptionalPatchBytes(real: string): Promise<Buffer | null> {
+  for (const [real, snapshot] of snapshots) {
+    let current: Buffer | null;
     try {
-      const stat = await fs.lstat(real);
-      if (!stat.isFile()) throw new Error('apply_patch target changed from a file before execution');
-      return await fs.readFile(real);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
-      throw error;
+      current = await readOptionalPatchBytes(real, projectFs);
+    } catch {
+      problems.push(`${snapshot.virtual}: could not inspect current state`);
+      continue;
+    }
+    if (samePatchState(current, snapshot.bytes)) continue;
+    const patchState = expected.get(real) ?? null;
+    if (!samePatchState(current, patchState)) {
+      problems.push(`${snapshot.virtual}: changed outside the recorded patch state`);
+      continue;
+    }
+    try {
+      if (projectFs !== localFs) {
+        if (snapshot.bytes === null) await projectFs.remove(real, { recursive: false, force: true });
+        else await projectFs.writeFile(real, snapshot.bytes);
+      } else if (snapshot.bytes === null) await fs.rm(real, { force: true });
+      else await fs.writeFile(real, snapshot.bytes);
+    } catch {
+      problems.push(`${snapshot.virtual}: restore failed`);
     }
   }
 
-  async function capturePatchRollbackSnapshots(resolution: PatchResolution): Promise<Map<string, PatchRollbackSnapshot>> {
-    const snapshots = new Map<string, PatchRollbackSnapshot>();
-    let total = 0;
-    for (const [real, virtual] of resolution.virtualPaths) {
-      const bytes = await readOptionalPatchBytes(real);
-      total += bytes?.length ?? 0;
-      if (total > MAX_PATCH_ROLLBACK_BYTES) {
-        throw new Error(
-          `apply_patch touches more than ${formatBytes(MAX_PATCH_ROLLBACK_BYTES)} of existing file data; split it into smaller patches so atomic rollback stays bounded.`
-        );
-      }
-      snapshots.set(real, { virtual, bytes });
-    }
-    return snapshots;
-  }
-
-  function samePatchState(left: Buffer | null, right: Buffer | null): boolean {
-    if (left === null || right === null) return left === right;
-    return left.equals(right);
-  }
-
-  function expectedPatchStates(
-    snapshots: ReadonlyMap<string, PatchRollbackSnapshot>,
-    delta: AppliedPatchDelta
-  ): Map<string, Buffer | null> {
-    const expected = new Map<string, Buffer | null>();
-    for (const [real, snapshot] of snapshots) expected.set(real, snapshot.bytes);
-    for (const { path: real, change } of delta.changes) {
-      if (change.kind === 'add') {
-        expected.set(real, Buffer.from(change.content, 'utf8'));
-      } else if (change.kind === 'delete') {
-        expected.set(real, null);
-      } else if (change.movePath === null) {
-        expected.set(real, Buffer.from(change.newContent, 'utf8'));
-      } else {
-        expected.set(real, null);
-        expected.set(change.movePath, Buffer.from(change.newContent, 'utf8'));
-      }
-    }
-    return expected;
-  }
-
-  /**
-   * Best-effort transaction rollback for the connector's stronger contract around raw Codex.
-   *
-   * Only a path still equal to the state recorded in the runtime delta is rewritten. If another
-   * process changed it concurrently, leave that user's newer data alone and report rollback as
-   * incomplete instead of "restoring" over an identity we can no longer prove belongs to us.
-   */
-  async function rollbackFailedPatch(
-    snapshots: Map<string, PatchRollbackSnapshot>,
-    delta: AppliedPatchDelta
-  ): Promise<{ complete: boolean; note: string }> {
-    const expected = expectedPatchStates(snapshots, delta);
-    const problems: string[] = [];
-
-    for (const [real, snapshot] of snapshots) {
-      let current: Buffer | null;
-      try {
-        current = await readOptionalPatchBytes(real);
-      } catch {
-        problems.push(`${snapshot.virtual}: could not inspect current state`);
-        continue;
-      }
-      if (samePatchState(current, snapshot.bytes)) continue;
-      const patchState = expected.get(real) ?? null;
-      if (!samePatchState(current, patchState)) {
-        problems.push(`${snapshot.virtual}: changed outside the recorded patch state`);
-        continue;
-      }
-      try {
-        if (snapshot.bytes === null) await fs.rm(real, { force: true });
-        else await fs.writeFile(real, snapshot.bytes);
-      } catch {
-        problems.push(`${snapshot.virtual}: restore failed`);
-      }
-    }
-
-    // Prove the final state rather than assuming successful write/remove calls meant restoration.
-    for (const [real, snapshot] of snapshots) {
-      try {
-        if (!samePatchState(await readOptionalPatchBytes(real), snapshot.bytes)) {
-          if (!problems.some((problem) => problem.startsWith(`${snapshot.virtual}:`))) {
-            problems.push(`${snapshot.virtual}: restore verification failed`);
-          }
-        }
-      } catch {
+  // Prove the final state rather than assuming successful write/remove calls meant restoration.
+  for (const [real, snapshot] of snapshots) {
+    try {
+      if (!samePatchState(await readOptionalPatchBytes(real, projectFs), snapshot.bytes)) {
         if (!problems.some((problem) => problem.startsWith(`${snapshot.virtual}:`))) {
           problems.push(`${snapshot.virtual}: restore verification failed`);
         }
       }
+    } catch {
+      if (!problems.some((problem) => problem.startsWith(`${snapshot.virtual}:`))) {
+        problems.push(`${snapshot.virtual}: restore verification failed`);
+      }
     }
-
-    if (problems.length === 0) {
-      delta.changes.splice(0);
-      delta.exact = true;
-      return { complete: true, note: 'All file changes from this failed patch were rolled back.' };
-    }
-    delta.exact = false;
-    return { complete: false, note: `WARNING: failed patch rollback was incomplete: ${problems.join('; ')}` };
   }
 
-  /** Shared execution path for the standalone tool and exec_command's upstream apply_patch intercept. */
-  async function runParsedPatch(
-    args: { patch: string; hunks: Hunk[]; workdir: string | null; environmentId: string | null },
-    roots: readonly Root[],
-    base: { real: string; virtual: string },
-    caps?: Capabilities
-  ): Promise<ParsedPatchRun> {
-    if (caps !== undefined) {
-      // Product permission gates around the otherwise ported Codex patch runtime. exec_command's
-      // interception deliberately omits this extra gate because command execution already grants
-      // shell-equivalent mutation ability, matching Codex's shell-tool interception path.
-      const denial = patchCapabilityDenial(args.hunks, caps);
-      if (denial !== null) return { result: fail(denial), content: null, exitCode: null };
-    }
+  if (problems.length === 0) {
+    delta.changes.splice(0);
+    delta.exact = true;
+    return { complete: true, note: 'All file changes from this failed patch were rolled back.' };
+  }
+  delta.exact = false;
+  return { complete: false, note: `WARNING: failed patch rollback was incomplete: ${problems.join('; ')}` };
+}
 
-    // `invocation.rs` turns `cd foo && apply_patch ...` into `args.workdir = "foo"`. Resolve that
-    // once against the selected exec environment, then clear it before handing the already-effective
-    // cwd to the verifier/runtime. The patch text itself never contains this shell-level workdir.
-    let effectiveBase = base;
-    let effectiveArgs = args;
-    if (args.workdir !== null) {
-      try {
-        // Preserve the shell gate from `cd dir && apply_patch`: interception must not execute a
-        // patch that the submitted shell command would never have reached. The cwd must already
-        // exist and be a directory; patch-created parents apply only to paths *inside* it.
-        effectiveBase = await resolveIn(roots, args.workdir, { base: base.virtual });
-        const stat = await fs.stat(effectiveBase.real);
-        if (!stat.isDirectory()) {
-          return { result: fail('apply_patch workdir must be an existing folder'), content: null, exitCode: null };
-        }
-      } catch (error) {
-        return { result: fail(friendlyError(error)), content: null, exitCode: null };
-      }
-      effectiveArgs = { ...args, workdir: null };
-    }
+/** Shared execution path for the standalone tool and exec_command's upstream apply_patch intercept. */
+async function runParsedPatch(
+  args: { patch: string; hunks: Hunk[]; workdir: string | null; environmentId: string | null },
+  roots: readonly Root[],
+  base: { real: string; virtual: string },
+  caps?: Capabilities
+): Promise<ParsedPatchRun> {
+  if (caps !== undefined) {
+    // Product permission gates around the otherwise ported Codex patch runtime. exec_command's
+    // interception deliberately omits this extra gate because command execution already grants
+    // shell-equivalent mutation ability, matching Codex's shell-tool interception path.
+    const denial = patchCapabilityDenial(args.hunks, caps);
+    if (denial !== null) return { result: fail(denial), content: null, exitCode: null };
+  }
 
-    // Every path the patch names is resolved through the connector environment up front, and the
-    // synchronous resolver handed into the Codex port reads that table back.
-    let resolution: PatchResolution;
+  // `invocation.rs` turns `cd foo && apply_patch ...` into `args.workdir = "foo"`. Resolve that
+  // once against the selected exec environment, then clear it before handing the already-effective
+  // cwd to the verifier/runtime. The patch text itself never contains this shell-level workdir.
+  let effectiveBase = base;
+  let effectiveArgs = args;
+  if (args.workdir !== null) {
     try {
-      resolution = await resolvePatchPaths(roots, effectiveBase.virtual, effectiveArgs.hunks);
+      // Preserve the shell gate from `cd dir && apply_patch`: interception must not execute a
+      // patch that the submitted shell command would never have reached. The cwd must already
+      // exist and be a directory; patch-created parents apply only to paths *inside* it.
+      const workdir = await resolveIn(roots, args.workdir, { base: base.virtual, remote: true });
+      effectiveBase = workdir;
+      const isDirectory = workdir.root.remote
+        ? (await fsForRoot(workdir.root).getMetadata(workdir.real)).isDirectory
+        : (await fs.stat(workdir.real)).isDirectory();
+      if (!isDirectory) {
+        return { result: fail('apply_patch workdir must be an existing folder'), content: null, exitCode: null };
+      }
     } catch (error) {
       return { result: fail(friendlyError(error)), content: null, exitCode: null };
     }
-    if (caps !== undefined) {
-      try {
-        const denial = await patchEffectCapabilityDenial(effectiveArgs.hunks, caps, resolution.resolve);
-        if (denial !== null) return { result: fail(denial), content: null, exitCode: null };
-      } catch (error) {
-        return { result: fail(friendlyError(error)), content: null, exitCode: null };
-      }
-    }
-    // Move-only is a separate permission from Edit. Upstream's default update mode normalizes
-    // even context-only moves to LF, so a CRLF file would be byte-rewritten under Move alone.
-    // Preserve line endings whenever Edit is unavailable; any real content change was already
-    // rejected by patchCapabilityDenial before resolution.
-    const patchUpdateMode = caps !== undefined && !caps.edit ? 'preserve_line_endings' : DEFAULT_APPLY_PATCH_FILE_UPDATE_MODE;
+    effectiveArgs = { ...args, workdir: null };
+  }
 
+  // Every path the patch names is resolved through the connector environment up front, and the
+  // synchronous resolver handed into the Codex port reads that table back.
+  let resolution: PatchResolution;
+  try {
+    resolution = await resolvePatchPaths(roots, effectiveBase.virtual, effectiveArgs.hunks);
+  } catch (error) {
+    return { result: fail(friendlyError(error)), content: null, exitCode: null };
+  }
+  if (caps !== undefined) {
     try {
-      await verifyApplyPatchArgs(
-        effectiveArgs,
-        effectiveBase.real,
-        patchUpdateMode,
-        resolution.resolve
-      );
+      const denial = await patchEffectCapabilityDenial(effectiveArgs.hunks, caps, resolution.resolve, resolution.fs);
+      if (denial !== null) return { result: fail(denial), content: null, exitCode: null };
     } catch (error) {
-      return {
-        result: fail(`apply_patch verification failed: ${safePatchOutput(applyPatchErrorText(error, caps?.read === true), resolution)}`),
-        content: null,
-        exitCode: null
-      };
+      return { result: fail(friendlyError(error)), content: null, exitCode: null };
     }
+  }
+  // Upstream's default update mode splits on LF only: lines outside a hunk keep their CR while
+  // the hunk's context and new lines lose it, so one edit leaves a CRLF file with mixed endings
+  // (and a context-only move under Move alone would rewrite bytes). Keep each file's own endings.
+  const patchUpdateMode = 'preserve_line_endings';
 
-    let rollbackSnapshots: Map<string, PatchRollbackSnapshot> | null = null;
-    if (caps !== undefined) {
-      try {
-        rollbackSnapshots = await capturePatchRollbackSnapshots(resolution);
-      } catch (error) {
-        return { result: fail(friendlyError(error)), content: null, exitCode: null };
-      }
-    }
-
-    const execution = await executeApplyPatch({
-      patch: effectiveArgs.patch,
-      cwd: effectiveBase.real,
-      updateFileMode: patchUpdateMode,
-      resolvePath: resolution.resolve
-    });
-    let rollbackNote = '';
-    if (execution.exitCode !== 0 && rollbackSnapshots !== null) {
-      const rollback = await rollbackFailedPatch(rollbackSnapshots, execution.delta);
-      rollbackNote = rollback.note;
-    }
-    const stdout = safePatchOutput(execution.stdout, resolution);
-    const stderr = safePatchOutput(`${execution.stderr}${rollbackNote ? `${execution.stderr.endsWith('\n') || execution.stderr === '' ? '' : '\n'}${rollbackNote}\n` : ''}`, resolution);
-    const aggregatedOutput = `${stdout}${stderr}`;
-    const content = formatExecOutputForModel(
-      {
-        exitCode: execution.exitCode,
-        stdout: newStreamOutput(stdout),
-        stderr: newStreamOutput(stderr),
-        aggregatedOutput: newStreamOutput(aggregatedOutput),
-        durationMs: execution.durationMs,
-        timedOut: false
-      },
-      DEFAULT_TRUNCATION_POLICY
+  try {
+    await verifyApplyPatchArgs(
+      effectiveArgs,
+      effectiveBase.real,
+      patchUpdateMode,
+      resolution.resolve,
+      resolution.fs
     );
-
-    const recordedChanges = patchFileChanges(execution.delta, resolution.virtualPaths);
-    noteChanges(recordedChanges.map(entry => entry.change), execution.exitCode === 0 && execution.delta.exact
-      ? recordedChanges.map(({ before, after }) => ({ before, after })) : undefined);
-    logInfo(`tool apply_patch (${execution.delta.changes.length} file(s), exit ${execution.exitCode})`);
+  } catch (error) {
     return {
-      result: execution.exitCode === 0 ? ok(content) : fail(content),
-      content,
-      exitCode: execution.exitCode
+      result: fail(`apply_patch verification failed: ${safePatchOutput(applyPatchErrorText(error, caps?.read === true), resolution)}`),
+      content: null,
+      exitCode: null
     };
   }
 
-  /** Product permission gates around the otherwise ported Codex patch runtime. */
-  function patchCapabilityDenial(hunks: readonly Hunk[], caps: Capabilities): string | null {
-    for (const hunk of hunks) {
-      if (hunk.kind === 'add_file') {
-        if (!caps.create) return 'TOOL_DISABLED: this patch adds a file but Create files and folders is disabled.';
-        continue;
-      }
-      if (hunk.kind === 'delete_file') {
-        if (!caps.deleteFile) return 'TOOL_DISABLED: this patch deletes a file but Delete files is disabled.';
-        continue;
-      }
-
-      // Current Codex rejects an entirely empty Update hunk, including a move-only one. A rename
-      // can still be expressed with a context-only chunk (` old` == `new`), so distinguish that
-      // no-op content check from a real rewrite and preserve this app's separate Move permission.
-      const contentChange =
-        hunk.movePath === null ||
-        hunk.chunks.some(
-          (chunk) =>
-            chunk.oldLines.length !== chunk.newLines.length ||
-            chunk.oldLines.some((line, index) => line !== chunk.newLines[index])
-        );
-      if (contentChange && !caps.edit) {
-        return 'TOOL_DISABLED: this patch updates a file but Edit files is disabled.';
-      }
-      if (hunk.movePath !== null && !caps.move) {
-        return 'TOOL_DISABLED: this patch moves a file but Move / rename is disabled.';
-      }
+  let rollbackSnapshots: Map<string, PatchRollbackSnapshot> | null = null;
+  if (caps !== undefined) {
+    try {
+      rollbackSnapshots = await capturePatchRollbackSnapshots(resolution);
+    } catch (error) {
+      return { result: fail(friendlyError(error)), content: null, exitCode: null };
     }
-    return null;
   }
 
-  /**
-   * Permission checks whose answer depends on the filesystem effect rather than patch syntax.
-   *
-   * Codex intentionally lets `Add File` replace an existing regular file and lets a move replace
-   * an occupied destination. Those are useful patch semantics, but in this product they are edits
-   * to existing data, not "create" or pure "move" effects. Require Edit in addition to the syntax
-   * permission before handing such a patch to the runtime.
-   */
-  async function patchEffectCapabilityDenial(
-    hunks: readonly Hunk[],
-    caps: Capabilities,
-    resolve: PatchPathResolver
-  ): Promise<string | null> {
-    const exists = async (target: string): Promise<boolean> => {
-      try {
-        await fs.lstat(target);
-        return true;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
-        throw error;
-      }
-    };
-    const samePath = (left: string, right: string): boolean =>
-      process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
+  const execution = await executeApplyPatch({
+    patch: effectiveArgs.patch,
+    cwd: effectiveBase.real,
+    updateFileMode: patchUpdateMode,
+    resolvePath: resolution.resolve,
+    fs: resolution.fs
+  });
+  let rollbackNote = '';
+  if (execution.exitCode !== 0 && rollbackSnapshots !== null) {
+    const rollback = await rollbackFailedPatch(rollbackSnapshots, execution.delta, resolution.fs);
+    rollbackNote = rollback.note;
+  }
+  const stdout = safePatchOutput(execution.stdout, resolution);
+  const stderr = safePatchOutput(`${execution.stderr}${rollbackNote ? `${execution.stderr.endsWith('\n') || execution.stderr === '' ? '' : '\n'}${rollbackNote}\n` : ''}`, resolution);
+  const aggregatedOutput = `${stdout}${stderr}`;
+  const content = formatExecOutputForModel(
+    {
+      exitCode: execution.exitCode,
+      stdout: newStreamOutput(stdout),
+      stderr: newStreamOutput(stderr),
+      aggregatedOutput: newStreamOutput(aggregatedOutput),
+      durationMs: execution.durationMs,
+      timedOut: false
+    },
+    DEFAULT_TRUNCATION_POLICY
+  );
 
-    for (const hunk of hunks) {
-      if (hunk.kind === 'add_file') {
-        if (!caps.edit && (await exists(resolve(hunk.path, '')))) {
-          return 'TOOL_DISABLED: this patch replaces an existing file but Edit files is disabled.';
-        }
-        continue;
-      }
-      if (hunk.kind !== 'update_file' || hunk.movePath === null || caps.edit) continue;
-      const source = resolve(hunk.path, '');
-      const destination = resolve(hunk.movePath, '');
-      if (!samePath(source, destination) && (await exists(destination))) {
-        return 'TOOL_DISABLED: this patch replaces an existing move destination but Edit files is disabled.';
-      }
+  const recordedChanges = patchFileChanges(execution.delta, resolution.virtualPaths);
+  noteChanges(recordedChanges.map(entry => entry.change), execution.exitCode === 0 && execution.delta.exact
+    ? recordedChanges.map(({ before, after }) => ({ before, after })) : undefined);
+  logInfo(`tool apply_patch (${execution.delta.changes.length} file(s), exit ${execution.exitCode})`);
+  return {
+    result: execution.exitCode === 0 ? ok(content) : fail(content),
+    content,
+    exitCode: execution.exitCode
+  };
+}
+
+/** Product permission gates around the otherwise ported Codex patch runtime. */
+function patchCapabilityDenial(hunks: readonly Hunk[], caps: Capabilities): string | null {
+  for (const hunk of hunks) {
+    if (hunk.kind === 'add_file') {
+      if (!caps.create) return 'TOOL_DISABLED: this patch adds a file but Create files and folders is disabled.';
+      continue;
     }
-    return null;
-  }
-
-  interface PatchResolution {
-    resolve: PatchPathResolver;
-    /** Real path -> safe virtual path, used only for recorder change evidence. */
-    virtualPaths: Map<string, string>;
-    /** Exact model-visible/real spellings that must never be echoed back as native paths. */
-    displayRewrites: Map<string, string>;
-  }
-
-  function safePatchOutput(text: string, resolution: PatchResolution): string {
-    let safe = text;
-    const rewrites = [...resolution.displayRewrites].sort(([a], [b]) => b.length - a.length);
-    for (const [from, to] of rewrites) {
-      if (from === '' || from === to || !safe.includes(from)) continue;
-      safe = safe.split(from).join(to);
-    }
-    return safe;
-  }
-
-  /**
-   * Resolves every spelling before the Codex verifier/runtime sees it.
-   *
-   * Codex normally does `cwd.join(path)`. This connector must retain its approved-root boundary,
-   * so the synchronous resolver handed into the port reads a table that was produced by the same
-   * sandbox path resolver every other filesystem tool uses.
-   */
-  async function resolvePatchPaths(
-    roots: readonly Root[],
-    baseVirtual: string,
-    hunks: readonly Hunk[]
-  ): Promise<PatchResolution> {
-    const realBySpelling = new Map<string, string>();
-    const virtualPaths = new Map<string, string>();
-    const displayRewrites = new Map<string, string>();
-    // The Codex verifier/runtime is sequential: a later hunk may legally read a path an earlier
-    // Add/Move created, or may deliberately fail because an earlier Delete/Move removed it. Path
-    // resolution has to model that same presence state instead of consulting only pre-patch disk.
-    const pendingPresence = new Map<string, boolean>();
-    const pathKey = (real: string): string => (process.platform === 'win32' ? real.toLowerCase() : real);
-
-    const add = async (spelledPath: string, requireExisting: boolean): Promise<string> => {
-      // First resolve the sandbox identity without requiring the leaf to exist. This gives later
-      // hunks a stable real key even when the path exists only in the patch's simulated state.
-      let resolved = await resolveIn(roots, spelledPath, { base: baseVirtual, allowMissing: true });
-      const state = pendingPresence.get(pathKey(resolved.real));
-      // An untouched initial Update/Delete keeps the old strict Not-found behaviour. Once an
-      // earlier hunk has established presence/absence, the verifier owns the sequential verdict.
-      if (requireExisting && state === undefined) {
-        resolved = await resolveIn(roots, spelledPath, { base: baseVirtual, allowMissing: false });
-      }
-      realBySpelling.set(spelledPath, resolved.real);
-      virtualPaths.set(resolved.real, resolved.virtual);
-      displayRewrites.set(resolved.real, resolved.virtual);
-      if (isNativeWindowsPath(spelledPath)) displayRewrites.set(spelledPath, resolved.virtual);
-      return resolved.real;
-    };
-
-    for (const hunk of hunks) {
-      if (hunk.kind === 'add_file') {
-        const target = await add(hunk.path, false);
-        pendingPresence.set(pathKey(target), true);
-        continue;
-      }
-      if (hunk.kind === 'delete_file') {
-        const target = await add(hunk.path, true);
-        pendingPresence.set(pathKey(target), false);
-        continue;
-      }
-
-      const source = await add(hunk.path, true);
-      if (hunk.movePath === null) {
-        pendingPresence.set(pathKey(source), true);
-        continue;
-      }
-      const destination = await add(hunk.movePath, false);
-      pendingPresence.set(pathKey(source), false);
-      pendingPresence.set(pathKey(destination), true);
+    if (hunk.kind === 'delete_file') {
+      if (!caps.deleteFile) return 'TOOL_DISABLED: this patch deletes a file but Delete files is disabled.';
+      continue;
     }
 
-    const resolve: PatchPathResolver = (spelledPath) => {
-      const resolved = realBySpelling.get(spelledPath);
-      if (resolved === undefined) {
-        throw new SandboxError(`Patch path was not validated before use: ${spelledPath}`);
-      }
-      return resolved;
-    };
-    return { resolve, virtualPaths, displayRewrites };
-  }
-
-  function patchFileChanges(delta: AppliedPatchDelta, virtualPaths: ReadonlyMap<string, string>): Array<{ change: FileChange; before: string; after: string }> {
-    return delta.changes.map(({ path, change }) => {
-      let realPath = path;
-      let before: string;
-      let after: string;
-      if (change.kind === 'add') {
-        before = change.overwrittenContent ?? '';
-        after = change.content;
-      } else if (change.kind === 'delete') {
-        before = change.content;
-        after = '';
-      } else {
-        realPath = change.movePath ?? path;
-        before = change.oldContent;
-        after = change.newContent;
-      }
-      const counts = lineDelta(before, after);
-      return {
-        change: {
-          path: virtualPaths.get(realPath) ?? '[unresolved patch path]',
-          added: counts.added,
-          removed: counts.removed,
-          approximate: counts.approximate || !delta.exact
-        },
-        before,
-        after
-      };
-    });
-  }
-
-  // ---------------------------------------------------------------------------
-  // read helpers
-  // ---------------------------------------------------------------------------
-
-  function hasGlob(path: string): boolean {
-    return path.includes('*') || path.includes('?');
-  }
-
-  /**
-   * Expands a glob to real virtual paths, bounded twice over.
-   *
-   * Bounded on the walk (`GLOB_SCAN_LIMIT`) so a pattern rooted at a huge tree cannot spend
-   * minutes, and bounded on the result (`MAX_GLOB_MATCHES`) so a pattern cannot quietly turn
-   * one call into a bulk read of a repository. Both bounds are reported rather than silently
-   * applied — a truncated expansion the model does not know about is worse than no expansion.
-   */
-  async function expandGlob(
-    roots: Parameters<typeof resolvePath>[0],
-    pattern: string
-  ): Promise<{ matches: string[]; truncated: 'matches' | 'scan' | null }> {
-    const normalised = process.platform === 'win32' ? pattern.replace(/\\/g, '/') : pattern;
-    const segments = normalised.split('/');
-    const baseSegments: string[] = [];
-    for (const segment of segments) {
-      if (hasGlob(segment)) break;
-      baseSegments.push(segment);
+    // Current Codex rejects an entirely empty Update hunk, including a move-only one. A rename
+    // can still be expressed with a context-only chunk (` old` == `new`), so distinguish that
+    // no-op content check from a real rewrite and preserve this app's separate Move permission.
+    const contentChange =
+      hunk.movePath === null ||
+      hunk.chunks.some(
+        (chunk) =>
+          chunk.oldLines.length !== chunk.newLines.length ||
+          chunk.oldLines.some((line, index) => line !== chunk.newLines[index])
+      );
+    if (contentChange && !caps.edit) {
+      return 'TOOL_DISABLED: this patch updates a file but Edit files is disabled.';
     }
-    // A leading wildcard is workspace-relative. Substituting `/` here silently changed
-    // `*.ts` into an absolute virtual-root lookup and made every learned workspace useless.
-    const base = baseSegments.join('/') || (normalised.startsWith('/') ? '/' : '');
-    const rest = segments.slice(baseSegments.length).join('/');
-    if (!rest) return { matches: [normalised], truncated: null };
+    if (hunk.movePath !== null && !caps.move) {
+      return 'TOOL_DISABLED: this patch moves a file but Move / rename is disabled.';
+    }
+  }
+  return null;
+}
 
-    const resolved = await resolveIn(roots, base, { access: 'read' });
-    const info = await statInfo(resolved.real, resolved.virtual, { scanContent: false });
-    if (info.type !== 'directory') throw new SandboxError(`${resolved.virtual} is not a folder, so it cannot be globbed`);
+/**
+ * Permission checks whose answer depends on the filesystem effect rather than patch syntax.
+ *
+ * Codex intentionally lets `Add File` replace an existing regular file and lets a move replace
+ * an occupied destination. Those are useful patch semantics, but in this product they are edits
+ * to existing data, not "create" or pure "move" effects. Require Edit in addition to the syntax
+ * permission before handing such a patch to the runtime.
+ */
+async function patchEffectCapabilityDenial(
+  hunks: readonly Hunk[],
+  caps: Capabilities,
+  resolve: PatchPathResolver,
+  projectFs: ProjectFs
+): Promise<string | null> {
+  const exists = async (target: string): Promise<boolean> => {
+    try {
+      // A server folder never resolves a dangling link, so following links there loses nothing.
+      if (projectFs === localFs) await fs.lstat(target);
+      else await projectFs.getMetadata(target);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    }
+  };
+  const samePath = (left: string, right: string): boolean =>
+    projectFs === localFs && process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
 
-    // `**` walks with Codex's bounded breadth-first walk; a single-level pattern needs one
-    // directory read and nothing more.
-    let candidates: string[];
-    let scanTruncated = false;
-    if (rest.includes('**')) {
-      const walked = await walkFiles(resolved.real, resolved.virtual, {
-        maxEntries: GLOB_SCAN_LIMIT,
-        exclude: DEFAULT_EXCLUDES
-      });
-      candidates = walked.files;
-      scanTruncated = walked.truncated;
+  for (const hunk of hunks) {
+    if (hunk.kind === 'add_file') {
+      if (!caps.edit && (await exists(resolve(hunk.path, '')))) {
+        return 'TOOL_DISABLED: this patch replaces an existing file but Edit files is disabled.';
+      }
+      continue;
+    }
+    if (hunk.kind !== 'update_file' || hunk.movePath === null || caps.edit) continue;
+    const source = resolve(hunk.path, '');
+    const destination = resolve(hunk.movePath, '');
+    if (!samePath(source, destination) && (await exists(destination))) {
+      return 'TOOL_DISABLED: this patch replaces an existing move destination but Edit files is disabled.';
+    }
+  }
+  return null;
+}
+
+interface PatchResolution {
+  resolve: PatchPathResolver;
+  /** Real path -> safe virtual path, used only for recorder change evidence. */
+  virtualPaths: Map<string, string>;
+  /** Exact model-visible/real spellings that must never be echoed back as native paths. */
+  displayRewrites: Map<string, string>;
+  /** Where every path of the patch lives: this computer, or the one server folder (#1469). */
+  fs: ProjectFs;
+}
+
+function safePatchOutput(text: string, resolution: PatchResolution): string {
+  let safe = text;
+  const rewrites = [...resolution.displayRewrites].sort(([a], [b]) => b.length - a.length);
+  for (const [from, to] of rewrites) {
+    if (from === '' || from === to || !safe.includes(from)) continue;
+    safe = safe.split(from).join(to);
+  }
+  return safe;
+}
+
+/**
+ * Resolves every spelling before the Codex verifier/runtime sees it.
+ *
+ * Codex normally does `cwd.join(path)`. This connector must retain its approved-root boundary,
+ * so the synchronous resolver handed into the port reads a table that was produced by the same
+ * sandbox path resolver every other filesystem tool uses.
+ */
+async function resolvePatchPaths(
+  roots: readonly Root[],
+  baseVirtual: string,
+  hunks: readonly Hunk[]
+): Promise<PatchResolution> {
+  const realBySpelling = new Map<string, string>();
+  const virtualPaths = new Map<string, string>();
+  const displayRewrites = new Map<string, string>();
+  // The Codex verifier/runtime is sequential: a later hunk may legally read a path an earlier
+  // Add/Move created, or may deliberately fail because an earlier Delete/Move removed it. Path
+  // resolution has to model that same presence state instead of consulting only pre-patch disk.
+  const pendingPresence = new Map<string, boolean>();
+  const pathKey = (real: string): string => (process.platform === 'win32' ? real.toLowerCase() : real);
+  const touchedRoots = new Map<string, Root>();
+
+  const add = async (spelledPath: string, requireExisting: boolean): Promise<string> => {
+    // First resolve the sandbox identity without requiring the leaf to exist. This gives later
+    // hunks a stable real key even when the path exists only in the patch's simulated state.
+    let resolved = await resolveIn(roots, spelledPath, { base: baseVirtual, allowMissing: true, remote: true });
+    const state = pendingPresence.get(pathKey(resolved.real));
+    // An untouched initial Update/Delete keeps the old strict Not-found behaviour. Once an
+    // earlier hunk has established presence/absence, the verifier owns the sequential verdict.
+    if (requireExisting && state === undefined) {
+      resolved = await resolveIn(roots, spelledPath, { base: baseVirtual, allowMissing: false, remote: true });
+    }
+    touchedRoots.set(resolved.root.name, resolved.root);
+    realBySpelling.set(spelledPath, resolved.real);
+    virtualPaths.set(resolved.real, resolved.virtual);
+    displayRewrites.set(resolved.real, resolved.virtual);
+    if (isNativeWindowsPath(spelledPath)) displayRewrites.set(spelledPath, resolved.virtual);
+    return resolved.real;
+  };
+
+  for (const hunk of hunks) {
+    if (hunk.kind === 'add_file') {
+      const target = await add(hunk.path, false);
+      pendingPresence.set(pathKey(target), true);
+      continue;
+    }
+    if (hunk.kind === 'delete_file') {
+      const target = await add(hunk.path, true);
+      pendingPresence.set(pathKey(target), false);
+      continue;
+    }
+
+    const source = await add(hunk.path, true);
+    if (hunk.movePath === null) {
+      pendingPresence.set(pathKey(source), true);
+      continue;
+    }
+    const destination = await add(hunk.movePath, false);
+    pendingPresence.set(pathKey(source), false);
+    pendingPresence.set(pathKey(destination), true);
+  }
+
+  // One patch is applied through one file system. A server folder's files are reached over its
+  // own SFTP session, so a patch there stays inside that folder; mixing it with any other folder
+  // would need two file systems and two rollbacks that could not succeed or fail together.
+  const remote = [...touchedRoots.values()].find(root => root.remote);
+  if (remote && touchedRoots.size > 1) {
+    throw new SandboxError(
+      `This patch changes files in /${remote.name}, a folder on a server, and in another folder. A patch can change files in one server folder at a time; split it into one patch per folder.`
+    );
+  }
+
+  const resolve: PatchPathResolver = (spelledPath) => {
+    const resolved = realBySpelling.get(spelledPath);
+    if (resolved === undefined) {
+      throw new SandboxError(`Patch path was not validated before use: ${spelledPath}`);
+    }
+    return resolved;
+  };
+  return { resolve, virtualPaths, displayRewrites, fs: remote ? fsForRoot(remote) : localFs };
+}
+
+function patchFileChanges(delta: AppliedPatchDelta, virtualPaths: ReadonlyMap<string, string>): Array<{ change: FileChange; before: string; after: string }> {
+  return delta.changes.map(({ path, change }) => {
+    let realPath = path;
+    let before: string;
+    let after: string;
+    if (change.kind === 'add') {
+      before = change.overwrittenContent ?? '';
+      after = change.content;
+    } else if (change.kind === 'delete') {
+      before = change.content;
+      after = '';
     } else {
-      const listed = await listDirectoryLevel(resolved.real, resolved.virtual, GLOB_SCAN_LIMIT, false);
-      candidates = listed.entries.filter((entry) => entry.type === 'file').map((entry) => entry.virtualPath);
-      scanTruncated = listed.truncated;
+      realPath = change.movePath ?? path;
+      before = change.oldContent;
+      after = change.newContent;
     }
+    const counts = lineDelta(before, after);
+    return {
+      change: {
+        path: virtualPaths.get(realPath) ?? '[unresolved patch path]',
+        added: counts.added,
+        removed: counts.removed,
+        approximate: counts.approximate || !delta.exact
+      },
+      before,
+      after
+    };
+  });
+}
 
-    const matcher = globToRegExp(rest, false);
-    const prefixLength = resolved.virtual.length + 1;
-    const matches: string[] = [];
-    for (const candidate of candidates) {
-      if (!matcher.test(candidate.slice(prefixLength))) continue;
-      // Truncation means there is an actual omitted match, not merely that the result landed
-      // exactly on the cap. Returning `matches` as soon as the 20th item was added made a folder
-      // with exactly 20 matches claim "more than 20 matches" and sent the model narrowing a query
-      // that had already been answered completely.
-      if (matches.length >= MAX_GLOB_MATCHES) return { matches, truncated: 'matches' };
-      matches.push(candidate);
+// ---------------------------------------------------------------------------
+// read helpers
+// ---------------------------------------------------------------------------
+
+function hasGlob(path: string): boolean {
+  return path.includes('*') || path.includes('?');
+}
+
+/**
+ * Expands a glob to real virtual paths, bounded twice over.
+ *
+ * Bounded on the walk (`GLOB_SCAN_LIMIT`) so a pattern rooted at a huge tree cannot spend
+ * minutes, and bounded on the result (`MAX_GLOB_MATCHES`) so a pattern cannot quietly turn
+ * one call into a bulk read of a repository. Both bounds are reported rather than silently
+ * applied — a truncated expansion the model does not know about is worse than no expansion.
+ */
+async function expandGlob(
+  roots: Parameters<typeof resolvePath>[0],
+  pattern: string
+): Promise<{ matches: string[]; truncated: 'matches' | 'scan' | null }> {
+  const normalised = process.platform === 'win32' ? pattern.replace(/\\/g, '/') : pattern;
+  const segments = normalised.split('/');
+  const baseSegments: string[] = [];
+  for (const segment of segments) {
+    if (hasGlob(segment)) break;
+    baseSegments.push(segment);
+  }
+  // A leading wildcard is workspace-relative. Substituting `/` here silently changed
+  // `*.ts` into an absolute virtual-root lookup and made every learned workspace useless.
+  const base = baseSegments.join('/') || (normalised.startsWith('/') ? '/' : '');
+  const rest = segments.slice(baseSegments.length).join('/');
+  if (!rest) return { matches: [normalised], truncated: null };
+
+  const resolved = await resolveIn(roots, base, { access: 'read', remote: true });
+  const projectFs = fsForRoot(resolved.root);
+  const info = await statInfo(resolved.real, resolved.virtual, { scanContent: false, fs: projectFs });
+  if (info.type !== 'directory') throw new SandboxError(`${resolved.virtual} is not a folder, so it cannot be globbed`);
+
+  // `**` walks with Codex's bounded breadth-first walk; a single-level pattern needs one
+  // directory read and nothing more.
+  let candidates: string[];
+  let scanTruncated = false;
+  if (rest.includes('**')) {
+    const walked = await walkFiles(resolved.real, resolved.virtual, {
+      maxEntries: GLOB_SCAN_LIMIT,
+      exclude: DEFAULT_EXCLUDES,
+      fs: projectFs
+    });
+    candidates = walked.files;
+    scanTruncated = walked.truncated;
+  } else {
+    const listed = await listDirectoryLevel(resolved.real, resolved.virtual, GLOB_SCAN_LIMIT, false, projectFs);
+    candidates = listed.entries.filter((entry) => entry.type === 'file').map((entry) => entry.virtualPath);
+    scanTruncated = listed.truncated;
+  }
+
+  const matcher = globToRegExp(rest, false);
+  const prefixLength = resolved.virtual.length + 1;
+  const matches: string[] = [];
+  for (const candidate of candidates) {
+    if (!matcher.test(candidate.slice(prefixLength))) continue;
+    // Truncation means there is an actual omitted match, not merely that the result landed
+    // exactly on the cap. Returning `matches` as soon as the 20th item was added made a folder
+    // with exactly 20 matches claim "more than 20 matches" and sent the model narrowing a query
+    // that had already been answered completely.
+    if (matches.length >= MAX_GLOB_MATCHES) return { matches, truncated: 'matches' };
+    matches.push(candidate);
+  }
+  return { matches, truncated: scanTruncated ? 'scan' : null };
+}
+
+interface ReadOneOptions {
+  roots: Parameters<typeof resolvePath>[0];
+  canRead: boolean;
+  canBrowse: boolean;
+  startLine?: number;
+  endLine?: number;
+  maxBytes: number;
+  imageBytes: number;
+}
+
+interface ReadTarget {
+  path: string;
+  /** A range the caller attached to this one path, or null for the call-wide range. */
+  range: { start: number; end: number | undefined } | null;
+}
+
+/**
+ * Reads a `path:12-40` or `path:12` suffix off one requested path.
+ *
+ * It is the spelling a model reaches for when it wants several ranges of one file in one
+ * call, and the sandbox used to refuse it as a colon in a path — five calls across the 50 most
+ * recent recorded sessions, each carrying three or four ranges of the same file. Only a suffix
+ * after the last separator counts, so a `C:\\...` drive letter is never read as a range, and
+ * a range that runs backwards is left on the path for the sandbox to refuse as before.
+ */
+function splitLineRange(requested: string): { path: string; range: ReadTarget['range'] } {
+  const match = /^(.*[^\\/:]):(\d{1,9})(?:-(\d{1,9}))?$/.exec(requested);
+  if (!match) return { path: requested, range: null };
+  const start = Number(match[2]);
+  const end = match[3] === undefined ? undefined : Number(match[3]);
+  if (start < 1 || (end !== undefined && end < start)) return { path: requested, range: null };
+  return { path: match[1]!, range: { start, end } };
+}
+
+/** How many entries a not-found error lists from the nearest folder that does exist. */
+const MISSING_PATH_LISTING = 40;
+
+/**
+ * For a path that does not exist, the nearest folder above it that does, listed.
+ *
+ * "Not found" alone sends the model into a listing call it could have been spared: in the 50
+ * most recent recorded sessions the single most repeated read failure was a repository file
+ * guessed one folder too high, followed by a read of the folder to see what was there. Listing
+ * the nearest existing ancestor answers that follow-up in the same reply. It walks up through
+ * the sandbox one level at a time and says nothing unless a folder resolved.
+ */
+async function nearestFolderListing(roots: Root[], requested: string, err: unknown): Promise<string> {
+  if (!(err instanceof SandboxError) || !err.message.startsWith('Not found:')) return '';
+  const meant = await pathUnderNamedRoot(roots, requested);
+  if (meant) return `\nDid you mean ${meant}? It exists under the approved root of that name.`;
+  let candidate = requested;
+  for (let depth = 0; depth < 8; depth++) {
+    const parent = candidate.replace(/[\\/]+[^\\/]+[\\/]*$/, '');
+    if (parent === candidate || parent === '' || /^[A-Za-z]:$/.test(parent)) return '';
+    candidate = parent;
+    let resolved;
+    try {
+      resolved = await resolveIn(roots, candidate, { access: 'read', remote: true });
+    } catch (error) {
+      if (error instanceof SandboxError && error.message.startsWith('Not found:')) continue;
+      return '';
     }
-    return { matches, truncated: scanTruncated ? 'scan' : null };
-  }
-
-  interface ReadOneOptions {
-    roots: Parameters<typeof resolvePath>[0];
-    canRead: boolean;
-    canBrowse: boolean;
-    startLine?: number;
-    endLine?: number;
-    maxBytes: number;
-    imageBytes: number;
-  }
-
-  interface ReadTarget {
-    path: string;
-    /** A range the caller attached to this one path, or null for the call-wide range. */
-    range: { start: number; end: number | undefined } | null;
-  }
-
-  /**
-   * Reads a `path:12-40` or `path:12` suffix off one requested path.
-   *
-   * It is the spelling a model reaches for when it wants several ranges of one file in one
-   * call, and the sandbox used to refuse it as a colon in a path — five calls across the 50 most
-   * recent recorded sessions, each carrying three or four ranges of the same file. Only a suffix
-   * after the last separator counts, so a `C:\\...` drive letter is never read as a range, and
-   * a range that runs backwards is left on the path for the sandbox to refuse as before.
-   */
-  function splitLineRange(requested: string): { path: string; range: ReadTarget['range'] } {
-    const match = /^(.*[^\\/:]):(\d{1,9})(?:-(\d{1,9}))?$/.exec(requested);
-    if (!match) return { path: requested, range: null };
-    const start = Number(match[2]);
-    const end = match[3] === undefined ? undefined : Number(match[3]);
-    if (start < 1 || (end !== undefined && end < start)) return { path: requested, range: null };
-    return { path: match[1]!, range: { start, end } };
-  }
-
-  /** How many entries a not-found error lists from the nearest folder that does exist. */
-  const MISSING_PATH_LISTING = 40;
-
-  /**
-   * For a path that does not exist, the nearest folder above it that does, listed.
-   *
-   * "Not found" alone sends the model into a listing call it could have been spared: in the 50
-   * most recent recorded sessions the single most repeated read failure was a repository file
-   * guessed one folder too high, followed by a read of the folder to see what was there. Listing
-   * the nearest existing ancestor answers that follow-up in the same reply. It walks up through
-   * the sandbox one level at a time and says nothing unless a folder resolved.
-   */
-  async function nearestFolderListing(roots: Root[], requested: string, err: unknown): Promise<string> {
-    if (!(err instanceof SandboxError) || !err.message.startsWith('Not found:')) return '';
-    let candidate = requested;
-    for (let depth = 0; depth < 8; depth++) {
-      const parent = candidate.replace(/[\\/]+[^\\/]+[\\/]*$/, '');
-      if (parent === candidate || parent === '' || /^[A-Za-z]:$/.test(parent)) return '';
-      candidate = parent;
-      let resolved;
-      try {
-        resolved = await resolveIn(roots, candidate, { access: 'read' });
-      } catch (error) {
-        if (error instanceof SandboxError && error.message.startsWith('Not found:')) continue;
-        return '';
-      }
-      try {
-        const { entries, truncated } = await listDirectoryLevel(resolved.real, resolved.virtual, MISSING_PATH_LISTING, false);
-        const names = entries.map((entry) => `${entry.type === 'directory' ? 'd' : 'f'} ${entry.name}`);
-        const more = truncated ? `, …` : '';
-        return `\nThe nearest existing folder is ${resolved.virtual}${
-          entries.length === 0 ? ', and it is empty.' : `; it contains: ${names.join(', ')}${more}`
-        }`;
-      } catch {
-        return '';
-      }
+    try {
+      const { entries, truncated } = await listDirectoryLevel(resolved.real, resolved.virtual, MISSING_PATH_LISTING, false, fsForRoot(resolved.root));
+      const names = entries.map((entry) => `${entry.type === 'directory' ? 'd' : 'f'} ${entry.name}`);
+      const more = truncated ? `, …` : '';
+      return `\nThe nearest existing folder is ${resolved.virtual}${
+        entries.length === 0 ? ', and it is empty.' : `; it contains: ${names.join(', ')}${more}`
+      }`;
+    } catch {
+      return '';
     }
-    return '';
   }
+  return '';
+}
 
-  /**
-   * One path, one section of output, and the byte cost of producing it.
-   *
-   * The three result shapes are decided here rather than by an action argument, because from
-   * the caller's side they are one question — what is at this path — and asking a model to
-   * pick the right verb for a path it has not looked at yet is how `read_file` on a directory
-   * became a routine error.
-   */
-  async function readOne(
-    requested: string,
-    options: ReadOneOptions
-  ): Promise<{ text: string; bytes: number; image?: { data: string; mimeType: string } }> {
-    // 虚拟根列出当前授权目录，不把它当作主机文件系统根。
+/**
+ * A missing path that names another approved root further down, where the rest exists.
+ *
+ * Live 2026-10-12: with roots `/downloads` and `/voxelcraft`, a model read
+ * `/downloads/.Dev-projects/voxelcraft/shared/adventure.ts`, the project's disk path under the
+ * wrong root. The listing that followed showed the user's Downloads folder, unrelated to the
+ * project, instead of the file it was after.
+ */
+async function pathUnderNamedRoot(roots: Root[], requested: string): Promise<string | null> {
+  const segments = requested.split(/[\\/]+/).filter(Boolean);
+  for (let index = 1; index < segments.length - 1; index++) {
+    const root = roots.find(entry => entry.name.toLowerCase() === segments[index]!.toLowerCase());
+    if (!root) continue;
+    const candidate = `/${[root.name, ...segments.slice(index + 1)].join('/')}`;
+    try {
+      return (await resolveIn(roots, candidate, { access: 'read', remote: true })).virtual;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+/**
+ * One path, one section of output, and the byte cost of producing it.
+ *
+ * The three result shapes are decided here rather than by an action argument, because from
+ * the caller's side they are one question — what is at this path — and asking a model to
+ * pick the right verb for a path it has not looked at yet is how `read_file` on a directory
+ * became a routine error.
+ */
+async function readOne(
+  requested: string,
+  options: ReadOneOptions
+): Promise<{ text: string; bytes: number; image?: { data: string; mimeType: string } }> {
+  // The virtual root itself: a model that has not looked yet naturally starts at "/", and "Path
+  // is empty" left it guessing the names. The shared folders are what "/" contains.
   if (typeof requested === 'string' && (process.platform === 'win32' ? /^[/\\]+$/ : /^\/+$/).test(requested.trim())) {
     if (!options.canBrowse) {
       return { text: `--- / ---\nTOOL_DISABLED: listing folders needs the Browse folders permission.`, bytes: 0 };
@@ -1609,174 +1746,175 @@ export function registerExecutionTools(reg: ExecutionRegistrar, host: CoreExecut
       : `--- / — ${options.roots.length} entr${options.roots.length === 1 ? 'y' : 'ies'}, one level ---\n${options.roots.map(root => `d ${root.name}`).join('\n')}`;
     return { text, bytes: Buffer.byteLength(text, 'utf8') };
   }
-  const resolved = await resolveIn(options.roots, requested, { access: 'read' });
-    const info = await statInfo(resolved.real, resolved.virtual, { scanContent: !options.canRead });
+  const resolved = await resolveIn(options.roots, requested, { access: 'read', remote: true });
+  const projectFs = fsForRoot(resolved.root);
+  const info = await statInfo(resolved.real, resolved.virtual, { scanContent: !options.canRead, fs: projectFs });
 
-    if (info.type === 'directory') {
-      if (!options.canBrowse) {
-        return { text: `--- ${resolved.virtual} ---\nTOOL_DISABLED: listing folders needs the Browse folders permission.`, bytes: 0 };
-      }
-      const { entries, truncated } = await listDirectoryLevel(resolved.real, resolved.virtual, MAX_DIR_ENTRIES);
-      const prefixLength = resolved.virtual.length + 1;
-      const body = entries
-        .map((entry) => {
-          const kind = entry.type === 'directory' ? 'd' : entry.type === 'file' ? 'f' : '?';
-          const size = entry.bytes === null ? '' : `  ${formatBytes(entry.bytes)}`;
-          return `${kind} ${entry.virtualPath.slice(prefixLength)}${size}`;
-        })
-        .join('\n');
-      const note = truncated
-        ? `\n(stopped at ${MAX_DIR_ENTRIES} entries — read a subfolder, or use a glob such as ${resolved.virtual}/**/*.ts)`
-        : '';
-      const text =
-        entries.length === 0
-          ? `--- ${resolved.virtual} — empty folder ---`
-          : `--- ${resolved.virtual} — ${entries.length} entr${entries.length === 1 ? 'y' : 'ies'}, one level ---\n${body}${note}`;
-      return { text, bytes: Buffer.byteLength(text, 'utf8') };
+  if (info.type === 'directory') {
+    if (!options.canBrowse) {
+      return { text: `--- ${resolved.virtual} ---\nTOOL_DISABLED: listing folders needs the Browse folders permission.`, bytes: 0 };
     }
+    const { entries, truncated } = await listDirectoryLevel(resolved.real, resolved.virtual, MAX_DIR_ENTRIES, true, projectFs);
+    const prefixLength = resolved.virtual.length + 1;
+    const body = entries
+      .map((entry) => {
+        const kind = entry.type === 'directory' ? 'd' : entry.type === 'file' ? 'f' : '?';
+        const size = entry.bytes === null ? '' : `  ${formatBytes(entry.bytes)}`;
+        return `${kind} ${entry.virtualPath.slice(prefixLength)}${size}`;
+      })
+      .join('\n');
+    const note = truncated
+      ? `\n(stopped at ${MAX_DIR_ENTRIES} entries — read a subfolder, or use a glob such as ${resolved.virtual}/**/*.ts)`
+      : '';
+    const text =
+      entries.length === 0
+        ? `--- ${resolved.virtual} — empty folder ---`
+        : `--- ${resolved.virtual} — ${entries.length} entr${entries.length === 1 ? 'y' : 'ies'}, one level ---\n${body}${note}`;
+    return { text, bytes: Buffer.byteLength(text, 'utf8') };
+  }
 
-    if (info.type !== 'file') {
-      const text = `--- ${resolved.virtual} ---\n${formatFileInfo(info)}\nNot a regular file, so there is nothing to read.`;
-      return { text, bytes: Buffer.byteLength(text, 'utf8') };
-    }
+  if (info.type !== 'file') {
+    const text = `--- ${resolved.virtual} ---\n${formatFileInfo(info)}\nNot a regular file, so there is nothing to read.`;
+    return { text, bytes: Buffer.byteLength(text, 'utf8') };
+  }
 
-    if (!options.canRead) {
-      // Metadata without content is a real answer when the user granted exactly that, and it
-      // is strictly better than refusing the path outright.
-      const text = `--- ${resolved.virtual} ---\n${formatFileInfo(info)}\n(file contents need the Read files permission)`;
-      return { text, bytes: Buffer.byteLength(text, 'utf8') };
-    }
+  if (!options.canRead) {
+    // Metadata without content is a real answer when the user granted exactly that, and it
+    // is strictly better than refusing the path outright.
+    const text = `--- ${resolved.virtual} ---\n${formatFileInfo(info)}\n(file contents need the Read files permission)`;
+    return { text, bytes: Buffer.byteLength(text, 'utf8') };
+  }
 
-    const extension = nodePath.extname(resolved.virtual).toLowerCase();
-    if (IMAGE_EXTENSIONS.has(extension)) {
-      // The same loader `view_image` uses, so an image opened through either tool is validated and
-      // decoded identically. `view_image` still exists in its own right: it is Codex's tool, with
-      // Codex's name, schema and errors, and this branch is only `read` continuing to answer "what
-      // is at this path" for a path that happens to be a picture.
-      // Text and image representations have separate aggregate bounds. An ordinary screenshot
-      // must not fail solely because it is larger than the text budget. Still charge base64,
-      // not just compressed file bytes, and refuse an exhausted image batch before decoding.
-      if (options.imageBytes <= 0) throw new Error('Read image output cap reached; read remaining images in another call or use view_image.');
-      const image = await viewImage(resolved.real, null, undefined, resolved.virtual);
-      logInfo(`tool read image ${resolved.virtual} (${formatBytes(image.bytes)})`);
-      const text = `--- ${resolved.virtual} — ${formatBytes(image.bytes)} ${image.mimeType} ---`;
-      if (image.base64.length > options.imageBytes) {
-        throw new Error(
-          `Read image output cap reached (${formatBytes(MAX_READ_IMAGE_BYTES)} base64 per call); read remaining images in another call or use view_image.`
-        );
-      }
-      return {
-        text,
-        bytes: Buffer.byteLength(text, 'utf8'),
-        image: { data: image.base64, mimeType: image.mimeType }
-      };
+  const extension = nodePath.extname(resolved.virtual).toLowerCase();
+  if (IMAGE_EXTENSIONS.has(extension)) {
+    // The same loader `view_image` uses, so an image opened through either tool is validated and
+    // decoded identically. `view_image` still exists in its own right: it is Codex's tool, with
+    // Codex's name, schema and errors, and this branch is only `read` continuing to answer "what
+    // is at this path" for a path that happens to be a picture.
+    // Text and image representations have separate aggregate bounds. An ordinary screenshot
+    // must not fail solely because it is larger than the text budget. Still charge base64,
+    // not just compressed file bytes, and refuse an exhausted image batch before decoding.
+    if (options.imageBytes <= 0) throw new Error('Read image output cap reached; read remaining images in another call or use view_image.');
+    const image = await viewImage(resolved.real, null, undefined, resolved.virtual, undefined, projectFs);
+    logInfo(`tool read image ${resolved.virtual} (${formatBytes(image.bytes)})`);
+    const text = `--- ${resolved.virtual} — ${formatBytes(image.bytes)} ${image.mimeType} ---`;
+    if (image.base64.length > options.imageBytes) {
+      throw new Error(
+        `Read image output cap reached (${formatBytes(MAX_READ_IMAGE_BYTES)} base64 per call); read remaining images in another call or use view_image.`
+      );
     }
-
-    if (info.binary) {
-      // Never dumped as base64. A model that asked to read a .dll wanted to know what it is,
-      // and several megabytes of base64 answers a question nobody asked at ruinous cost.
-      const text =
-        `--- ${resolved.virtual} ---\n${formatFileInfo(info)}\n` +
-        'Binary file, so its bytes are not returned. Use exec_command if you need to inspect or convert it.';
-      return { text, bytes: Buffer.byteLength(text, 'utf8') };
-    }
-
-    let result;
-    try {
-      result = await readTextFile(resolved.real, {
-        startLine: options.startLine,
-        endLine: options.endLine,
-        maxBytes: options.maxBytes
-      });
-    } catch (error) {
-      if (!(error instanceof BinaryReadError)) throw error;
-      info.binary = true;
-      const text =
-        `--- ${resolved.virtual} ---\n${formatFileInfo(info)}\n` +
-        'Binary file, so its bytes are not returned. Use exec_command if you need to inspect or convert it.';
-      return { text, bytes: Buffer.byteLength(text, 'utf8') };
-    }
-    if (result.lastLine >= result.firstLine) noteDetail(`lines ${result.firstLine}–${result.lastLine}`);
-    /*
-     * How long is this file?
-     *
-     * That is the question the header's line count exists to answer, and it used to go unanswered
-     * on exactly the reads that needed it: a range read stopped at `end_line`, so `totalLines` was
-     * null and the header said `lines 600-750` with no denominator. The caller could see what it
-     * had and not what it was a part of — which is how "600-750" gets mistaken for a whole file,
-     * and how a follow-up read gets aimed at a line that does not exist.
-     *
-     * `info.lines` is no help here: `readOne` calls `statInfo` with `scanContent: !canRead`, so in
-     * the ordinary read path the content scan is skipped and `info.lines` is null. The total now
-     * comes from the read itself, which counts on past the range (see `MAX_LINE_COUNT_BYTES`).
-     *
-     * So a total is missing in one case only — a range inside a file too big to be worth counting —
-     * and the header then states the range plainly rather than inventing a denominator.
-     */
-    const numbered = boundedNumberedRead(
-      result.text,
-      result.firstLine,
-      result.lastLine >= result.firstLine,
-      options.maxBytes
-    );
-    const visibleLastLine = numbered.lastLine;
-    const range =
-      visibleLastLine < result.firstLine
-        ? result.totalLines === null
-          ? 'no lines in that range'
-          : `no lines in that range; the file has ${result.totalLines}`
-        : result.totalLines === null
-          ? `lines ${result.firstLine}-${visibleLastLine}`
-          : `lines ${result.firstLine}-${visibleLastLine} of ${result.totalLines}`;
-    const note = result.truncated || numbered.truncated
-      ? `\n(output cap reached; continue from line ${visibleLastLine + 1} or raise max_bytes up to ${MAX_READ_BYTES})`
-      : result.hasMore
-        ? `\n(more lines follow — continue from line ${visibleLastLine + 1})`
-        : '';
-    const header = `--- ${resolved.virtual} — ${range}, ${formatBytes(info.bytes)}, modified ${info.modified} ---`;
-    const text = `${header}${numbered.text === '' && visibleLastLine < result.firstLine ? '' : `\n${numbered.text}`}${note}`;
     return {
       text,
-      // Charge the aggregate call budget for what is actually serialized, including headers and
-      // line-number prefixes. Counting only raw file bytes let thousands of short lines amplify a
-      // nominal 512 KiB cap into a multi-megabyte MCP response.
-      bytes: Buffer.byteLength(text, 'utf8')
+      bytes: Buffer.byteLength(text, 'utf8'),
+      image: { data: image.base64, mimeType: image.mimeType }
     };
   }
 
-  /**
-   * Adds the model-visible line-number prefix without letting that metadata amplify a bounded
-   * file slice into an unbounded MCP result. `readTextFile` caps raw decoded bytes; a file made of
-   * hundreds of thousands of empty/tiny lines can add several extra megabytes of decimal prefixes
-   * afterwards. Spend the same budget on the numbered representation too. A real empty logical
-   * line is represented by `N\t`; `hasLine=false` is the only case that renders no row.
+  if (info.binary) {
+    // Never dumped as base64. A model that asked to read a .dll wanted to know what it is,
+    // and several megabytes of base64 answers a question nobody asked at ruinous cost.
+    const text =
+      `--- ${resolved.virtual} ---\n${formatFileInfo(info)}\n` +
+      'Binary file, so its bytes are not returned. Use exec_command if you need to inspect or convert it.';
+    return { text, bytes: Buffer.byteLength(text, 'utf8') };
+  }
+
+  let result;
+  try {
+    result = await readTextFile(resolved.real, {
+      startLine: options.startLine,
+      endLine: options.endLine,
+      maxBytes: options.maxBytes,
+      fs: projectFs
+    });
+  } catch (error) {
+    if (!(error instanceof BinaryReadError)) throw error;
+    info.binary = true;
+    const text =
+      `--- ${resolved.virtual} ---\n${formatFileInfo(info)}\n` +
+      'Binary file, so its bytes are not returned. Use exec_command if you need to inspect or convert it.';
+    return { text, bytes: Buffer.byteLength(text, 'utf8') };
+  }
+  if (result.lastLine >= result.firstLine) noteDetail(`lines ${result.firstLine}–${result.lastLine}`);
+  /*
+   * How long is this file?
+   *
+   * That is the question the header's line count exists to answer, and it used to go unanswered
+   * on exactly the reads that needed it: a range read stopped at `end_line`, so `totalLines` was
+   * null and the header said `lines 600-750` with no denominator. The caller could see what it
+   * had and not what it was a part of — which is how "600-750" gets mistaken for a whole file,
+   * and how a follow-up read gets aimed at a line that does not exist.
+   *
+   * `info.lines` is no help here: `readOne` calls `statInfo` with `scanContent: !canRead`, so in
+   * the ordinary read path the content scan is skipped and `info.lines` is null. The total now
+   * comes from the read itself, which counts on past the range (see `MAX_LINE_COUNT_BYTES`).
+   *
+   * So a total is missing in one case only — a range inside a file too big to be worth counting —
+   * and the header then states the range plainly rather than inventing a denominator.
    */
-  function boundedNumberedRead(
-    text: string,
-    firstLine: number,
-    hasLine: boolean,
-    maxBytes: number
-  ): { text: string; lastLine: number; truncated: boolean } {
-    if (!hasLine) return { text: '', lastLine: firstLine - 1, truncated: false };
-    const lines = text.split('\n');
-    const kept: string[] = [];
-    let bytes = 0;
-    for (let index = 0; index < lines.length; index++) {
-      const rendered = `${firstLine + index}\t${lines[index] ?? ''}`;
-      const cost = Buffer.byteLength(rendered, 'utf8') + (kept.length === 0 ? 0 : 1);
-      // Always return the first logical line. The backend already guaranteed that raw line fits
-      // the requested budget; the small line-number prefix must not turn that into an empty-page
-      // retry loop.
-      if (kept.length > 0 && bytes + cost > maxBytes) break;
-      kept.push(rendered);
-      bytes += cost;
-    }
-    return {
-      text: kept.join('\n'),
-      lastLine: firstLine + kept.length - 1,
-      truncated: kept.length < lines.length
-    };
-  }
+  const numbered = boundedNumberedRead(
+    result.text,
+    result.firstLine,
+    result.lastLine >= result.firstLine,
+    options.maxBytes
+  );
+  const visibleLastLine = numbered.lastLine;
+  const range =
+    visibleLastLine < result.firstLine
+      ? result.totalLines === null
+        ? 'no lines in that range'
+        : `no lines in that range; the file has ${result.totalLines}`
+      : result.totalLines === null
+        ? `lines ${result.firstLine}-${visibleLastLine}`
+        : `lines ${result.firstLine}-${visibleLastLine} of ${result.totalLines}`;
+  const note = result.truncated || numbered.truncated
+    ? `\n(output cap reached; continue from line ${visibleLastLine + 1} or raise max_bytes up to ${MAX_READ_BYTES})`
+    : result.hasMore
+      ? `\n(more lines follow — continue from line ${visibleLastLine + 1})`
+      : '';
+  const header = `--- ${resolved.virtual} — ${range}, ${formatBytes(info.bytes)}, modified ${info.modified} ---`;
+  const text = `${header}${numbered.text === '' && visibleLastLine < result.firstLine ? '' : `\n${numbered.text}`}${note}`;
+  return {
+    text,
+    // Charge the aggregate call budget for what is actually serialized, including headers and
+    // line-number prefixes. Counting only raw file bytes let thousands of short lines amplify a
+    // nominal 512 KiB cap into a multi-megabyte MCP response.
+    bytes: Buffer.byteLength(text, 'utf8')
+  };
+}
 
+/**
+ * Adds the model-visible line-number prefix without letting that metadata amplify a bounded
+ * file slice into an unbounded MCP result. `readTextFile` caps raw decoded bytes; a file made of
+ * hundreds of thousands of empty/tiny lines can add several extra megabytes of decimal prefixes
+ * afterwards. Spend the same budget on the numbered representation too. A real empty logical
+ * line is represented by `N\t`; `hasLine=false` is the only case that renders no row.
+ */
+function boundedNumberedRead(
+  text: string,
+  firstLine: number,
+  hasLine: boolean,
+  maxBytes: number
+): { text: string; lastLine: number; truncated: boolean } {
+  if (!hasLine) return { text: '', lastLine: firstLine - 1, truncated: false };
+  const lines = text.split('\n');
+  const kept: string[] = [];
+  let bytes = 0;
+  for (let index = 0; index < lines.length; index++) {
+    const rendered = `${firstLine + index}\t${lines[index] ?? ''}`;
+    const cost = Buffer.byteLength(rendered, 'utf8') + (kept.length === 0 ? 0 : 1);
+    // Always return the first logical line. The backend already guaranteed that raw line fits
+    // the requested budget; the small line-number prefix must not turn that into an empty-page
+    // retry loop.
+    if (kept.length > 0 && bytes + cost > maxBytes) break;
+    kept.push(rendered);
+    bytes += cost;
+  }
+  return {
+    text: kept.join('\n'),
+    lastLine: firstLine + kept.length - 1,
+    truncated: kept.length < lines.length
+  };
+}
 
 }

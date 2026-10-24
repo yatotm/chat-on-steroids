@@ -16,15 +16,20 @@ import { currentLanguage, t, ui } from './i18n.js';
 const ICONS: Readonly<Record<string, string>> = {
   'i-agents': 'robot',
   'i-arrow-down': 'arrow-down',
+  'i-arrow-up': 'arrow-up',
   'i-arrow-left': 'arrow-left',
   'i-arrow-right': 'arrow-right',
   'i-back': 'arrow-left',
   'i-ban': 'prohibit',
   'i-bolt': 'lightning',
+  'i-bookmark': 'bookmark-simple',
+  'i-bookmark-fill': 'fill:bookmark-simple',
+  'i-browser': 'browser',
   'i-chart': 'chart-line',
   'i-chat': 'chat-circle',
   'i-check': 'check',
   'i-check-circle': 'check-circle',
+  'i-checks': 'checks',
   'i-clock': 'clock',
   'i-copy': 'copy',
   'i-dock-expand': 'corners-out',
@@ -35,6 +40,8 @@ const ICONS: Readonly<Record<string, string>> = {
   'i-file-text': 'file-text',
   'i-folder': 'folder',
   'i-gear': 'gear-six',
+  'i-group': 'folder-simple',
+  'i-git-branch': 'git-branch',
   'i-git-diff': 'git-diff',
   'i-globe': 'globe-hemisphere-west',
   'i-home': 'house',
@@ -43,28 +50,36 @@ const ICONS: Readonly<Record<string, string>> = {
   'i-loop': 'arrows-clockwise',
   'i-monitor': 'monitor',
   'i-more': 'dots-three',
+  'i-more-vertical': 'dots-three-vertical',
   'i-out': 'arrow-square-out',
   'i-panel-bottom': 'fill:square-half-bottom',
   'i-panel-right': 'fill:square-half',
+  'i-palette': 'palette',
   'i-paw': 'paw-print',
   'i-page-next': 'caret-right',
   'i-page-previous': 'caret-left',
   'i-pencil': 'pencil-simple',
+  'i-pin': 'push-pin-simple',
+  'i-pinned': 'fill:push-pin-simple',
+  'i-plug': 'plug',
   'i-play': 'play',
   'i-plus': 'plus',
   'i-power': 'power',
   'i-pulse': 'activity',
   'i-retry': 'arrow-clockwise',
   'i-search': 'magnifying-glass',
+  'i-shield': 'shield-check',
   'i-skill': 'cube',
+  'i-sparkle': 'sparkle',
   'i-star': 'star',
   'i-star-fill': 'fill:star',
-  'i-steps': 'list-checks',
+  'i-steps': 'list-checks', 'i-stop': 'stop-circle',
   'i-sun': 'sun',
   'i-target': 'target',
   'i-terminal': 'terminal-window',
   'i-zoom-in': 'magnifying-glass-plus',
   'i-zoom-out': 'magnifying-glass-minus',
+  'i-zoom-reset': 'arrow-counter-clockwise',
   'i-trash': 'trash',
   'i-warning': 'warning',
   'i-x': 'x'
@@ -118,30 +133,40 @@ export function el(tag: string, className = '', text: string | (() => string) = 
 
 export const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
 
-/** Filter complete settings sections so headings, controls and their context stay together. */
-export function filterSettingsSections(view: HTMLElement, search: string): void {
-  const fold = (text: string) => text.toLocaleLowerCase(currentLanguage());
-  const query = fold(search.trim());
-  let matches = 0;
-  for (const heading of view.querySelectorAll<HTMLElement>('.automation-section-head')) {
-    const pane = heading.nextElementSibling as HTMLElement | null;
-    if (!pane?.classList.contains('pane')) continue;
-    const visible = !query || fold(`${heading.textContent} ${pane.textContent}`).includes(query);
-    heading.hidden = pane.hidden = !visible;
-    if (visible) matches++;
-  }
-  const empty = view.querySelector<HTMLElement>('#settingsSearchEmpty');
-  if (empty) empty.hidden = !query || matches > 0;
-}
-
 let toastTimer: number | undefined;
+let toastWatch: ResizeObserver | undefined;
 
 export function toast(message: string): void {
   document.querySelector('.toast')?.remove();
+  toastWatch?.disconnect();
   const node = el('div', 'toast', message);
+  node.setAttribute('role', 'status');
   document.body.append(node);
+  placeToast(node);
+  // The composer and its dock can grow or the window resize while the toast shows: it follows.
+  toastWatch = typeof ResizeObserver === 'function' ? new ResizeObserver(() => { if (node.isConnected) placeToast(node); }) : undefined;
+  for (const target of document.querySelectorAll('main, .card.is-session > .composer, .card.is-session > .composer-dock')) toastWatch?.observe(target);
   window.clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => node.remove(), 3200);
+  toastTimer = window.setTimeout(() => { node.remove(); toastWatch?.disconnect(); }, 3200);
+}
+
+/** Shown over the content it is about: centred on the open chat's composer and just above it and
+ *  its dock, so it never covers the draft or its controls; elsewhere centred on the main pane
+ *  instead of the window, which put it half over the sidebar. */
+function placeToast(node: HTMLElement): void {
+  const visible = (target: Element | null | undefined): DOMRect | null => {
+    const box = target?.getBoundingClientRect();
+    return box && box.width > 0 && box.height > 0 ? box : null;
+  };
+  const composer = visible(document.querySelector('.card.is-session > .composer'));
+  const area = composer ?? visible(document.querySelector('main'));
+  if (!area) return;
+  node.style.left = `${area.left + area.width / 2}px`;
+  node.style.maxWidth = `${Math.max(160, Math.min(560, area.width - 32))}px`;
+  if (!composer) return;
+  const dock = document.querySelector('.card.is-session > .composer-dock');
+  const dockBox = dock && getComputedStyle(dock).opacity !== '0' ? visible(dock) : null;
+  node.style.bottom = `${Math.max(12, window.innerHeight - Math.min(composer.top, dockBox?.top ?? Infinity) + 12)}px`;
 }
 
 /** Unwraps IPC replies, translating known app errors and preserving unknown error text. */

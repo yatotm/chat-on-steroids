@@ -1,11 +1,12 @@
-import { afterEach, beforeEach, expect, it } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { promises as fs } from 'node:fs';
 import { initConfigPath, defaultConfig, saveConfig } from '../src/main/config.js';
 import { initDurableStore, flushDurable, resetDurableForTests } from '../src/main/durable.js';
 import {
-  createSession, deleteSession, flushSessions, initSessionStore, renameSession, resetSessionStoreForTests, sessionSearchIndexPath, upsertMessageEvent
+  createSession, deleteSession, flushSessions, initSessionStore, readEvents, renameSession, resetSessionStoreForTests, sessionSearchIndexPath, upsertMessageEvent
 } from '../src/main/session/store.js';
-import { foldCase, queryTerms, resetSessionSearchForTests, searchIndexingSettled, searchSessions, snippetFor } from '../src/main/session/search.js';
+import { findInSession, foldCase, locateMessage, locateSearchMatch, queryTerms, resetSessionSearchForTests, searchIndexingSettled, searchSessions, snippetFor } from '../src/main/session/search.js';
+import { positionOf } from '../src/shared/chronology.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
 
 let directory: string;
@@ -17,6 +18,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   await searchIndexingSettled(); resetSessionSearchForTests();
+  vi.restoreAllMocks();
   await flushDurable(); resetSessionStoreForTests(); resetDurableForTests(); await removeTempDir(directory);
 });
 
@@ -100,6 +102,31 @@ it('leaves helper chats out, as the sidebar does', async () => {
   expect(await search('internal')).toMatchObject({ results: [], total: 0 });
 });
 
+it('ranks an older title match before newer text matches even at a small result limit', async () => {
+  let clock = Date.now();
+  vi.spyOn(Date, 'now').mockImplementation(() => ++clock);
+  const title = await chat('Needle in the title', [['user', 'ordinary words']]);
+  for (let index = 0; index < 5; index++) await chat(`Recent ${index}`, [['user', 'needle in the text']]);
+  await search('needle');
+  const reply = await searchSessions('needle', 2);
+  expect(reply.results[0]!.id).toBe(title);
+  expect(reply.results).toHaveLength(2);
+  expect(reply.limited).toBe(true);
+});
+
+it('does not return superseded words while a changed chat awaits reindexing', async () => {
+  const id = await chat('Revision', [['user', 'obsolete needle']]);
+  await search('needle');
+  const original = (await readEvents(id, { kinds: ['user_message'] }))[0]!;
+  if (original.kind !== 'user_message') throw new Error('Missing original question');
+  await upsertMessageEvent(id, { ...original, time: original.time + 10,
+    message: { text: 'replacement words', chars: 17, truncated: false } });
+  await flushSessions();
+  expect((await searchSessions('needle')).results).toEqual([]);
+  await searchIndexingSettled();
+  expect((await search('replacement')).results.map(result => result.id)).toEqual([id]);
+});
+
 it('marks matches at the right place, also around characters whose lowercase is longer', () => {
   expect(foldCase('İstanbul Straße')).toHaveLength('İstanbul Straße'.length);
   const text = 'İstanbul: the bridge to İzmir';
@@ -133,4 +160,79 @@ it('matches words without their accents, at the right place, and says when more 
   expect((await searchSessions('cafe', 2)).results).toHaveLength(2);
   expect(await searchSessions('cafe', 3)).not.toHaveProperty('limited');
   expect((await searchSessions('cafe', 3)).results).toHaveLength(3);
+});
+
+it('locates the first message holding the query, so a result opens there', async () => {
+  const id = await chat('Release planning', [
+    ['user', 'plan the release'],
+    ['assistant', 'First tag the build.'],
+    ['user', 'and the Wíndows installer?'],
+    ['assistant', 'The windows installer comes after the bridge.']
+  ]);
+  const { readEvents } = await import('../src/main/session/store.js');
+  const said = (await readEvents(id, { kinds: ['user_message', 'assistant_message'] }));
+  // Accents and case fold as in the search itself; the first message holding a word wins.
+  const found = await locateSearchMatch(id, 'WINDOWS');
+  const third = said.find(event => event.kind === 'user_message' && event.message.text.startsWith('and the'))!;
+  expect(found).toEqual({ seq: third.seq, kind: 'user_message', messageId: (third as { messageId?: string }).messageId ?? null, position: positionOf(third) });
+  // Any one of the words is enough to place it: the snippet came from the first of them.
+  expect((await locateSearchMatch(id, 'bridge installer'))?.seq).toBe(third.seq);
+  expect((await locateSearchMatch(id, 'bridge'))?.kind).toBe('assistant_message');
+  // Nothing said matches (a title-only match): no place to open at.
+  expect(await locateSearchMatch(id, 'planning')).toBeNull();
+  expect(await locateSearchMatch(id, '   ')).toBeNull();
+});
+
+// Find in chat (Codex's ⌘F): every message holding the phrase, in the order they were said, from the
+// whole recording rather than the page the window happens to hold.
+it('finds every message of one chat that holds a phrase, in order', async () => {
+  const id = await chat('Release planning', [
+    ['user', 'Check the Windows installer'],
+    ['assistant', 'The windows   INSTALLER builds; the bridge is next.'],
+    ['user', 'And the installer for macOS?'],
+    ['assistant', 'Both installers are signed.']
+  ]);
+  const said = await readEvents(id, { kinds: ['user_message', 'assistant_message'] });
+  const found = await findInSession(id, 'Windows installer');
+  // Case and runs of spaces do not matter; the whole phrase must be there.
+  expect(found.map(location => location.seq)).toEqual([said[0]!.seq, said[1]!.seq]);
+  expect(found[0]).toEqual({ seq: said[0]!.seq, kind: 'user_message', messageId: (said[0] as { messageId?: string }).messageId ?? null, position: positionOf(said[0]!) });
+  expect((await findInSession(id, 'installer')).map(location => location.seq)).toEqual(said.map(event => event.seq));
+  expect(await findInSession(id, 'linux')).toEqual([]);
+  expect(await findInSession(id, '  ')).toEqual([]);
+});
+
+it('finds a phrase as the chat shows it, across bold, code and links', async () => {
+  // Answers are recorded as Markdown: "File: /kunden" did not match "**File:** `/kunden…`" (2.1.41 pass).
+  const id = await chat('Formatting', [
+    ['user', 'Create the file'],
+    ['assistant', '- **File:** `/kundenprojekt/goal.txt`\n- See [the setup guide](https://example.com/setup) first.'],
+    ['assistant', 'Use **bold** literally: `**`']
+  ]);
+  const said = await readEvents(id, { kinds: ['user_message', 'assistant_message'] });
+  expect((await findInSession(id, 'File: /kundenprojekt')).map(location => location.seq)).toEqual([said[1]!.seq]);
+  expect((await findInSession(id, 'see the setup guide first')).map(location => location.seq)).toEqual([said[1]!.seq]);
+  // What was written stays findable too.
+  expect((await findInSession(id, '**File:**')).map(location => location.seq)).toEqual([said[1]!.seq]);
+  expect((await findInSession(id, 'use bold literally')).map(location => location.seq)).toEqual([said[2]!.seq]);
+});
+
+it('locates a reply by its native message id, where it first appeared (#482)', async () => {
+  // Branch in new chat links back to the exact reply it was branched from.
+  const id = await chat('Branch source', [['user', 'try one'], ['assistant', 'Approach A.'], ['user', 'go on'], ['assistant', 'Approach A, step two.']]);
+  const { readEvents } = await import('../src/main/session/store.js');
+  const replies = (await readEvents(id, { kinds: ['assistant_message'] })) as Array<{ seq: number; time: number; messageId: string; kind: string; origin?: number }>;
+  const first = replies[0]!;
+  expect(await locateMessage(id, first.messageId)).toEqual({ seq: first.seq, kind: 'assistant_message', messageId: first.messageId, position: positionOf(first) });
+  expect(await locateMessage(id, 'not-in-this-chat')).toBeNull();
+});
+
+it('locates a bookmarked reply whose recorded id is upper case (bookmarks are kept lower case)', async () => {
+  const session = await createSession({ conversationId: `search-chat-${++counter}`, title: 'Upper-case id' });
+  const recorded = 'ABCDEF01-2345-4678-9ABC-DEF012345678';
+  await upsertMessageEvent(session.id, { kind: 'assistant_message', source: 'extension', time: Date.now(), messageId: recorded,
+    message: { text: 'Marked answer.', chars: 14, truncated: false }, state: 'final', final: true });
+  await flushSessions();
+  const location = await locateMessage(session.id, recorded.toLowerCase());
+  expect(location).toMatchObject({ kind: 'assistant_message', messageId: recorded });
 });

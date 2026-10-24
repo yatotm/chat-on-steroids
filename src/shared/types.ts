@@ -1,4 +1,5 @@
-import type { ReasoningEffort } from './session.js';
+import type { ReasoningEffort, RecordingStorageLimitGiB } from './session.js';
+import type { PluginRefreshStatus } from './plugin-refresh.js';
 import { WINDOWS_COMPUTER_READ_METHODS, WINDOWS_COMPUTER_INPUT_METHODS } from './windows-computer.js';
 import { BROWSER_READ_TOOLS, BROWSER_WRITE_TOOLS } from './browser-control.js';
 import type { CommandAllowlistSettings } from './command-allowlist.js';
@@ -88,11 +89,22 @@ export interface SecureStorageInfo {
   detail: string | null;
 }
 
+/** A folder on a server, reached with the system's own `ssh` (#1469). */
+export interface RemoteFolder {
+  /** As the person typed it: an ssh config alias or `user@host`; never starts with "-". */
+  host: string;
+  port?: number;
+  /** Absolute (`/srv/app`) or home-relative (`~/app`) folder on the server; absolute once resolved. */
+  path: string;
+}
+
 export interface Root {
   /** Virtual name exposed to the model, e.g. "project" for /project. */
   name: string;
-  /** Absolute host path. Never sent to the model. */
+  /** Absolute host path. Never sent to the model. For a server folder, `host[:port]:/path`, its identity. */
   path: string;
+  /** Set for a folder on a server: where it is. Its files go over SFTP and its commands over ssh. */
+  remote?: RemoteFolder;
 }
 
 export type TunnelKind = 'openai' | 'cloudflared' | 'manual';
@@ -127,7 +139,7 @@ export interface TunnelSettings {
 }
 
 /** `cos` is the built-in CoS browser (src/main/cos-browser), which needs no installed browser. */
-export const CHAT_BROWSERS = ['chrome', 'edge', 'brave', 'cos'] as const;
+export const CHAT_BROWSERS = ['chrome', 'edge', 'brave', 'firefox', 'cos'] as const;
 export type ChatBrowser = (typeof CHAT_BROWSERS)[number];
 
 export interface UiPrefs {
@@ -140,9 +152,13 @@ export interface UiPrefs {
   /** Maintenance may reuse existing tabs but cannot open helpers or missing chats. */
   browserOnly?: boolean;
   backgroundChats?: boolean;
+  /** Where background tabs go: the app's minimized window, or a collapsed tab group in the user's window (#128). */
+  backgroundPlacement?: 'window' | 'group';
   browserBridgePort?: import('./browser-bridge.js').BrowserBridgePort;
   /** Opt-in browser automation for changed connector tool schemas. */
   autoRefreshPlugins?: boolean;
+  /** True once the person answered the one-time offer to turn automatic plugin refresh on. */
+  autoRefreshPluginsAsked?: boolean;
   /** Opt-in deterministic metadata routing for managed Skills on ordinary user input. */
   autoSelectSkills?: boolean;
   /** Actual app-owned tabs to retain; active work and drafts stay protected. Omitted uses workers + 2. */
@@ -150,16 +166,28 @@ export interface UiPrefs {
   finishTool?: boolean;
   planBackend?: 'chatgpt' | 'api';
   finishAction?: 'notify' | 'goal';
+  /** Leave unverified Goal completion pending; Session finish may notify. Off by default. */
+  finishHoldOnStop?: boolean;
   finishLeadMinutes?: number;
   developerMode?: boolean;
   /** Rotating joke words instead of "Working" in a chat's status line. Off by default. */
   playfulStatus?: boolean;
+  /** Screen readers hear "Reply finished" when a turn completes in the open chat. Off by default. */
+  announceTurns?: boolean;
+  /** A random fun-fact aside at the end of each automatic Continue, marked for the model to ignore. Off by default. */
+  playfulContinue?: boolean;
+  /** The person's own words in place of the built-in automatic Continue phrase (silence recovery only). Unset means the built-in phrases. */
+  customContinue?: string;
   /** Keep the chat at its end while it grows, here and on ChatGPT, until the reader scrolls up. On unless false. */
   followOutput?: boolean;
   /** Add the Chat On Steroids Core mention to the user's own prompts sent from the app. On unless false. */
   mentionCore?: boolean;
+  /** Prefer the installed Plugins app on regular COS-managed sends; worker/recovery sends still use Core. Off by default. */
+  mentionPlugins?: boolean;
   /** The interface language the window last reported; the browser extension follows it. */
   language?: import('./ui-language.js').UiLanguage;
+  /** The version this install last started as; What's New shows once per real update (#1172). */
+  lastSeenVersion?: string;
   /**
    * The extension's own preferences as it last reported them stored. The app keeps them so a
    * reinstalled extension, which starts with empty storage under a new id, gets them back.
@@ -170,10 +198,37 @@ export interface UiPrefs {
   minimizeToTray: boolean;
   autoConnect: boolean;
   startAtLogin?: boolean;
+  /** A notification when a chat finishes a turn while the window is in the background. Missing means on. */
+  turnNotifications?: boolean;
+  /**
+   * #1402: after this many minutes of one turn, the next tool result starts a fresh turn with an
+   * automatic continue (0 = off). Missing means 30.
+   */
+  rotateTurnMinutes?: number;
+  /**
+   * Opt-in: where ChatGPT offers no Send for a fresh-turn continue at a tool result (it shows only
+   * Stop there), stop the turn right after a result instead and send the continue as an ordinary
+   * message once the stop shows. Missing means off.
+   */
+  rotateStopFallback?: boolean;
+  /** Usage › Other apps: read Codex's and Claude Code's local logs (numbers only). Missing means on. */
+  localAppUsage?: boolean;
+  /** Codex's "Follow-up behavior": a message typed during a turn joins it (`steer`, the default) or waits for its end (`queue`). */
+  followUp?: 'steer' | 'queue';
+  /** Codex's "Enter key behavior": Enter sends (missing or true), or only Cmd/Ctrl+Enter sends (false). */
+  enterSends?: boolean;
+  /** Keep the computer from sleeping while a chat is working (Codex: Prevent sleep while running). Missing means on. */
+  keepAwake?: boolean;
+  /** With keepAwake: also keep the screen on (Modern Standby laptops sleep once it turns off). */
+  keepScreenAwake?: boolean;
   /** Default screenshots to the active window instead of the whole primary monitor. */
   privacyScreenshots: boolean;
+  /** Mask API keys, tokens, private keys and secret settings in what tools return to ChatGPT. Missing means on. */
+  secretsShield?: boolean;
   /** Browser for app-originated launches; connected source tabs retain placement ownership. */
   chatBrowser?: ChatBrowser;
+  /** Where a minimized built-in browser window goes (default: the taskbar or Dock). */
+  cosBrowserMinimize?: 'taskbar' | 'tray';
   /** Explicit choice, never inherited from the OS: the window looks how you left it. */
   theme: 'light' | 'dark';
   appearance?: import('./appearance.js').AppearanceSettings;
@@ -192,6 +247,8 @@ export interface SessionSettings {
   advisoryTokens: number;
   /** Estimated tokens at which that suggestion becomes urgent. */
   limitTokens: number;
+  /** Size of the store for recorded images and long texts, in GiB (#1406). Missing means 2. */
+  storageLimitGiB?: RecordingStorageLimitGiB;
 }
 
 /**
@@ -346,17 +403,33 @@ export interface MultiAgentSettings {
    */
   waitForSubAgents?: boolean;
   /**
+   * Opt into an isolated Git worktree and branch for each newly spawned worker.
+   * Defaults to Off. Existing managed workers keep their exact workspace if toggled Off.
+   */
+  autoWorktrees?: boolean;
+  /**
    * Reclaim only terminal processes owned by an exactly identified worker that has remained
    * sleeping beyond the runtime-retention threshold. Off by default; durable worker/chat
    * identity and history are never reclaimed by this switch.
    */
   endSleepingWorkerProcesses?: boolean;
+  /**
+   * Archive each worker's ChatGPT chat once its run has ended (#1460). ChatGPT's own reversible
+   * archive; nothing is deleted. Off by default.
+   */
+  archiveWorkerChats?: boolean;
 }
 
 /** The user's own additions to what each MCP connector tells the model about itself. */
 export interface McpSettings {
   /** Appended to the Core and Desktop server instructions, or empty for none. */
   instructions: string;
+  /**
+   * Keep each connector's secret URL path across restarts, for a tunnel of the user's own whose
+   * URL ChatGPT stores (#924). Off by default: tokens rotate on every start. Stored only in the
+   * OS-backed secret store; turning it off forgets them.
+   */
+  persistentUrls?: boolean;
 }
 
 /** The opt-in local control API for an agent watching this app (`src/main/control-api.ts`). */
@@ -364,7 +437,7 @@ export interface ControlApiSettings {
   /** Serve the loopback API and write its token to userData. Off unless the user turns it on. */
   enabled: boolean;
   /**
-   * Also let a caller with the token send and cancel messages through the outbox. Off unless the
+   * Also let a caller with the token send messages, start new chats and cancel messages through the outbox. Off unless the
    * user turns it on, and never on while `enabled` is off: turning the API off revokes it.
    */
   allowActions: boolean;
@@ -434,8 +507,18 @@ export interface ConnectionStatus {
    * connected" from "we know we were connected N seconds ago".
    */
   handshakeAt: number | null;
+  /**
+   * Why an `offline` state is offline: `service` when OpenAI's tunnel service answered with errors,
+   * so this computer's internet works. Null or absent: OpenAI could not be reached at all.
+   */
+  offlineCause?: 'service' | null;
   /** Epoch ms of the last request ChatGPT sent to this app, end-to-end proof. */
   lastRequestAt: number | null;
+  /**
+   * With "Keep plugin URLs across restarts" on: the kept local port was taken at this start, so the
+   * endpoint listens on another one and a tunnel of the user's own must point there. Null otherwise.
+   */
+  keptPortMoved?: { from: number; to: number } | null;
   /**
    * Epoch ms of the last tool ChatGPT actually ran. Requests arriving with no tool
    * call ever following is the signature of Developer mode being off in ChatGPT.
@@ -443,6 +526,11 @@ export interface ConnectionStatus {
   lastToolCallAt: number | null;
   /** The tunnel's own view of itself, or null when no tunnel is running. */
   health: TunnelHealth | null;
+  /**
+   * Epoch ms until which a message for an existing chat is held while a new tunnel-client takes
+   * over that chat's route (#1220), or null when nothing is held.
+   */
+  routeSettlingUntil?: number | null;
   /**
    * One entry per model-facing connector, in setup order.
    *
@@ -462,6 +550,8 @@ export interface SurfaceStatus {
   id: SurfaceId;
   /** Exactly what the user should name the connector in ChatGPT. */
   connectorName: string;
+  /** What ChatGPT shows for it once a served call proved a different name (a rename); null otherwise. */
+  chatgptName?: string | null;
   /** Exactly what the user should paste as its description. */
   description: string;
   /** One line in the app's own voice, for the setup card. */
@@ -553,6 +643,11 @@ export interface BridgeStatus {
    */
   extensionVersion: string | null;
   /**
+   * `gecko` when the browser that reported `extensionVersion` is Firefox, whose signed add-on
+   * Firefox updates itself. With several browsers connected, that version is the oldest of them.
+   */
+  extensionEngine?: 'gecko';
+  /**
    * The extension in the person's own Chrome, Edge or Brave, apart from the CoS browser's copy.
    * Null until one has spoken to this app process; Setup's first step waits for it.
    */
@@ -560,6 +655,10 @@ export interface BridgeStatus {
     present: boolean; version: string | null; lastSeenAt: number | null; signedIn?: boolean | null;
     /** Kept across restarts: the version last seen there, and whether ChatGPT last answered signed in. */
     proof?: { version: string; signedIn: boolean | null } | null;
+    /** `gecko`: Firefox's signed add-on, which Firefox updates itself. */
+    engine?: 'gecko';
+    /** false: that browser may not open chatgpt.com, so no content script can run there. */
+    chatgptAccess?: boolean;
   } | null;
   /** The CoS browser's own copy of the extension, connected right now. */
   cosExtension?: { present: boolean };
@@ -594,6 +693,16 @@ export interface CompanionDiagnostics {
     durations: boolean;
   };
   tab: CompanionTabDiagnostics | null;
+  /** For the diagnostics report: names, versions, counts and booleans only. Absent from older extensions. */
+  environment?: CompanionEnvironment | null;
+}
+
+export interface CompanionEnvironment {
+  browser: { name: string; version: string | null };
+  /** ChatGPT tabs by state. */
+  tabs: { open: number; discarded: number; frozen: number; loading: number; grouped: number; inBackgroundWindow: number };
+  /** Which of ChatGPT's controls the most recently used awake ChatGPT tab still has. */
+  page: { composer: boolean; sendArea: boolean; modelMenu: boolean; plusMenu: boolean; language: string | null } | null;
 }
 
 export interface CompanionTraceEntry {
@@ -676,7 +785,13 @@ export interface UpdateStatus {
   error: string | null;
   /** When the release API last answered, as epoch ms. Null until it has. */
   checkedAt: number | null;
+  /** A version handed to its installer that this start is still older than: it did not install. */
+  notInstalled?: string | null;
 }
+
+/** Receipt only; authoritative component state still establishes completion. */
+/** `confirm`: the update is downloaded; the app asks the person, then calls again with that version. */
+export type UpdateAllResult = 'restarting' | 'manual' | 'checking-connectors' | 'confirm';
 
 /** Where an installation that cannot update itself gets the new version by hand. */
 export const RELEASES_PAGE = 'https://github.com/yatotm/chat-on-steroids/releases/latest';
@@ -707,6 +822,12 @@ export interface MacOSDesktopAccessStatus {
   accessibility: MacOSPermissionState;
   checkedAt: number;
   error: string | null;
+  /**
+   * Which permissions this app was ever seen holding. A missing permission that was granted
+   * before usually means an update changed the app's signature (#1469 era, live 2026-10-15):
+   * System Settings still shows it on, and only resetting it lets macOS ask again.
+   */
+  grantedBefore?: { screen: boolean; accessibility: boolean };
 }
 
 /**
@@ -731,6 +852,16 @@ export interface AppState {
    * local contract only; they are not evidence that ChatGPT has refreshed its cached tools.
    */
   connectorSchemas: Partial<Record<SurfaceId, string>>;
+  /** Provider declaration evidence scoped to the current local schema. */
+  connectorRefresh?: Partial<Record<SurfaceId, PluginRefreshStatus>>;
+  /** Per surface, the declaration ChatGPT confirmed after a plugin refresh (or found already current). */
+  confirmedConnectorSchemas?: Partial<Record<SurfaceId, string>>;
+  /** Read-only ledger health; no stored content or filesystem paths cross IPC. */
+  pluginRefreshUnreadable?: boolean;
+  /** True while the 2 GiB recording store refuses new images and long texts. */
+  recordingStorageFull?: boolean;
+  /** True when the saved keys exist but working secure storage could not read them; saves fail until the person starts fresh. */
+  credentialsUnreadable?: boolean;
   platform: PlatformInfo;
   /** Only packaged Windows builds may change the login item. */
   loginStartupAvailable?: boolean;
@@ -751,6 +882,8 @@ export interface AppState {
   update: UpdateStatus;
   /** Present only on macOS once the in-process native backend has reported its live TCC state. */
   desktopAccess?: MacOSDesktopAccessStatus | null;
+  /** This run's settings file could not be read, so the app started read-only; cleared once read-only is off. */
+  settingsRecovered?: boolean;
 }
 
 export const DEFAULT_CAPABILITIES: Capabilities = {

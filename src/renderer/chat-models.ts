@@ -1,6 +1,6 @@
 import { ui, uiText, t } from './i18n.js';
 import type { ChatModelCatalog } from '../shared/chat-models.js';
-import { chatModelDisplayLabel, resolveChatModel } from '../shared/chat-models.js';
+import { chatModelDisplayLabel, DEFAULT_HELPER_CHAT_MODEL, resolveChatModel } from '../shared/chat-models.js';
 import type { Config } from '../shared/types.js';
 import type { ReasoningEffort } from '../shared/session.js';
 import { $, el, icon, run } from './dom.js';
@@ -54,6 +54,15 @@ const composerEfforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'm
 const effortLabel = (effort: string): string => effortNames[effort] ? t(effortNames[effort]) : effort;
 function observedModel(value: string) {
   return resolveChatModel(catalog.models, value);
+}
+
+/**
+ * A model and effort as the composer shows them ("GPT-6 Sol · High", "… · Instant"), for any
+ * observed choice; a model this account's catalog does not list keeps its id.
+ */
+export function chatModelName(model: string, reasoningEffort: string | undefined): string {
+  const label = observedModel(model)?.label ?? model;
+  return reasoningEffort ? chatModelDisplayLabel(label, reasoningEffort as ReasoningEffort, effortLabel(reasoningEffort)) : label;
 }
 
 function paintComposerContext(): void {
@@ -118,7 +127,11 @@ function options(select: HTMLSelectElement, choices: Array<{ id: string; label: 
     }
     const unverified = !!value && !choices.some(choice => choice.id === value);
     badge.hidden = !unverified;
-    if (unverified) ui(badge, 'textContent', () => t('Unverified'));
+    if (unverified) {
+      ui(badge, 'textContent', () => t('Unverified'));
+      // Workers and the Goal helper both fall back to ChatGPT's current model (#499); say so.
+      ui(badge, 'title', () => t("This ChatGPT account doesn't offer this model, so ChatGPT's current model is used."));
+    }
   }
 }
 
@@ -152,6 +165,10 @@ function paintPair(modelId: string, effortId: string, modelValue?: string, effor
   const effort = document.getElementById(effortId) as HTMLSelectElement | null;
   if (!model || !effort) return;
   const models = modelId === 'composerModel' ? composerModels() : catalog.models;
+  // No saved sub-agent default starts workers on ChatGPT's current model. The select says so as
+  // Automatic instead of naming a model nothing would use; a model picked there still gets its
+  // preferred effort.
+  const automaticModel = allowEmpty || modelId === 'workerModel';
   let nextModel = modelValue ?? model.value;
   let nextEffort = effortValue ?? effort.value;
   const observed = observedModel(nextModel);
@@ -160,7 +177,7 @@ function paintPair(modelId: string, effortId: string, modelValue?: string, effor
     // cannot prove which efforts that alias supports. Retain both requested values
     // until the user deliberately selects a family; native selection proves the pair.
     const modelChoices = [...distinctModelChoices(models), { id: nextModel, label: `${observed.label} · ${nextModel}` }];
-    if (allowEmpty) modelChoices.unshift({ id: '', label: () => t('Automatic') });
+    if (automaticModel) modelChoices.unshift({ id: '', label: () => t('Automatic') });
     options(model, modelChoices, nextModel);
     const effortChoices = [{ id: nextEffort, label: () => nextEffort ? effortLabel(nextEffort) : t('Keep requested model settings') }];
     if (allowEmpty && nextEffort) effortChoices.unshift({ id: '', label: () => t('Automatic') });
@@ -168,7 +185,7 @@ function paintPair(modelId: string, effortId: string, modelValue?: string, effor
     return;
   }
   nextModel = observed?.id ?? nextModel;
-  if (models.length && !nextModel && !allowEmpty && !(modelId === 'composerModel' && composerContext?.automatic)) {
+  if (models.length && !nextModel && !automaticModel && !(modelId === 'composerModel' && composerContext?.automatic)) {
     // A preference selects only a model/effort actually observed in this catalog.
     const preferred = models.find(item => /^gpt[ -]?6$/i.test(item.label) && item.efforts.includes('high'));
     nextModel = (preferred ?? models[0]!).id;
@@ -179,10 +196,10 @@ function paintPair(modelId: string, effortId: string, modelValue?: string, effor
     nextEffort = supported.includes('high') ? 'high' : supported[0] ?? '';
   }
   const modelChoices = distinctModelChoices(models);
-  if (allowEmpty) modelChoices.unshift({ id: '', label: () => t('Automatic') });
+  if (automaticModel) modelChoices.unshift({ id: '', label: () => t('Automatic') });
   const effortChoices: Array<{ id: string; label: string | (() => string) }> =
     (models.find(item => item.id === nextModel)?.efforts ?? []).map(id => ({ id, label: () => effortLabel(id) }));
-  if (allowEmpty) effortChoices.unshift({ id: '', label: () => t('Automatic') });
+  if (allowEmpty || (automaticModel && !nextModel)) effortChoices.unshift({ id: '', label: () => t('Automatic') });
   options(model, modelChoices, nextModel);
   options(effort, effortChoices, nextEffort);
 }
@@ -474,7 +491,7 @@ export function applyChatModels(config: Config, previous?: Config): void {
   ordinaryDefaults = { model: config.ui?.defaultChatModel ?? '', reasoningEffort: config.ui?.defaultChatReasoning ?? '' };
   paintPair('defaultChatModel', 'defaultChatReasoning', chosen('defaultChatModel', ordinaryDefaults.model, previous?.ui?.defaultChatModel), chosen('defaultChatReasoning', ordinaryDefaults.reasoningEffort, previous?.ui?.defaultChatReasoning), true);
   paintPair('workerModel', 'workerReasoning', chosen('workerModel', config.multiAgent.defaultModel ?? '', previous?.multiAgent.defaultModel), chosen('workerReasoning', config.multiAgent.defaultReasoning ?? '', previous?.multiAgent.defaultReasoning));
-  paintPair('helperModel', 'helperReasoning', chosen('helperModel', config.goal.helperModel ?? 'gpt-5.6-sol', previous?.goal.helperModel ?? 'gpt-5.6-sol'), chosen('helperReasoning', config.goal.helperReasoning ?? 'high', previous?.goal.helperReasoning ?? 'high'));
+  paintPair('helperModel', 'helperReasoning', chosen('helperModel', config.goal.helperModel ?? DEFAULT_HELPER_CHAT_MODEL, previous?.goal.helperModel ?? DEFAULT_HELPER_CHAT_MODEL), chosen('helperReasoning', config.goal.helperReasoning ?? 'high', previous?.goal.helperReasoning ?? 'high'));
   paintComposerContext();
   if (catalogSubscribed && catalog.state !== 'unknown') return;
   const requested = ++generation;

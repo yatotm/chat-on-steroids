@@ -5,6 +5,7 @@
  * No runtime logic here beyond a couple of pure helpers the UI and the recorder must
  * agree on exactly.
  */
+import { workerOwnTask } from './worker-brief.js';
 
 /** Where an event came from. The extension is untrusted UI observation; mcp is ours. */
 export type EventSource = 'extension' | 'mcp' | 'app';
@@ -91,7 +92,7 @@ export interface AssetRef {
   height?: number;
 }
 
-/** Recording-asset storage is global; cleanup never changes the configured 2 GiB ceiling. */
+/** Recording-asset storage is global; cleanup never changes the configured ceiling. */
 export interface ImageStorageInfo {
   /** All bytes charged to the global session-asset quota, including preserved non-image assets. */
   usedBytes: number;
@@ -99,12 +100,21 @@ export interface ImageStorageInfo {
 }
 
 export interface ImageStorageClearResult extends ImageStorageInfo {
-  /** Physical image bytes removed by this explicit user operation. */
+  /** Physical bytes removed by this explicit user operation. */
   freedBytes: number;
   removedFiles: number;
 }
 
-export type ImageStorageClearMode = 'oldest-gib' | 'all';
+/**
+ * `oldest-gib` and `all` remove images only. `old-chats-gib` empties whole chats unused for a
+ * week, oldest first, of images and long texts until about 1 GiB is free (#1406).
+ */
+export type ImageStorageClearMode = 'oldest-gib' | 'all' | 'old-chats-gib';
+
+/** The recording storage sizes Settings offers, in GiB. The first is the default. */
+export const RECORDING_STORAGE_LIMITS_GIB = [2, 5, 10, 20, 50] as const;
+export type RecordingStorageLimitGiB = (typeof RECORDING_STORAGE_LIMITS_GIB)[number];
+export const DEFAULT_RECORDING_STORAGE_GIB: RecordingStorageLimitGiB = 2;
 
 /** Compact human-readable presentation of one tool call. */
 export interface ActivitySummary {
@@ -377,6 +387,12 @@ export type SessionEvent =
       wireTokenEstimate?: number;
       /** Native badge on this exact user message. Missing means unobserved; null means absent. */
       reaction?: string | null;
+      /** Its parent in ChatGPT's message tree ("root" for a chat's first question), as first seen. */
+      parentId?: string;
+      /** Edit & resubmit (#365): the question this one is a later version of, in ChatGPT's own edit. */
+      replaces?: string;
+      /** A Goal or Loop follow-up its page typed: the app's message, not the person's (#1655). */
+      automatic?: true;
       attachments?: import('./input.js').InputAttachment[];
       assets?: AssetRef[];
       /** Image assets explicitly removed from local recording storage; same-message replay cannot restore them. */
@@ -464,7 +480,7 @@ export type SessionEvent =
    * event written before this model existed, or by a page whose commentary had no readable
    * identity, is still a plain standalone caption.
    */
-  | (BaseEvent & { kind: 'progress'; message: StoredText; progressId?: string; origin?: number; finishControl?: { state: 'released' | 'notified' | 'decision'; conversationId: string; revision?: string; inputRevision?: string; workSeq?: number } })
+  | (BaseEvent & { kind: 'progress'; message: StoredText; progressId?: string; origin?: number; reason?: 'helper_stop_unverified'; finishControl?: { state: 'released' | 'notified' | 'decision'; conversationId: string; revision?: string; inputRevision?: string; workSeq?: number } })
   /**
    * Visible ChatGPT-native tool activity that never passed through this MCP server.
    *
@@ -479,8 +495,14 @@ export type SessionEvent =
    * call under the same server turn then proved it had not. Absent on the page's own starts.
    */
   | (BaseEvent & { kind: 'turn_start'; detail?: string })
-  | (BaseEvent & { kind: 'turn_end'; outcome: TurnOutcome; detail?: string; reason?: 'thinking_failed'; providerMessageId?: string })
-  | (BaseEvent & { kind: 'chat_error'; message: StoredText; recoverable?: boolean; blocking?: boolean; reason?: 'thinking_failed' | 'stream_gone' })
+  | (BaseEvent & { kind: 'turn_end'; outcome: TurnOutcome; detail?: string; reason?: 'thinking_failed'; providerMessageId?: string;
+      /** The user sent a message into this running answer and ChatGPT carried the response on into the next turn (#1301). */
+      continued?: true })
+  /**
+   * `retryAt` is the first time ChatGPT said a blocking history limit may be retried, kept for the
+   * timeline to show. The live hold follows each newer deadline; this one is never an authority.
+   */
+  | (BaseEvent & { kind: 'chat_error'; message: StoredText; recoverable?: boolean; blocking?: boolean; retryAt?: number; reason?: 'thinking_failed' | 'stream_gone' })
   | (BaseEvent & { kind: 'tool_call'; call: ToolCallRecord; origin?: number })
   /**
    * An app-authored line. `continuation` names the Compact & Resume it is about, so the
@@ -514,6 +536,8 @@ export type SessionEvent =
       chars: number;
       /** What triggered it: manual compaction, resume, or an automatic suggestion. */
       reason: string;
+      /** The Compact & Resume run that saved it, so its timeline row can claim it (#1215). */
+      continuation?: string;
     });
 
 export type SessionEventKind = SessionEvent['kind'];
@@ -580,6 +604,20 @@ export interface SessionOrigin {
   agentId: string | null;
   /** The worker's task, verbatim from `agents action=spawn`. Empty for a resume. */
   task: string;
+  /**
+   * Branch in new chat (#482): the ChatGPT chat and exact native reply this chat was branched
+   * from, with `fromSessionId` naming the source session. Presentation only; nothing carries over.
+   */
+  branchOf?: { conversationId: string; messageId: string };
+}
+
+/** Historical presentation projected from an accepted broker snapshot; grants no worker authority. */
+export interface WorkerAssignmentSummary {
+  conversationId: string;
+  agentId: string;
+  label: string;
+  task: string;
+  recordedAt: number;
 }
 
 const RESUMED_PREFIX = 'Resumed · ';
@@ -604,7 +642,8 @@ export function originTitle(origin: SessionOrigin, source: string | null): strin
   if (origin.kind === 'helper') return 'Task helper';
   if (origin.kind === 'worker') {
     const who = origin.agentId ?? 'worker';
-    const task = clip(origin.task, 60);
+    // Its own task: the run's shared context opens every worker's brief alike.
+    const task = clip(workerOwnTask(origin.task), 60);
     return task ? `${who} · ${task}` : who;
   }
   // A resumed chat is itself resumable, and often is. Stacking the prefix each time
@@ -670,6 +709,7 @@ export interface SessionSummary {
    * useful worker activity without loading each worker transcript.
    */
   lastToolActivity?: Pick<ActivitySummary, 'kind' | 'title'> | null;
+  workerAssignment?: WorkerAssignmentSummary;
   /** Observation time of the newest stable final assistant message. */
   lastAssistantFinalAt?: number | null;
   /**
@@ -881,13 +921,21 @@ export function isReasoningEffort(value: unknown): value is ReasoningEffort {
 export interface AgentInfo {
   /** Broker owner projection. IDs such as worker-1 are local to this incarnation. */
   runId?: string;
+  /** Immutable broker allocation identity; survives a sleeping family's new incarnation. */
+  workerAllocationRunId?: string;
+  /** Durable requirement for a marker-proven Git worktree; never fall back to the prime cwd. */
+  managedWorktree?: boolean;
+  /** Cleanup acknowledgment; does not remove the durable isolation requirement. */
+  managedWorktreeCleaned?: boolean;
   primeConversationId?: string;
   id: string;
   role: AgentRole;
-  /** Spawn label; reused assignments fall back to the stable worker id. */
+  /** Current job name; preserved on reuse unless the prime explicitly renames it. */
   label: string;
   /** Spawn brief, or a bounded inbox preview for the current reused assignment. */
   task: string;
+  /** The job's name from the spawn brief, kept when a wake replaces `task`; display only. */
+  jobTitle?: string;
   /**
    * Requested reasoning level for this worker's chat, or null to inherit the default.
    *
@@ -1066,6 +1114,8 @@ export interface SwarmState {
    * Caller/model status remains scoped separately and never uses this to reveal another owner.
    */
   retainedHistory?: boolean;
+  /** Local UI projection of dormant workers; never grants caller/model access. */
+  retainedWorkers?: AgentInfo[];
   agents: AgentInfo[];
 }
 
@@ -1080,6 +1130,27 @@ export interface ClearAgentResult {
   cleared: 'run' | 'worker' | 'none';
   reason: string;
   swarm: SwarmState;
+}
+
+/** A user-reviewable cleanup offer, not filesystem or worker-execution authority. */
+export interface WorkerWorktreeCleanupOffer {
+  runId: string;
+  agentId: string;
+  reason: string;
+  /** User-facing job name; older stored checkout offers may not have one. */
+  label?: string;
+  /** Approved-root virtual path only; never expose a native filesystem path. */
+  workspace: string;
+  dirty: boolean;
+  ignoredFiles: boolean;
+  uniqueCommits: boolean;
+  /** Count only: ignored/untracked native filenames stay within the main process. */
+  changeCount: number;
+}
+
+export interface WorkerWorktreeCleanupResult {
+  removed: boolean;
+  branchPreserved: boolean;
 }
 
 // ---------------------------------------------------------------- helpers
@@ -1223,6 +1294,30 @@ export interface SessionSearchResult {
   /** A line of the chat around the first match, with match ranges into `text`; absent for a title match. */
   snippet?: { text: string; matches: Array<[number, number]> };
 }
+/** The longest bookmark excerpt, ellipsis included; the renderer cuts it before it is sent. */
+export const BOOKMARK_EXCERPT_MAX = 160;
+
+/** An answer you bookmarked in a chat, to jump back to it from the chat's header. */
+export interface SessionBookmark {
+  /** ChatGPT's id of the answer. */
+  messageId: string;
+  /** The start of the answer as plain text, one line, at most `BOOKMARK_EXCERPT_MAX` characters. */
+  excerpt: string;
+  /** When the answer appeared: the list is in this order, like the chat. */
+  messageTime: number;
+  /** When it was bookmarked. */
+  at: number;
+}
+
+/** The message a text match was found in, to open the chat there (`sessions:locate-match`). */
+export interface SessionSearchLocation {
+  /** The message's event, as the timeline holds it. */
+  seq: number;
+  kind: 'user_message' | 'assistant_message';
+  messageId: string | null;
+  /** Where the message first appeared, in the timeline's paging order (origin, else seq). */
+  position: number;
+}
 export interface SessionSearchReply {
   results: SessionSearchResult[];
   /** Chats whose words are indexed so far, out of all chats; equal once indexing is done. */
@@ -1230,4 +1325,21 @@ export interface SessionSearchReply {
   total: number;
   /** More chats match than `results` holds. */
   limited?: true;
+}
+
+/**
+ * Stored title of the chat that collects tool calls no chat could be named for. It doubles as the
+ * marker the app finds that chat by (with no conversation), so it stays English on disk and the
+ * window shows it in the interface language.
+ */
+export const UNATTRIBUTED_SESSION_TITLE = 'Unattributed activity';
+
+/**
+ * The chat that collects unplaceable tool calls. No conversation alone does not make one: a new
+ * chat whose first message has not gone out yet has none either (#1759). The bucket is created
+ * without an origin, while such a chat starts with one, so even a chat renamed to the bucket's
+ * title stays a chat.
+ */
+export function isUnattributedSession(summary: { conversationId: string | null; title: string; origin?: SessionOrigin | null }): boolean {
+  return summary.conversationId === null && !summary.origin && summary.title === UNATTRIBUTED_SESSION_TITLE;
 }

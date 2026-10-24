@@ -1,3 +1,4 @@
+import { constants } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import sharp from 'sharp';
@@ -11,6 +12,7 @@ export const MAX_IMAGE_EXPORT_BYTES = 25 * 1024 * 1024;
 /** Base64 of the largest original plus the JSON around it. */
 export const IMAGE_EXPORT_BODY_BYTES = Math.ceil(MAX_IMAGE_EXPORT_BYTES / 3) * 4 + 64 * 1024;
 
+const NO_HARD_LINKS = new Set(['ENOTSUP', 'EOPNOTSUPP', 'ENOSYS', 'EPERM', 'EXDEV', 'EMLINK']);
 const FORMATS: Record<string, string> = { png: '.png', jpeg: '.jpg', webp: '.webp' };
 const EXTENSIONS: Record<string, string> = { '.png': 'png', '.jpg': 'jpeg', '.jpeg': 'jpeg', '.webp': 'webp' };
 
@@ -52,7 +54,12 @@ export async function saveImageFile(bytes: Buffer, target: ImageExportTarget): P
   const temporary = path.join(path.dirname(file), `.${path.basename(file)}.${randomUUID()}.part`);
   await fs.writeFile(temporary, bytes, { flag: 'wx' });
   try {
-    await fs.link(temporary, file);
+    try {
+      await fs.link(temporary, file);
+    } catch (error) {
+      if (!NO_HARD_LINKS.has((error as NodeJS.ErrnoException).code ?? '')) throw error;
+      await fs.copyFile(temporary, file, constants.COPYFILE_EXCL);
+    }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new ImageExportError(`${virtual} already exists. Choose another name.`);
     throw error;

@@ -1,13 +1,18 @@
+import { isSftpRemote } from '../shared/projects.js';
 import type { InputAttachment } from '../shared/input.js';
 import type { LocalProject } from '../shared/projects.js';
 import type { ToolEditReview } from '../shared/session.js';
 import type { ProjectDirectoryListing, ProjectFileEntry, ProjectFileKind, ProjectFilePreview, ProjectFilesChanged } from '../shared/project-files.js';
 import type { ProjectGitChange, ProjectGitChanged, ProjectGitDiff, ProjectGitSnapshot, ProjectGitStatus } from '../shared/project-git.js';
+import { requestName } from './name-dialog.js';
 import { safeExternalLink } from '../shared/external-link.js';
 import { marked } from 'marked';
-import { currentLanguage, t, ui } from './i18n.js';
+import { currentLanguage, onLanguageChange, t, tn, ui } from './i18n.js';
 import { disclosureChevron, el, icon, run, toast } from './dom.js';
 import { attachWorkPanelResize } from './work-panel-resize.js';
+import { createSearchPopup } from './search-popup.js';
+import { openRowMenu, type RowMenuItem } from './row-menu.js';
+import { appendGitignoreEntry, gitignoreEntry } from './gitignore-entry.js';
 import { sanitizeHtmlTree } from './sanitize-html.js';
 import type { ProjectCodeEditor, ProjectDiffViewer } from './file-code-editor.js';
 import type { ProjectPdfViewer } from './file-pdf-viewer.js';
@@ -23,6 +28,8 @@ interface FilePanelOptions {
   onAttach?: (attachment: InputAttachment) => void;
   /** Capture the current composer owner before staging starts, including its draft epoch. */
   captureAttachment?: () => (attachment: InputAttachment) => boolean;
+  /** Puts a request in the composer for the person to read and send; never sends it. */
+  onAskChat?: (request: string) => void;
 }
 
 interface Selection {
@@ -32,6 +39,7 @@ interface Selection {
 
 const PREVIEW_HEIGHT_KEY = 'chat-on-steroids.file-preview-height';
 const PREVIEW_MIN_HEIGHT = 140;
+const GITIGNORE = '.gitignore';
 const MARKDOWN_TAGS = new Set([
   'A', 'BLOCKQUOTE', 'BR', 'CODE', 'DEL', 'EM', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
   'HR', 'KBD', 'LI', 'OL', 'P', 'PRE', 'S', 'STRONG', 'TABLE', 'TBODY', 'TD', 'TFOOT',
@@ -103,68 +111,22 @@ function actionButton(label: () => string, glyph: string, action: () => void | P
   button.type = 'button';
   button.append(icon(glyph), el('span', '', label));
   ui(button, 'title', label);
+  // The label can be hidden when the toolbar is narrow; the name stays (fitToolbarActions).
+  ui(button, 'aria-label', label);
   button.addEventListener('click', () => void action());
   return button;
 }
 
 function requestEntryName(options: { title: string; initial?: string; confirm: string }): Promise<string | null> {
-  document.querySelector('.file-entry-dialog')?.remove();
-  return new Promise(resolve => {
-    const box = document.createElement('dialog');
-    box.className = 'file-entry-dialog';
-    const form = document.createElement('form');
-    form.className = 'file-entry-dialog-form';
-    form.noValidate = true;
-    const heading = el('h2', '', options.title);
-    const label = el('label', 'file-entry-dialog-field');
-    const input = document.createElement('input');
-    input.className = 'file-entry-dialog-input';
-    input.type = 'text';
-    input.maxLength = 255;
-    input.autocomplete = 'off';
-    input.spellcheck = false;
-    input.value = options.initial ?? '';
-    label.append(el('span', '', () => t('Name')), input);
-    const actions = el('div', 'file-entry-dialog-actions');
-    const cancel = el('button', 'btn', () => t('Cancel')) as HTMLButtonElement;
-    cancel.type = 'button';
-    const confirm = el('button', 'btn btn-solid', options.confirm) as HTMLButtonElement;
-    confirm.type = 'submit';
-    actions.append(cancel, confirm);
-    form.append(heading, label, actions);
-    box.append(form);
-    document.body.append(box);
-
-    let settled = false;
-    const finish = (value: string | null): void => {
-      if (settled) return;
-      settled = true;
-      box.remove();
-      resolve(value);
-    };
-    cancel.addEventListener('click', () => finish(null));
-    box.addEventListener('cancel', event => { event.preventDefault(); finish(null); });
-    input.addEventListener('input', () => input.setCustomValidity(''));
-    form.addEventListener('submit', event => {
-      event.preventDefault();
-      const value = input.value.trim();
-      if (!value || value === '.' || value === '..' || /[\\/\0]/.test(value)) {
-        input.setCustomValidity(t('Use one file or folder name.'));
-        input.reportValidity();
-        return;
-      }
-      finish(value);
-    });
-
-    if (typeof box.showModal === 'function') box.showModal();
-    else box.setAttribute('open', '');
-    input.focus();
-    input.select();
+  return requestName({
+    ...options, maxLength: 255,
+    validate: value => !value || value === '.' || value === '..' || /[\\/\0]/.test(value) ? t('Use one file or folder name.') : null
   });
 }
 
-function requestFileConfirmation(options: { title: string; message: string; detail?: string; confirm: string }): Promise<boolean> {
+function requestFileConfirmation(options: { title: string; message: string; detail?: string; confirm: string; danger?: boolean }): Promise<boolean> {
   document.querySelector('.file-confirm-dialog')?.remove();
+  const opener = document.activeElement as HTMLElement | null;
   return new Promise(resolve => {
     const box = document.createElement('dialog');
     box.className = 'file-confirm-dialog';
@@ -174,7 +136,7 @@ function requestFileConfirmation(options: { title: string; message: string; deta
     const actions = el('div', 'file-entry-dialog-actions');
     const cancel = el('button', 'btn', () => t('Cancel')) as HTMLButtonElement;
     cancel.type = 'button';
-    const confirm = el('button', 'btn btn-solid file-dialog-danger', options.confirm) as HTMLButtonElement;
+    const confirm = el('button', `btn btn-solid${options.danger === false ? '' : ' file-dialog-danger'}`, options.confirm) as HTMLButtonElement;
     confirm.type = 'button';
     actions.append(cancel, confirm);
     body.append(actions);
@@ -185,7 +147,10 @@ function requestFileConfirmation(options: { title: string; message: string; deta
     const finish = (value: boolean): void => {
       if (settled) return;
       settled = true;
+      // Closing a modal dialog hands focus back to where it was; removing it leaves focus on the page body.
+      if (typeof box.close === 'function' && box.open) box.close();
       box.remove();
+      if ((!document.activeElement || document.activeElement === document.body) && opener?.isConnected) opener.focus({ preventScroll: true });
       resolve(value);
     };
     cancel.addEventListener('click', () => finish(false));
@@ -230,6 +195,14 @@ export function createFilePanel(options: FilePanelOptions) {
     toolbarActions.append(newFile, newFolder, rename, remove, reveal, changes);
     toolbar.append(toolbarActions, refresh);
   }
+  // Labels that do not fit hid the last actions behind an invisible scrollbar (German: Delete,
+  // Reveal and Changes). Show icons only then; each button keeps its title and accessible name.
+  const fitToolbarActions = (): void => {
+    toolbarActions.classList.remove('is-compact');
+    toolbarActions.classList.toggle('is-compact', toolbarActions.scrollWidth > toolbarActions.clientWidth + 1);
+  };
+  if (typeof ResizeObserver === 'function') new ResizeObserver(fitToolbarActions).observe(toolbar);
+  onLanguageChange(() => { updateChangesButton(); fitToolbarActions(); });
 
   const body = el('div', 'file-panel-body');
   const tree = el('div', 'file-tree'); tree.setAttribute('role', 'tree');
@@ -311,13 +284,30 @@ export function createFilePanel(options: FilePanelOptions) {
   let reviewGeneration = 0;
   let gitSnapshot: ProjectGitSnapshot | null = null;
   let selectedBaseRef: string | null = null;
-  let branchMenu: HTMLElement | null = null;
+  const branchPopup = createSearchPopup({
+    trigger: () => branchTrigger, className: 'file-branch',
+    label: () => t('Compare branches'), placeholder: () => t('Search branches…'), empty: () => t('No branches found'),
+    choices: () => [{ ref: '', label: t('Working tree') }, ...(gitSnapshot?.branches ?? [])].map(choice => ({
+      label: choice.label, selected: choice.ref === (selectedBaseRef ?? ''),
+      ...(choice.ref.startsWith('refs/remotes/') ? { title: t('Locally cached remote branch; no automatic fetch') } : {}),
+      pick: () => {
+        if (selectedBaseRef === (choice.ref || null)) return;
+        selectedBaseRef = choice.ref || null;
+        gitDiffGeneration++; gitDiffPath = null; gitDiffValue = null;
+        gitSnapshot = null;
+        destroyDiffViewer(); render();
+        void reconcileGitChanges();
+      }
+    })),
+    notes: () => gitSnapshot?.branchesTruncated ? [t('More branches exist than can be shown.')] : []
+  });
   let gitLoading = false;
   let gitGeneration = 0;
   let gitDiffGeneration = 0;
   let gitDiffPath: string | null = null;
   let gitDiffValue: ProjectGitDiff | null = null;
   let renderedGitDiffRevision: string | null = null;
+  let conflictThreeWay = true;
   let gitReconcileTimer: number | null = null;
   const retainedDrafts = new Map<string, { preview: ProjectFilePreview & { text: string; revision: string }; text: string }>();
   let expanded = new Set<string>(['']);
@@ -436,7 +426,7 @@ export function createFilePanel(options: FilePanelOptions) {
   }
 
   function editablePreview(value: ProjectFilePreview): value is ProjectFilePreview & { text: string; revision: string } {
-    return !value.binary && value.text !== null && !value.truncated && typeof value.revision === 'string';
+    return !project?.remote && !value.binary && value.text !== null && !value.truncated && typeof value.revision === 'string';
   }
 
   async function leaveEditorIfNeeded(): Promise<boolean> {
@@ -512,7 +502,7 @@ export function createFilePanel(options: FilePanelOptions) {
     pane.hidden = false;
     if (!options.mount) options.host.classList.add('has-file-panel');
     options.toggle?.setAttribute('aria-expanded', 'true');
-    if (project.remote) { render(); return; }
+    if (project.remote && !isSftpRemote(project.remote)) { render(); return; }
     if (mode === 'files' && !listings.has('')) await loadDirectory('');
     else render();
     if (reconcile) void reconcileGitChanges();
@@ -542,6 +532,10 @@ export function createFilePanel(options: FilePanelOptions) {
   function updateActions(): void {
     const target = actionSelection();
     const inFiles = mode === 'files';
+    // A project on a server (#1469) is browsed and previewed here; v1 changes its files only
+    // through ChatGPT's tools, so actions that could only fail there are not offered.
+    const onServer = Boolean(project?.remote);
+    for (const button of [newFile, newFolder, rename, remove, reveal]) button.hidden = onServer;
     const mutable = inFiles && Boolean(project) && target.path !== '' &&
       (target.kind === 'file' || target.kind === 'directory');
     rename.disabled = !mutable;
@@ -603,6 +597,7 @@ export function createFilePanel(options: FilePanelOptions) {
   }
 
   function gitStatusLabel(status: ProjectGitStatus): string {
+    if (status === 'C') return t('Conflict');
     if (status === 'U') return t('Untracked');
     if (status === 'A') return t('Added');
     if (status === 'D') return t('Deleted');
@@ -643,6 +638,8 @@ export function createFilePanel(options: FilePanelOptions) {
   }
 
   function folderGitStatus(statuses: ReadonlySet<ProjectGitStatus>): ProjectGitStatus {
+    // A folder holding a conflict says so, whatever else changed in it.
+    if (statuses.has('C')) return 'C';
     return statuses.size === 1 ? [...statuses][0]! : 'M';
   }
 
@@ -979,9 +976,9 @@ export function createFilePanel(options: FilePanelOptions) {
       surfaceClass = 'has-pdf-viewer';
       content = pdfHost;
     } else if (value.binary) {
-      content = el('p', 'file-preview-empty', value.note ?? (() => t('Binary file · preview unavailable')));
+      content = el('p', 'file-preview-empty', () => value.note ? t(value.note) : t('Binary file · preview unavailable'));
     } else if (value.text === null) {
-      content = el('p', 'file-preview-empty', value.note ?? t('Preview unavailable'));
+      content = el('p', 'file-preview-empty', () => value.note ? t(value.note) : t('Preview unavailable'));
     } else if (/\.(?:md|markdown)$/i.test(value.name)) {
       content = markdownPreview(value.text);
     } else {
@@ -1022,6 +1019,7 @@ export function createFilePanel(options: FilePanelOptions) {
     const label = count > 0 ? t('Changes ({0})', [count]) : t('Changes');
     changes.title = label;
     changes.setAttribute('aria-label', label);
+    fitToolbarActions();
   }
 
   function changeStats(change: ProjectGitChange): HTMLElement {
@@ -1029,7 +1027,7 @@ export function createFilePanel(options: FilePanelOptions) {
     if (change.status === 'U') {
       stats.title = t('All lines in this untracked file');
       stats.append(el('span', 'is-muted', change.binary ? t('Binary') :
-        change.additions === null ? '—' : change.additions === 1 ? t('1 line') : t('{0} lines', [change.additions])));
+        change.additions === null ? '—' : tn('{0} line', '{0} lines', change.additions)));
       return stats;
     }
     stats.title = gitSnapshot?.comparison ? t('Changes from comparison base') : t('Changes since HEAD');
@@ -1072,7 +1070,7 @@ export function createFilePanel(options: FilePanelOptions) {
       return;
     }
     const groups: Array<[ProjectGitStatus, string]> = [
-      ['M', t('Modified')], ['A', t('Added')], ['D', t('Deleted')],
+      ['C', t('Conflicts')], ['M', t('Modified')], ['A', t('Added')], ['D', t('Deleted')],
       ['R', t('Renamed')], ['U', t('Untracked')]
     ];
     for (const [status, label] of groups) {
@@ -1097,11 +1095,92 @@ export function createFilePanel(options: FilePanelOptions) {
         row.title = `${gitStatusLabel(change.status)} · ${change.previousPath ? `${change.previousPath} → ` : ''}${change.path} · ${stats.textContent ?? ''}`;
         row.setAttribute('aria-label', row.title);
         row.addEventListener('click', () => void openGitDiff(change));
+        // A name no single .gitignore line can hold (a line break) gets no menu rather than one that does nothing.
+        if (status === 'U' && !gitSnapshot.comparison && !project.remote && gitignoreEntry(change.path, false)) {
+          row.addEventListener('contextmenu', event => {
+            event.preventDefault();
+            // The context-menu key reports no pointer position; the menu then opens below the row.
+            const pointer = event.clientX || event.clientY ? { at: { x: event.clientX, y: event.clientY } } : {};
+            openRowMenu({
+              owner: `git-change:${change.path}`,
+              anchor: () => [...changesList.querySelectorAll<HTMLElement>('.file-change-row')].find(item => item.dataset.path === change.path) ?? null,
+              label: () => t('Add to .gitignore'),
+              items: () => ignoreMenuItems(change.path),
+              ...pointer
+            });
+          });
+        }
         section.append(row);
       }
       changesList.append(section);
     }
     if (gitSnapshot.truncated) changesList.append(el('p', 'file-changes-limit', () => t('More changes exist than can be shown at once.')));
+  }
+
+  function ignoreMenuItems(path: string): RowMenuItem[] {
+    const items: RowMenuItem[] = [{
+      action: 'gitignore-file', icon: 'i-ban', label: () => t('Add “{0}” to .gitignore', [baseName(path)]),
+      run: () => void addToGitignore(path, false)
+    }];
+    const folder = parentPath(path);
+    if (folder) {
+      items.push({
+        action: 'gitignore-folder', icon: 'i-folder', label: () => t('Add “{0}” to .gitignore', [`${baseName(folder)}/`]),
+        title: () => `${folder}/`, run: () => void addToGitignore(folder, true)
+      });
+    }
+    return items;
+  }
+
+  /**
+   * Appends one untracked path to the project folder's .gitignore through the Files save path.
+   * The file is read before the dialog and saved against that revision, so an edit made
+   * elsewhere while the dialog is open is refused instead of overwritten.
+   */
+  async function addToGitignore(path: string, folder: boolean): Promise<void> {
+    const current = project;
+    const entry = gitignoreEntry(path, folder);
+    if (!current || current.remote || !entry) return;
+    const expected = generation;
+    const rowPosition = [...changesList.querySelectorAll<HTMLElement>('.file-change-row')].findIndex(row => row.dataset.path === path);
+    const read = await window.api.previewProjectFile(current.id, GITIGNORE);
+    if (expected !== generation || project?.id !== current.id) return;
+    let base: (ProjectFilePreview & { text: string; revision: string }) | null = null;
+    if (read.ok) {
+      if (!editablePreview(read.data)) { toast(t('.gitignore is too large or not plain text, so it cannot be changed here.')); return; }
+      base = read.data;
+    } else {
+      // A missing file is created after the dialog; any other read failure is reported as is.
+      const root = await run(window.api.listProjectFiles(current.id, ''));
+      if (!root || expected !== generation || project?.id !== current.id) return;
+      if (root.entries.some(item => item.path === GITIGNORE)) { toast(t(read.error)); return; }
+    }
+    const confirmed = await requestFileConfirmation({
+      title: t('Add to .gitignore?'),
+      message: t('Add the line “{0}” to .gitignore?', [entry]),
+      ...(base ? {} : { detail: t('This project has no .gitignore yet. One is created in the project folder.') }),
+      confirm: t('Add'),
+      danger: false
+    });
+    if (!confirmed || expected !== generation || project?.id !== current.id) return;
+    if (!base) {
+      if (!(await run(window.api.createProjectFileEntry(current.id, '', GITIGNORE, 'file')))) return;
+      const created = await run(window.api.previewProjectFile(current.id, GITIGNORE));
+      if (!created || !editablePreview(created)) return;
+      base = created;
+    }
+    const saved = await run(window.api.saveProjectFile(current.id, GITIGNORE, appendGitignoreEntry(base.text, entry),
+      base.modifiedAt, base.bytes, base.revision));
+    if (!saved) return;
+    toast(t('Added {0} to .gitignore', [entry]));
+    if (expected !== generation || project?.id !== current.id) return;
+    if (!options.reviewOnly) await reloadDirectory('');
+    await reconcileGitChanges(true);
+    // The ignored row is gone after the refresh, taking focus with it: continue at the row now in its place.
+    if (document.activeElement && document.activeElement !== document.body) return;
+    const rows = [...changesList.querySelectorAll<HTMLElement>('.file-change-row')];
+    (rows.find(row => row.dataset.path === path) ?? rows[Math.min(Math.max(rowPosition, 0), rows.length - 1)]
+      ?? (options.reviewOnly ? refresh : backToFiles)).focus({ preventScroll: true });
   }
 
   function closeGitDiff(): void {
@@ -1160,6 +1239,18 @@ export function createFilePanel(options: FilePanelOptions) {
     language.textContent = created.language;
   }
 
+  async function mountConflictPanes(value: ProjectGitDiff, panes: Array<[HTMLElement, string]>, language: HTMLElement, revision: string): Promise<void> {
+    const token = ++diffMountToken;
+    const module = await import('./file-code-editor.js');
+    const current = (): boolean => token === diffMountToken && mode === 'changes' && gitDiffPath === value.path && revision === renderedGitDiffRevision;
+    if (!current()) return;
+    const editors = await Promise.all(panes.map(([parent, text]) =>
+      module.createProjectCodeEditor({ parent, filename: value.path, text, readOnly: true })));
+    if (!current() || !editors.length) { for (const editor of editors) editor.destroy(); return; }
+    diffViewer = { view: editors[0]!.view, language: editors[0]!.language, destroy: () => { for (const editor of editors) editor.destroy(); } };
+    language.textContent = editors[0]!.language;
+  }
+
   function renderGitDiff(): void {
     const historical = mode === 'review';
     const path = historical ? reviewValue?.path ?? t('Review edit') : gitDiffPath;
@@ -1172,7 +1263,7 @@ export function createFilePanel(options: FilePanelOptions) {
     const value = historical ? reviewValue : gitDiffValue;
     const revision = historical
       ? `review\0${reviewSource?.callId ?? ''}\0${reviewSource?.cursor ?? 0}`
-      : `${gitSnapshot?.revision ?? ''}\0${gitDiffPath}`;
+      : `${gitSnapshot?.revision ?? ''}\0${gitDiffPath}\0${conflictThreeWay}`;
     if (renderedGitDiffRevision === revision && (diffViewer || (value && 'binary' in value && (value.binary || value.tooLarge)))) {
       preview.hidden = false;
       return;
@@ -1192,11 +1283,30 @@ export function createFilePanel(options: FilePanelOptions) {
       next.disabled = reviewSource.cursor === reviewSource.indices.length - 1;
       actions.append(previous, el('span', 'file-review-counter', `${reviewSource.cursor + 1}/${reviewSource.indices.length}`), next);
     }
+    const conflicted = !historical && value && 'status' in value && value.status === 'C' ? value : null;
+    if (conflicted?.conflict) {
+      const threeWay = actionButton(() => t('Three-way view'), 'i-git-branch', () => {
+        conflictThreeWay = !conflictThreeWay; render();
+        // The header is rebuilt: focus stays on the toggle.
+        preview.querySelector<HTMLButtonElement>('.file-conflict-toggle')?.focus();
+      });
+      threeWay.classList.add('file-conflict-toggle');
+      threeWay.setAttribute('aria-pressed', String(conflictThreeWay));
+      actions.append(threeWay);
+    }
+    if (conflicted && options.onAskChat) {
+      const ask = options.onAskChat;
+      actions.append(actionButton(() => t('Ask chat to resolve'), 'i-chat', () => ask(t(
+        'Help me resolve the merge conflict in {0}. Read the common base, ours and theirs with git show :1:./{0}, :2:./{0} and :3:./{0}, then write a version that keeps what both sides meant and tell me what you chose. Do not stage or commit it.',
+        [conflicted.path]))));
+    }
     actions.append(actionButton(() => t('Close preview'), 'i-x', historical ? leaveReview : closeGitDiff));
     head.append(title, actions);
     if (!value) {
       replacePreview(head, el('p', 'file-preview-empty', () => t('Loading diff…')));
       preview.hidden = false;
+      // Nothing is shown for this revision yet: a binary, too large or conflicted result must still render.
+      renderedGitDiffRevision = null;
       return;
     }
     const language = el('span', 'file-editor-language', () => t('Detecting language…'));
@@ -1207,9 +1317,35 @@ export function createFilePanel(options: FilePanelOptions) {
         ? `${gitStatusLabel(value.status)} · ${value.previousPath} → ${value.path}`
         : `${gitStatusLabel((value as ProjectGitDiff).status)} · ${value.path}`;
     meta.append(el('span', '', status), language);
+    if (conflicted?.conflict && conflictThreeWay) {
+      const sides: Array<[() => string, string | null]> = [
+        [() => t('Ours (HEAD)'), conflicted.conflict.ours], [() => t('Common base'), conflicted.conflict.base],
+        [() => t('Theirs (incoming)'), conflicted.conflict.theirs]
+      ];
+      // The view is a size container: three columns when the panel is wide, three rows when not.
+      const panesHost = el('div', 'file-conflict-view');
+      const grid = el('div', 'file-conflict-panes');
+      panesHost.append(grid);
+      const panes: Array<[HTMLElement, string]> = [];
+      for (const [label, text] of sides) {
+        const body = el('div', 'file-code-editor-host file-conflict-pane-body');
+        if (text === null) body.append(el('p', 'file-preview-empty', () => t('Not in this version')));
+        else panes.push([body, text]);
+        const pane = el('section', 'file-conflict-pane');
+        ui(pane, 'aria-label', label);
+        pane.append(el('div', 'file-conflict-pane-label', label), body);
+        grid.append(pane);
+      }
+      preview.classList.remove('is-editing', 'has-pdf-viewer', 'has-diff-viewer');
+      preview.classList.add('has-code-viewer');
+      replacePreview(head, meta, panesHost);
+      preview.hidden = false;
+      void mountConflictPanes(conflicted, panes, language, revision);
+      return;
+    }
     if (('binary' in value && (value.binary || value.tooLarge)) || value.baseText === null || value.currentText === null) {
       language.remove();
-      replacePreview(head, meta, el('p', 'file-preview-empty', 'note' in value ? value.note ?? (() => t('Diff preview unavailable')) : () => t('Diff preview unavailable')));
+      replacePreview(head, meta, el('p', 'file-preview-empty', () => 'note' in value && value.note ? t(value.note) : t('Diff preview unavailable')));
       preview.hidden = false;
       return;
     }
@@ -1246,7 +1382,7 @@ export function createFilePanel(options: FilePanelOptions) {
 
   async function reconcileGitChanges(forceDiff = false): Promise<void> {
     const current = project;
-    if (current?.remote) { render(); return; }
+    if (current?.remote && !isSftpRemote(current.remote)) { render(); return; }
     if (!current) {
       gitSnapshot = null; gitLoading = false; updateChangesButton(); renderTree(); renderChangesList(); return;
     }
@@ -1331,7 +1467,7 @@ export function createFilePanel(options: FilePanelOptions) {
   }
 
   function render(): void {
-    const remote = !!project?.remote;
+    const remote = !!project?.remote && !isSftpRemote(project.remote);
     remoteNotice.hidden = !remote; toolbar.hidden = body.hidden = remote;
     if (remote) { syncWatches(); return; }
     const showingChanges = mode === 'changes';
@@ -1381,6 +1517,12 @@ export function createFilePanel(options: FilePanelOptions) {
     updateActions();
     syncWatches();
   }
+
+  // Group titles, counts and row labels are plain text; repaint them when the language changes.
+  onLanguageChange(() => {
+    renderTree();
+    if (mode === 'changes' && gitDiffPath === null) renderChangesList();
+  });
 
   function watchedDirectories(): string[] {
     if (!project) return [];
@@ -1456,6 +1598,7 @@ export function createFilePanel(options: FilePanelOptions) {
   async function handleWatchedChange(change: ProjectFilesChanged): Promise<void> {
     const current = project;
     if (!current || change.projectId !== current.id) return;
+    if (change.watchLost) { watchSignature = ''; syncWatches(); }
     scheduleGitReconcile();
     const expectedGeneration = generation;
     const listing = await run(window.api.listProjectFiles(current.id, change.directory));
@@ -1586,84 +1729,11 @@ export function createFilePanel(options: FilePanelOptions) {
   }
 
   refresh.onclick = () => void (mode === 'changes' ? reconcileGitChanges(true) : refreshAll());
-  function closeBranchMenu(restoreFocus = false): void {
-    if (!branchMenu) return;
-    const leaving = branchMenu; branchMenu = null;
-    // Leave like the other menus: a short fade while it stops taking input, then removal.
-    leaving.inert = true; leaving.classList.add('is-leaving');
-    const motion = !window.matchMedia?.('(prefers-reduced-motion: reduce)').matches && typeof leaving.animate === 'function';
-    if (motion) void leaving.animate([{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'translateY(-4px)' }], { duration: 120, easing: 'ease-in' })
-      .finished.catch(() => undefined).then(() => leaving.remove());
-    else leaving.remove();
-    document.removeEventListener('pointerdown', dismissBranchMenu, true);
-    document.removeEventListener('keydown', branchMenuKeydown, true);
-    window.removeEventListener('resize', dismissBranchMenuOnResize);
-    branchTrigger.setAttribute('aria-expanded', 'false');
-    if (restoreFocus) branchTrigger.focus();
-  }
-  function dismissBranchMenu(event: PointerEvent): void {
-    if (branchMenu && !branchMenu.contains(event.target as Node) && !branchTrigger.contains(event.target as Node)) closeBranchMenu();
-  }
-  function branchMenuKeydown(event: KeyboardEvent): void {
-    if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closeBranchMenu(true); }
-  }
-  function dismissBranchMenuOnResize(): void { closeBranchMenu(); }
+  function closeBranchMenu(restoreFocus = false): void { branchPopup.close(restoreFocus); }
   branchTrigger.addEventListener('click', () => {
-    if (branchMenu) { closeBranchMenu(); return; }
+    if (branchPopup.open) { closeBranchMenu(); return; }
     if (!project || (gitSnapshot?.state !== 'ready' && !selectedBaseRef)) return;
-    const menu = el('div', 'file-branch-menu');
-    menu.setAttribute('role', 'dialog');
-    menu.setAttribute('aria-label', t('Compare branches'));
-    const search = el('input', 'file-branch-search') as HTMLInputElement;
-    search.type = 'search'; search.placeholder = t('Search branches…');
-    search.setAttribute('aria-label', t('Search branches…'));
-    const items = el('div', 'file-branch-items');
-    const renderItems = (): void => {
-      items.replaceChildren();
-      const query = search.value.trim().toLocaleLowerCase();
-      const choices = [{ ref: '', label: t('Working tree') }, ...(gitSnapshot?.branches ?? [])];
-      for (const choice of choices.filter(entry => entry.label.toLocaleLowerCase().includes(query))) {
-        const option = el('button', 'file-branch-option') as HTMLButtonElement;
-        option.type = 'button';
-        if (choice.ref.startsWith('refs/remotes/')) option.title = t('Locally cached remote branch; no automatic fetch');
-        option.append(el('span', '', choice.label));
-        if (choice.ref === (selectedBaseRef ?? '')) option.append(icon('i-check'));
-        option.addEventListener('click', () => {
-          closeBranchMenu();
-          if (selectedBaseRef === (choice.ref || null)) return;
-          selectedBaseRef = choice.ref || null;
-          gitDiffGeneration++; gitDiffPath = null; gitDiffValue = null;
-          gitSnapshot = null;
-          destroyDiffViewer(); render();
-          void reconcileGitChanges();
-        });
-        items.append(option);
-      }
-      if (!items.childElementCount) items.append(el('p', 'file-branch-empty', () => t('No branches found')));
-      if (gitSnapshot?.branchesTruncated) items.append(el('p', 'file-branch-empty', () => t('More branches exist than can be shown.')));
-    };
-    search.addEventListener('input', renderItems);
-    search.addEventListener('keydown', event => {
-      if (event.key === 'ArrowDown') { event.preventDefault(); items.querySelector<HTMLButtonElement>('button')?.focus(); }
-      if (event.key === 'Enter') { event.preventDefault(); items.querySelector<HTMLButtonElement>('button')?.click(); }
-    });
-    items.addEventListener('keydown', event => {
-      const buttons = [...items.querySelectorAll<HTMLButtonElement>('button')];
-      const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
-      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-        event.preventDefault(); buttons[Math.max(0, Math.min(buttons.length - 1, index + (event.key === 'ArrowDown' ? 1 : -1)))]?.focus();
-      }
-    });
-    menu.append(search, items);
-    const rect = branchTrigger.getBoundingClientRect();
-    menu.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 300))}px`;
-    menu.style.top = `${Math.max(8, Math.min(rect.bottom + 4, window.innerHeight - 270))}px`;
-    document.body.append(menu); branchMenu = menu;
-    branchTrigger.setAttribute('aria-expanded', 'true');
-    document.addEventListener('pointerdown', dismissBranchMenu, true);
-    document.addEventListener('keydown', branchMenuKeydown, true);
-    window.addEventListener('resize', dismissBranchMenuOnResize);
-    renderItems(); search.focus();
+    branchPopup.show();
   });
   pane.addEventListener('keydown', event => {
     if (editingPath && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {

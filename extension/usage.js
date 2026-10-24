@@ -8,10 +8,12 @@
  * reach the stream tens of seconds before React publishes it, which is the difference between
  * an exact Core caller and CALLER_IDENTITY_REQUIRED. Resume requests also project their
  * opaque conversation id and HTTP status; the isolated recorder owns generation eligibility.
+ * A bounded 404 answer to a history or send request contributes only whether its code is
+ * `conversation_deleted`, with the exact conversation id.
  */
 (() => {
   'use strict';
-  const OBSERVER_VERSION = 3;
+  const OBSERVER_VERSION = 7;
   const prior = window.__cosUsageObserver;
   // An extension update re-executes this file in pages that stay open, and the same protocol
   // version used to keep the *old* code running until the tab was reloaded — measured
@@ -33,6 +35,8 @@
   const nativePost = window.postMessage.bind(window);
   const post = (...args) => { if (active) nativePost(...args); };
   let latest = null;
+  let latestHistoryLimit = null;
+  let latestDeleted = null;
   let requestOrder = 0, latestOrder = 0;
   const CONVERSATION = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   // @ehkogh/#318: the alternate shell also uses bare UUID workflow ids.
@@ -45,6 +49,12 @@
   const originReaders = new Set();
   const readers = new Set();
   const ORIGIN_LISTEN_MS = 15 * 60_000;
+  const MAX_HISTORY_RETRY_MS = 24 * 60 * 60_000;
+  // A 429 may not expose Retry-After at all (including due to response-header
+  // filtering). Back off conservatively instead of entering a reload storm.
+  const HEADERLESS_HISTORY_BACKOFF_MS = 60_000;
+  // ChatGPT has used both the singular and plural history detail routes.
+  const HISTORY_PATH = /^\/backend-api\/conversations?\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i;
   function publishOrigin(conversationId, requestIds, observedAt) {
     if (!active) return;
     const fresh = requestIds.filter(id => !origins.has(`${conversationId}:${id}`));
@@ -76,33 +86,115 @@
       const reset = typeof row?.reset_after === 'string' ? Date.parse(row.reset_after) : NaN;
       if ((model || feature) && remaining !== null) add({ model: model || feature, scope: model ? 'model' : 'feature', remaining, remainingPercent: null, resetAt: Number.isFinite(reset) && reset > 0 ? reset : null, windowSeconds: null });
     }
-    const rates = [{ ...data, label: 'Shared usage' }, ...(Array.isArray(data.additional_rate_limits) ? data.additional_rate_limits.slice(0, 40) : [])];
+    // wham/usage is Codex's usage endpoint: its windows are Codex limits (Codex's /status and
+    // ChatGPT's sidebar panel), never limits on ChatGPT chat messages.
+    const rates = [{ ...data, label: 'Codex' }, ...(Array.isArray(data.additional_rate_limits) ? data.additional_rate_limits.slice(0, 40) : [])];
     for (const rate of rates) {
       const model = label(rate?.model_slug), name = model || label(rate?.limit_name) || label(rate?.label);
       for (const window of [rate?.rate_limit?.primary_window, rate?.rate_limit?.secondary_window]) {
         const used = finite(window?.used_percent);
         if (!name || used === null || used > 100) continue;
         const reset = finite(window?.reset_at);
-        add({ model: name, scope: model ? 'model' : 'shared', remaining: null, remainingPercent: 100 - used, resetAt: reset === null || reset === 0 ? null : reset * 1000, windowSeconds: finite(window?.limit_window_seconds) || null });
+        add({ model: name, scope: 'codex', remaining: null, remainingPercent: 100 - used, resetAt: reset === null || reset === 0 ? null : reset * 1000, windowSeconds: finite(window?.limit_window_seconds) || null });
       }
     }
     latestOrder = order;
     latest = { type: 'cos-usage', rows, observedAt }; post(latest, location.origin);
   };
+  function retryAfterAt(response, observedAt) {
+    for (const name of ['retry-after', 'x-oai-history-initial-retry-after']) {
+      const raw = response.headers?.get?.(name);
+      if (typeof raw !== 'string' || !raw.trim()) continue;
+      const value = raw.trim();
+      let retryAt = NaN;
+      if (/^\d{1,6}$/.test(value)) retryAt = observedAt + Number(value) * 1000;
+      else retryAt = Date.parse(value);
+      if (Number.isFinite(retryAt) && retryAt > observedAt && retryAt - observedAt <= MAX_HISTORY_RETRY_MS) return retryAt;
+    }
+    return null;
+  }
   /**
-   * The Core app's identity, read from the page's own system hint list (#861).
+   * Provider history throttling happens before the conversation DOM exists.
+   * Project only the exact conversation id plus bounded retry deadline: no body,
+   * request headers, credentials or transcript bytes cross worlds.
+   */
+  function inspectHistoryLimit(response, observedAt, method) {
+    if (!active || method !== 'GET') return;
+    let url;
+    try { url = new URL(response.url); } catch { return; }
+    if (url.origin !== location.origin) return;
+    const match = HISTORY_PATH.exec(url.pathname);
+    if (!match || response.status !== 429) return;
+    // Never assume a live Retry-After header exists: a fixed, bounded local
+    // cooldown covers real 429s without a usable header. It is not presented
+    // as a provider-declared retry deadline.
+    const retryAt = retryAfterAt(response, observedAt) ?? observedAt + HEADERLESS_HISTORY_BACKOFF_MS;
+    const projected = { type: 'cos-history-rate-limit', conversationId: match[1], retryAt, observedAt };
+    if (!latestHistoryLimit || projected.retryAt > latestHistoryLimit.retryAt ||
+        projected.conversationId !== latestHistoryLimit.conversationId) latestHistoryLimit = projected;
+    post(projected, location.origin);
+  }
+  /**
+   * A chat deleted in ChatGPT, in ChatGPT's own words (2026-10-11, measured): opening it answers
+   * the history request, and sending into it answers the send, with HTTP 404 and
+   * `detail.code: "conversation_deleted"`. The page then shows a localized notice, or moves to
+   * its home page. Only that code and the exact conversation id leave this world: the history
+   * route names the id, and a send names it in its own request body.
+   */
+  async function inspectDeleted(response, method, sentTo, observedAt) {
+    if (!active || response.status !== 404) return;
+    let url;
+    try { url = new URL(response.url); } catch { return; }
+    if (url.origin !== location.origin) return;
+    const history = method === 'GET' ? HISTORY_PATH.exec(url.pathname)?.[1] : null;
+    const conversationId = history || (method === 'POST' && /^\/backend-api\/(?:f\/)?conversation$/.test(url.pathname) ? sentTo : null);
+    if (!conversationId || !response.headers.get('content-type')?.includes('application/json')) return;
+    const reader = response.clone().body?.getReader();
+    if (!reader) return;
+    readers.add(reader);
+    const timer = setTimeout(() => void reader.cancel().catch(() => {}), 10000);
+    let bytes = 0, text = ''; const decoder = new TextDecoder();
+    try {
+      while (true) {
+        const { done, value } = await reader.read(); if (done) break;
+        bytes += value.byteLength; if (bytes > 16 * 1024) return;
+        text += decoder.decode(value, { stream: true });
+      }
+      const detail = JSON.parse(text + decoder.decode())?.detail;
+      if (detail?.code !== 'conversation_deleted') return;
+      // The history answer also names the conversation; one naming another proves nothing.
+      if (typeof detail.conversation_id === 'string' && detail.conversation_id.toLowerCase() !== conversationId.toLowerCase()) return;
+      latestDeleted = { type: 'cos-conversation-deleted', conversationId: conversationId.toLowerCase(), observedAt };
+      post(latestDeleted, location.origin);
+    } catch { /* An unreadable answer proves nothing. */ }
+    finally { clearTimeout(timer); readers.delete(reader); void reader.cancel().catch(() => {}); }
+  }
+  /** The conversation a send request names, read before the request leaves. */
+  function sendConversation(args) {
+    try {
+      const init = args[1];
+      const method = String(init?.method || args[0]?.method || 'GET').toUpperCase();
+      const url = new URL(typeof args[0] === 'string' ? args[0] : args[0] instanceof URL ? args[0].href : args[0].url, location.origin);
+      if (method !== 'POST' || url.origin !== location.origin || !/^\/backend-api\/(?:f\/)?conversation$/.test(url.pathname) ||
+          typeof init?.body !== 'string' || init.body.length > 2_000_000) return null;
+      const conversationId = JSON.parse(init.body)?.conversation_id;
+      return typeof conversationId === 'string' && CONVERSATION.test(conversationId) ? conversationId : null;
+    } catch { return null; }
+  }
+  /**
+   * COS Core and Plugins identities, read from the page's own system hints (#861).
    *
    * On some accounts ChatGPT attaches an app to a message only when the message mentions it, so
    * prompts the app sends carry a mention of Core. Only app ids and names leave this world.
    *
-   * A computer sharing its ChatGPT account with another names its Core with a suffix
-   * ("Chat On Steroids Core (Windows)"), and this world cannot know which one is this install's:
-   * the page may load its hints before the extension has heard from the app. So every Core-like
-   * name is reported with its app id, and the content script picks its own by exact name. A name
-   * that more than one app carries is ambiguous and reported without an id.
+   * A computer sharing its ChatGPT account with another uses per-surface suffixes.
+   * This world cannot know which install owns a name: report Core/Plugins app ids
+   * by exact name, marking duplicate names ambiguous. The content script picks
+   * this computer's installed connector only from the app-reported names.
    */
   const CORE_APP_NAME = 'Chat On Steroids Core';
   const CORE_NAME = /^Chat On Steroids Core(?: \([\p{L}\p{N} ._-]{1,32}\))?$/u;
+  const PLUGINS_NAME = /^Chat On Steroids Plugins(?: \([\p{L}\p{N} ._-]{1,32}\))?$/u;
   let coreMention = null;
   async function inspectSystemHints(response) {
     if (!active) return;
@@ -126,18 +218,24 @@
       const byName = new Map();
       for (const hint of list.slice(0, 2000)) {
         const id = /^(?:plugin|connector):(asdk_app_[A-Za-z0-9_-]{1,160})$/.exec(typeof hint?.system_hint === 'string' ? hint.system_hint : '')?.[1];
-        if (!id || typeof hint.name !== 'string' || !CORE_NAME.test(hint.name)) continue;
+        if (!id || typeof hint.name !== 'string' || !(CORE_NAME.test(hint.name) || PLUGINS_NAME.test(hint.name))) continue;
         if (!byName.has(hint.name)) byName.set(hint.name, new Set());
         byName.get(hint.name).add(id);
       }
-      // The page asks for several hint lists (basic, custom agents, plugins) and only the plugins
-      // list names Core, in whatever order they answer. A list without Core says nothing about it;
-      // only two different apps with the same Core name make that name ambiguous.
-      // Only the plugins list (`mode=plugins`, measured live) is complete about plugins: there a
-      // missing Core is news. Any other list without Core still says nothing about it.
+      // ChatGPT fetches basic, custom-agent and complete plugins lists in any order.
+      // An incomplete list must not erase an earlier Core or Plugins sighting;
+      // a complete plugins list does authoritatively revoke missing entries.
       const pluginList = url.searchParams.get('mode') === 'plugins';
       if ((!byName.size && !pluginList) || byName.size > 16) return;
-      const candidates = [...byName].map(([name, ids]) => ({ name, path: ids.size === 1 ? `app://${[...ids][0]}` : null }));
+      if (coreMention?.pluginList && !pluginList) return;
+      if (!pluginList && coreMention?.candidates) {
+        for (const old of coreMention.candidates) {
+          const ids = byName.get(old.name);
+          if (!ids) byName.set(old.name, new Set(old.path ? [old.path.slice(6)] : [null]));
+          else if (old.path && !ids.has(old.path.slice(6))) ids.add(old.path.slice(6));
+        }
+      }
+      const candidates = [...byName].map(([name, ids]) => ({ name, path: ids.size === 1 && !ids.has(null) ? `app://${[...ids][0]}` : null }));
       const plain = candidates.find(candidate => candidate.name === CORE_APP_NAME);
       // `path`/`name` keep describing the plain Core for a content script from before suffixes.
       coreMention = { type: 'cos-core-mention', path: plain?.path ?? null, name: plain?.path ? CORE_APP_NAME : null, candidates, pluginList };
@@ -170,6 +268,22 @@
    * Reads bounded complete SSE events from a clone without changing the page's response.
    * Only a conversation id and server request metadata from the same event are projected.
    */
+  /**
+   * The app a connector result names (#1305): `invoked_resource.resource_uri` is
+   * `/asdk_app_<id>/link_<id>/<tool>`, beside the request id that reached the app. Only a
+   * complete tool result message from `api_tool.call_tool` counts, never text in its content.
+   */
+  const APP_RESOURCE = /^\/(asdk_app_[A-Za-z0-9_-]{1,160})\/(link_[A-Za-z0-9_-]{1,160})\/[^/\s]{1,200}$/;
+  function appSightingsOf(message) {
+    const metadata = message?.metadata;
+    if (message?.author?.role !== 'tool' || message.author.name !== 'api_tool.call_tool' || !metadata || typeof metadata !== 'object') return [];
+    const requestId = metadata.request_id;
+    const match = typeof metadata.invoked_resource?.resource_uri === 'string' ? APP_RESOURCE.exec(metadata.invoked_resource.resource_uri) : null;
+    if (typeof requestId !== 'string' || !REQUEST.test(requestId) || !match) return [];
+    const name = metadata.invoked_resource.app_name;
+    const appName = typeof name === 'string' && name.length <= 200 ? name : null;
+    return [{ requestId, appId: match[1], linkId: match[2], appName }];
+  }
   function readOrigin(frame, stream = {}) {
       if (!frame || frame.length > 512 * 1024) { stream.header = null; return; }
       const lines = frame.split(/\r?\n/);
@@ -241,7 +355,8 @@
       const requestIds = new Set([body?.metadata?.request_id, body?.message?.metadata?.request_id,
         body?.input_message?.metadata?.request_id]
         .filter(id => typeof id === 'string' && REQUEST.test(id)));
-      return requestIds.size ? { conversationId, requestIds: [...requestIds] } : null;
+      const sightings = appSightingsOf(body?.message);
+      return requestIds.size || sightings.length ? { conversationId, requestIds: [...requestIds], sightings } : null;
   }
   async function inspectRequestOrigins(response, observedAt) {
     if (!active) return;
@@ -257,9 +372,15 @@
     const timer = setTimeout(() => void reader.cancel().catch(() => {}), ORIGIN_LISTEN_MS);
     const decoder = new TextDecoder(), emitted = new Set(), stream = {};
     let bytes = 0, buffer = '';
+    const sighted = new Set();
     const scan = (frame) => {
       const origin = readOrigin(frame, stream);
       if (!origin) return;
+      const newSightings = (origin.sightings || []).filter(sighting => !sighted.has(sighting.requestId)).slice(0, 16 - sighted.size);
+      if (newSightings.length) {
+        for (const sighting of newSightings) sighted.add(sighting.requestId);
+        if (active) post({ type: 'cos-app-sighting', conversationId: origin.conversationId, sightings: newSightings }, location.origin);
+      }
       const fresh = origin.requestIds.filter((id) => !emitted.has(id)).slice(0, 16 - emitted.size);
       if (fresh.length === 0) return;
       for (const id of fresh) emitted.add(id);
@@ -410,10 +531,12 @@
       const observedAt = Date.now(), order = ++requestOrder;
       noteSendModel(args, observedAt);
       const resume = active ? resumeRequest(args) : null;
+      const sentTo = active ? sendConversation(args) : null;
       const result = downstreamFetch.apply(this, args);
       if (!active) return result;
       void result.then((response) => {
         if (!active) return;
+        const responseAt = Date.now();
         let status = null, streamOpened = false;
         try {
           const url = new URL(response.url);
@@ -427,14 +550,16 @@
           ...(streamOpened && !inspectedResponses.has(response) ? { streamOpened: true } : {}) }, location.origin);
         if (inspectedResponses.has(response)) return;
         inspectedResponses.add(response);
-        void inspect(response, observedAt, order).catch(() => {});
-        void inspectSystemHints(response).catch(() => {});
         let method = 'GET';
         try {
           const explicit = args[1] && typeof args[1].method === 'string' ? args[1].method : null;
           const inherited = args[0] && typeof args[0] === 'object' && typeof args[0].method === 'string' ? args[0].method : null;
           method = String(explicit || inherited || 'GET').toUpperCase();
         } catch { return; }
+        inspectHistoryLimit(response, responseAt, method);
+        void inspectDeleted(response, method, sentTo, responseAt).catch(() => {});
+        void inspect(response, observedAt, order).catch(() => {});
+        void inspectSystemHints(response).catch(() => {});
         if (method === 'POST') void inspectRequestOrigins(response, observedAt).catch(() => {});
       }).catch(() => {
         // Network rejection only retires custody; it cannot prove that the stream is gone.
@@ -456,6 +581,8 @@
   const request = (event) => {
     if (!active || event.source !== window || event.origin !== location.origin || event.data?.type !== 'cos-usage-request') return;
     if (latest) post(latest, location.origin);
+    if (latestHistoryLimit && latestHistoryLimit.retryAt > Date.now()) post(latestHistoryLimit, location.origin);
+    if (latestDeleted) post(latestDeleted, location.origin);
     if (coreMention) post(coreMention, location.origin);
     // Newest first: old evidence must not fill content's 16-ID pending capacity
     // before the current workflow can enter it during document startup.
@@ -464,7 +591,7 @@
   };
   const hide = () => {
     for (const reader of originReaders) void reader.cancel().catch(() => {});
-    origins.clear();
+    origins.clear(); latestHistoryLimit = null; latestDeleted = null;
   };
   window.addEventListener('message', request);
   window.addEventListener('pagehide', hide);
@@ -475,7 +602,7 @@
     dispose() {
       active = false;
       for (const reader of readers) void reader.cancel().catch(() => {});
-      readers.clear(); origins.clear(); latest = null;
+      readers.clear(); origins.clear(); latest = null; latestHistoryLimit = null; latestDeleted = null;
       window.removeEventListener('message', request); window.removeEventListener('pagehide', hide);
       window.removeEventListener('DOMContentLoaded', installFetchObserver);
       window.removeEventListener('DOMContentLoaded', installSocketObserver);

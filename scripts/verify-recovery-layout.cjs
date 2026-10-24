@@ -1,4 +1,5 @@
 // Isolated Electron fixture: production countdown renderer, dock markup and CSS.
+const { withoutScripts } = require('./ui-check-page.cjs');
 const { app, BrowserWindow } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -24,8 +25,7 @@ app.whenReady().then(async () => {
   const win = new BrowserWindow({ show: false, width: 920, height: 380,
     webPreferences: { sandbox: true, offscreen: true, backgroundThrottling: false } });
   const css = fs.readFileSync(path.join(root, 'src/renderer/styles.css'), 'utf8');
-  const html = fs.readFileSync(path.join(root, 'src/renderer/index.html'), 'utf8')
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '').replace(/<link\b[^>]*>/gi, '');
+  const html = withoutScripts(fs.readFileSync(path.join(root, 'src/renderer/index.html'), 'utf8')).replace(/<link\b[^>]*>/gi, '');
   await win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html.replace('</head>', `<style>${css}</style></head>`)));
   await win.webContents.executeJavaScript(bundle.outputFiles[0].text);
   await win.webContents.executeJavaScript(`(() => {
@@ -71,6 +71,8 @@ app.whenReady().then(async () => {
   win.setContentSize(920, 320);
   win.webContents.setZoomFactor(1);
   const previews = [
+    { file: 'preview-pickup', kind: 'pickup', next: 'queue', deadline: 300_000, now: 0 },
+    { file: 'preview-pickup-stopped', kind: 'pickup-stopped', next: 'queue', attempts: 3, deadline: 300_000, now: 0 },
     { file: 'preview-unattributed', kind: 'unattributed', deadline: 15_000, now: 0 },
     { file: 'preview-unattributed-multiple', kind: 'unattributed', deadline: 60_000, now: 0 },
     { file: 'preview-unattributed-five-minute', kind: 'unattributed-wait', deadline: 300_000, now: 60_000 },

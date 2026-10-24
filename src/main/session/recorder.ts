@@ -30,9 +30,9 @@ import type {
   ToolOutcome,
   TurnOutcome
 } from '../../shared/session.js';
-import { estimateTokens, originTitle } from '../../shared/session.js';
+import { estimateTokens, isUnattributedSession, originTitle, UNATTRIBUTED_SESSION_TITLE } from '../../shared/session.js';
 import { chatErrorMessageKey } from '../../shared/chat-error.js';
-import { overlappingRequestTurns, recordedRequestTurn, responseTurnId } from '../../shared/chronology.js';
+import { continuedRequestTurn, overlappingRequestTurns, recordedRequestTurn, responseTurnId, turnOpenAt } from '../../shared/chronology.js';
 import { getConfig } from '../config.js';
 import { logInfo, logWarn } from '../logger.js';
 import { redactCredentialText } from '../redaction.js';
@@ -66,7 +66,8 @@ import {
   upsertMessageEvent,
   upsertNativeImageEvent,
   writeAsset,
-  writeOverflowText
+  writeOverflowText,
+  writeTurnTrace
 } from './store.js';
 import {
   awaitRequestCorrelation,
@@ -75,8 +76,11 @@ import {
   requestCorrelation,
   resetCorrelationRegistryForTests,
 } from './correlation.js';
-import { RESUME_CLAIM_WINDOW_MS, resumeOpeningChat } from './resume-gate.js';
+import { RESUME_CLAIM_WINDOW_MS, dispatchedResumeFromSession, dispatchedResumeMarkerIn, resumeOpeningChat } from './resume-gate.js';
 import { summarizeToolCall } from './summarize.js';
+import { editReplacement, replacedQuestion } from './edits.js';
+import { takeAutomaticReply } from './automatic-replies.js';
+import { noteRouteRequestSighted } from '../tunnel/route-settle.js';
 
 interface LiveConversation {
   conversationId: string;
@@ -202,9 +206,11 @@ export function recordingEnabled(): boolean {
  */
 export async function sessionForConversation(
   conversationId: string | null,
-  title?: string
+  title?: string,
+  /** An observed authored user message, not a guessed route or page label. */
+  openingUserMessage?: string
 ): Promise<string | null> {
-  if (!conversationId) return initializeSessionForConversation(conversationId, title);
+  if (!conversationId) return initializeSessionForConversation(conversationId, title, openingUserMessage);
 
   const pending = sessionInitializations.get(conversationId);
   if (pending) {
@@ -219,7 +225,7 @@ export async function sessionForConversation(
     return sessionId;
   }
 
-  const initializing = initializeSessionForConversation(conversationId, title);
+  const initializing = initializeSessionForConversation(conversationId, title, openingUserMessage);
   sessionInitializations.set(conversationId, initializing);
   try {
     const sessionId = await initializing;
@@ -276,9 +282,18 @@ async function settleResumeCommit(): Promise<void> {
   }
 }
 
+/** Retry the same observation after the unresolved handoff transfers its session. */
+export class ResumeDestinationPendingError extends Error {
+  constructor() {
+    super('a dispatched replacement chat is still waiting for its original local session');
+    this.name = 'ResumeDestinationPendingError';
+  }
+}
+
 async function initializeSessionForConversation(
   conversationId: string | null,
-  title?: string
+  title?: string,
+  openingUserMessage?: string
 ): Promise<string | null> {
   if (!recordingEnabled()) return null;
   if (!conversationId) return ensureUnattributedSession();
@@ -306,6 +321,16 @@ async function initializeSessionForConversation(
       return moved.sessionId;
     }
     known = await findSessionByConversation(conversationId);
+    const origin = pendingOrigins.get(conversationId);
+    const exactResumeCommand = origin?.kind === 'resume' && !!origin.fromSessionId &&
+      dispatchedResumeFromSession(origin.fromSessionId);
+    if (!known && resumeOpeningChat() && (dispatchedResumeMarkerIn(openingUserMessage) || exactResumeCommand)) {
+      // Only an observed marker or the ACK of this app's exact Resume command may
+      // defer admission after the ordinary claim window. An unrelated new chat
+      // must not be held hostage by a handoff that can remain open for hours.
+      // Neither hint grants rebind authority; /events validates the full bootstrap.
+      throw new ResumeDestinationPendingError();
+    }
   }
   if (!known && (await conversationWasSuperseded(conversationId))) {
     // Compact & Resume moved this chat's session onto its replacement. Whatever the old page
@@ -599,7 +624,7 @@ async function ensureUnattributedSession(): Promise<string | null> {
   if (unattributedSessionId) return unattributedSessionId;
   if (unattributedInitialization) return unattributedInitialization;
   const initializing = (async () => {
-    const summary = await createSession({ title: 'Unattributed activity' });
+    const summary = await createSession({ title: UNATTRIBUTED_SESSION_TITLE });
     await appendEvent(summary.id, {
       time: Date.now(), source: 'app', kind: 'session_start', conversationId: null, title: summary.title
     });
@@ -841,6 +866,8 @@ function noteCallEvidence(
     } else if (result === 'stored') {
       stored = true;
       logInfo(`request attribution: ${call.requestId} -> conversation ${conversationId}`);
+      noteRouteRequestSighted(call.requestId, conversationId, observedAt,
+        typeof call.createTime === 'number' && Number.isFinite(call.createTime) ? call.createTime * 1000 : null);
       scheduleAttributionRepair(call.requestId);
     }
   }
@@ -887,7 +914,7 @@ export async function repairDeterministicAttribution(affected?: ReadonlySet<stri
   const changed = new Set<string>();
 
   for (const summary of await indexedSessions()) {
-    if (summary.conversationId !== null || summary.title !== 'Unattributed activity') continue;
+    if (!isUnattributedSession(summary)) continue;
     const cached = repairBuckets.get(summary.id);
     if (affected && cached?.toolCalls === summary.toolCalls && cached.updatedAt === summary.updatedAt &&
         ![...affected].some((id) => cached.requestIds.has(id))) continue;
@@ -1307,7 +1334,16 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
       // Preserve the second document's observation long enough for the store to
       // record their exact same-request relation. A later question/ended response
       // still cannot steal this request from its original owner.
-      if (owner !== undefined && !(owner && target.turnId &&
+      // The one exception is a request that continued past its turn's end (#1301): a call that
+      // started after that end belongs to the live turn that began then.
+      const continued = owner ? continuedRequestTurn(stored?.timelineTurns, owner.turnId, target.turnId, input.startedAt) : undefined;
+      // And a late result of a call that started before the request continued keeps the turn
+      // that was open when it started.
+      const ownerStart = owner ? stored?.timelineTurns?.[responseTurnId(stored?.timelineTurns, owner.turnId)]?.time : undefined;
+      const earlier = owner && ownerStart !== undefined && input.startedAt < ownerStart ? turnOpenAt(stored?.timelineTurns, input.startedAt) : undefined;
+      if (earlier && owner && continuedRequestTurn(stored?.timelineTurns, earlier, owner.turnId, Number.MAX_SAFE_INTEGER) === responseTurnId(stored?.timelineTurns, owner.turnId)) {
+        target = { ...target, turnId: earlier };
+      } else if (!continued && owner !== undefined && !(owner && target.turnId &&
           overlappingRequestTurns(stored?.timelineTurns, owner.turnId, target.turnId, stored?.requestTurns, input.requestId))) {
         target = { ...target, turnId: owner?.turnId ?? null };
       }
@@ -1363,7 +1399,8 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
           ? 'recording storage limit reached'
           : message === 'Session image exceeds the recording limit' ? 'recording image size limit' : 'recording write failed';
         imageRecordingReasons.add(reason);
-        logWarn(`session image not stored: ${reason}`);
+        // The store reports being full once, as a state (#1406); other reasons keep their line.
+        if (message !== 'Global session asset quota exceeded') logWarn(`session image not stored: ${reason}`);
       }
     }
 
@@ -1481,7 +1518,8 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
         // The one thing an unattributed call still carries: the server turn it belongs to.
         input.requestId ?? null,
         reopenedTurnId,
-        filed
+        filed,
+        input.tool
       );
     } catch (err) {
       logWarn(`call attribution listener failed: ${(err as Error).message}`);
@@ -1629,7 +1667,8 @@ let attributionListener:
       completedFinalAt: number | null,
       requestId: string | null,
       reopenedTurnId: string | null,
-      filedSession: SessionSummary | null
+      filedSession: SessionSummary | null,
+      tool: string
     ) => void)
   | null = null;
 
@@ -1645,7 +1684,8 @@ export function setCallAttributionListener(
         requestId: string | null,
         /** The turn this call reopened, when it proved the page's completed end false. */
         reopenedTurnId: string | null,
-        filedSession: SessionSummary | null
+        filedSession: SessionSummary | null,
+        tool: string
       ) => void)
     | null
 ): void {
@@ -1724,11 +1764,15 @@ export interface ChatObservation {
     | 'assistant_message'
     | 'native_image'
     | 'page_tool'
+    | 'turn_trace'
     | 'turn_start'
     | 'turn_end'
     | 'chat_error'
-    | 'tool_evidence';
+    | 'tool_evidence'
+    | 'app_sightings';
   time: number;
+  /** app_sightings only: connector result rows as the page saw them (connector-identity.ts). */
+  apps?: import('../connector-identity.js').AppSighting[];
   /** Current native selection evidence, not a historical message or requested worker model. */
   model?: string;
   reasoningEffort?: import('../../shared/session.js').ReasoningEffort;
@@ -1744,6 +1788,10 @@ export interface ChatObservation {
   /** Exact native user-message attachment metadata; no remote URL or image bytes. */
   attachments?: import('../../shared/input.js').InputAttachment[];
   reaction?: string | null;
+  /** user_message: its parent in ChatGPT's message tree ("root" for the first question). */
+  parentId?: string;
+  /** user_message: ChatGPT's own proof that questions sharing `parentId` are versions of one message. */
+  parentExact?: boolean;
   /** ChatGPT's already-rendered authored markup for this same logical message. */
   renderedHtml?: string;
   messageId?: string;
@@ -1766,6 +1814,10 @@ export interface ChatObservation {
   previewError?: 'not_loaded' | 'ambiguous' | 'tainted' | 'oversized' | 'invalid' | 'quota';
   previewDataUrl?: string;
   turnId?: string;
+  /** A `turn_trace` observation's round outline (shared/turn-trace.ts). */
+  trace?: import('../../shared/turn-trace.js').TurnTrace;
+  /** On `turn_trace`: the user message that opened the page turn it was read from (#1301). */
+  question?: string;
   final?: boolean;
   state?: 'streaming' | 'final';
   /** Internal React conversation id used only to cross-check the URL conversation id. */
@@ -1773,6 +1825,8 @@ export interface ChatObservation {
   outcome?: TurnOutcome;
   /** Thinking failed closes input; stream_gone only files a recoverable transport episode. */
   reason?: 'thinking_failed' | 'stream_gone';
+  /** On `turn_end`: a message sent into the running answer ended this turn and the response went on (#1301). */
+  continued?: true;
   detail?: string;
   /** Browser terminal proof; app-owned Goal policy is applied only after this is durable. */
   goalEligible?: boolean;
@@ -1780,6 +1834,8 @@ export interface ChatObservation {
   recoverable?: boolean;
   /** chat_error only: the DOM classifier identified a provider access limit, in any language. */
   blocking?: boolean;
+  /** chat_error only: provider Retry-After deadline for loading this exact conversation history. */
+  retryAt?: number;
   /** tool_evidence only: the connector requests this turn's message model holds. */
   calls?: PageCallEvidence[];
 }
@@ -1967,7 +2023,8 @@ export async function recordRequestEvidence(
 ): Promise<string | null> {
   if (!recordingEnabled()) return null;
   const lineage = !conversations.has(conversationId) ? await supersededLineage(conversationId) : null;
-  const sessionId = lineage ?? await sessionForConversation(conversationId, observationTitle(observations));
+  const firstUser = observations.find((item) => item.kind === 'user_message' && item.messageId && item.text);
+  const sessionId = lineage ?? await sessionForConversation(conversationId, observationTitle(observations), firstUser?.text);
   if (!sessionId) return null;
   // Proof identifies even a retired caller; kernel/recorder attachment checks then refuse it
   // as superseded. Never turn an exact historical owner into anonymous executable authority.
@@ -2136,7 +2193,8 @@ async function recordChatObservationsNow(
   }
   const sessionId = await sessionForConversation(
     conversationId,
-    pageTitle?.text?.trim() || observedUserTitle(firstUser?.text)
+    pageTitle?.text?.trim() || observedUserTitle(firstUser?.text),
+    firstUser?.messageId ? firstUser.text : undefined
   );
   if (!sessionId) return { sessionId: null, stored: 0, activity, goalCandidates: [] };
   const live = conversations.get(conversationId);
@@ -2178,6 +2236,10 @@ async function recordChatObservationsNow(
           ...(item.attachments?.length ? { attachments: item.attachments } : {}),
           ...(item.reaction !== undefined ? { reaction: item.reaction } : {}),
           ...(item.model ? { model: item.model } : {}),
+          ...(item.parentId ? { parentId: item.parentId } : {}),
+          ...(editReplacement(item.messageId) ? { replaces: editReplacement(item.messageId) }
+            : item.parentId && item.parentExact === true ? await replacedQuestion(sessionId, item.messageId, item.parentId) : {}),
+          ...(takeAutomaticReply(conversationId, item.text ?? '') ? { automatic: true as const } : {}),
           messageId: item.messageId
         }, { preferTime: item.authoredTime === true, work: item.authoredNow === true });
         if (!written.changed) continue;
@@ -2306,6 +2368,11 @@ async function recordChatObservationsNow(
         stored += await recordNativeImage(sessionId, item, base);
         continue;
       }
+      case 'turn_trace': {
+        // Presentation beside the log: no event, no activity, no work or completion evidence.
+        if (item.turnId && item.trace && await writeTurnTrace(sessionId, item.turnId, item.trace, item.question)) notifyChanged(sessionId);
+        continue;
+      }
       case 'page_tool': {
         const newlyObserved = !!live && !!item.messageId && !live.pageTools.has(pageToolKey(item.messageId));
         const written = await recordPageTool(sessionId, live, item, base);
@@ -2335,6 +2402,17 @@ async function recordChatObservationsNow(
         const text = chatErrorMessageKey(item.text ?? '', item.recoverable === true);
         const question = item.recoverable === true ? await readLatestUserMessage(sessionId) : undefined;
         const recent = await readRecentEvents(sessionId, 32, { kinds: ['chat_error'], maxBytes: 256 * 1024 });
+        // A history limit that keeps answering the same way is one notice, not one per retry: on
+        // 2026-10-11 a throttled history wrote eight identical blocking notices in eight minutes. The
+        // same limit is said again only after another blocking error came in between, or after half an
+        // hour. A passing transport failure (a stream 404) does not change the limit, and repeating it
+        // after each one still stacked the same notice (2026-10-12). Only the history limit (it carries
+        // its Retry-After): the provider access dialog keeps being recorded again after 30 s, as before.
+        const newest = recent.reduce<SessionEvent | undefined>((latest, event) =>
+          event.kind === 'chat_error' && event.blocking === true && (!latest || event.seq > latest.seq) ? event : latest, undefined);
+        if (item.blocking === true && Number.isFinite(item.retryAt) && newest?.kind === 'chat_error' && newest.blocking === true &&
+            item.time - newest.time <= 30 * 60_000 &&
+            chatErrorMessageKey(newest.message.text, newest.recoverable === true) === text) continue;
         if (recent.some(event => event.kind === 'chat_error' &&
             ((question && event.recoverable === true && event.seq > (question.origin ?? question.seq)) ||
             ((Math.abs(item.time - event.time) <= 30_000 ||
@@ -2350,6 +2428,9 @@ async function recordChatObservationsNow(
           ...(item.reason === 'thinking_failed' || item.reason === 'stream_gone' ? { reason: item.reason } : {}),
           ...(typeof item.recoverable === 'boolean' ? { recoverable: item.recoverable } : {}),
           ...(typeof item.blocking === 'boolean' ? { blocking: item.blocking } : {}),
+          // The same bounds the bridge applies before it honors a Retry-After.
+          ...(item.blocking === true && Number.isFinite(item.retryAt) && item.retryAt! > item.time &&
+            item.retryAt! - item.time <= 24 * 60 * 60_000 ? { retryAt: item.retryAt } : {}),
           message: await storeText(sessionId, item.text ?? '', 2000)
         });
         activity.meaningful = true;
@@ -2414,7 +2495,8 @@ async function recordChatObservationsNow(
           outcome: item.outcome ?? 'unknown',
           ...(item.outcome === 'completed' && item.providerMessageId ? { providerMessageId: item.providerMessageId } : {}),
           ...(item.outcome === 'failed' && item.reason === 'thinking_failed' ? { reason: item.reason } : {}),
-          ...(item.detail ? { detail: item.detail } : {})
+          ...(item.detail ? { detail: item.detail } : {}),
+          ...(item.continued === true ? { continued: true as const } : {})
         });
         // As above, durable journal state owns idempotency; in-memory state follows it.
         if (live) {
@@ -2514,7 +2596,8 @@ export async function recordProgress(
   text: string,
   anchor?: { seq: number; time: number },
   turnId?: string | null,
-  finishControl?: { state: 'released' | 'notified' | 'decision'; conversationId: string; revision?: string; inputRevision?: string; workSeq?: number }
+  finishControl?: { state: 'released' | 'notified' | 'decision'; conversationId: string; revision?: string; inputRevision?: string; workSeq?: number },
+  reason?: 'helper_stop_unverified'
 ): Promise<{ seq: number; time: number } | null> {
   if (!recordingEnabled() || !progressId) return null;
   const time = anchor?.time ?? Date.now();
@@ -2528,6 +2611,7 @@ export async function recordProgress(
     kind: 'progress',
     progressId,
     ...(finishControl ? { finishControl } : {}),
+    ...(reason ? { reason } : {}),
     ...(anchor ? { origin: anchor.seq } : {}),
     ...(turnId ? { turnId } : {}),
     message: await storeText(sessionId, text, 4000)
@@ -2590,7 +2674,8 @@ export async function recordHandoff(
   sessionId: string,
   handoffId: string,
   chars: number,
-  reason: string
+  reason: string,
+  continuation?: string
 ): Promise<void> {
   await appendEvent(sessionId, {
     time: Date.now(),
@@ -2598,7 +2683,8 @@ export async function recordHandoff(
     kind: 'handoff',
     handoffId,
     chars,
-    reason
+    reason,
+    ...(continuation ? { continuation } : {})
   });
   notifyChanged(sessionId);
 }
@@ -2616,11 +2702,12 @@ export async function ensureHandoffRecorded(
   sessionId: string,
   handoffId: string,
   chars: number,
-  reason: string
+  reason: string,
+  continuation?: string
 ): Promise<boolean> {
   const existing = await readEvents(sessionId, { kinds: ['handoff'] });
   if (existing.some((event) => event.kind === 'handoff' && event.handoffId === handoffId)) return false;
-  await recordHandoff(sessionId, handoffId, chars, reason);
+  await recordHandoff(sessionId, handoffId, chars, reason, continuation);
   return true;
 }
 

@@ -7,7 +7,7 @@ export { MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION, UNATTENDED_EXEC_NOTICE_MS } f
 export const processCustody = createProcessCustody(unifiedExecManager, requestCorrelation);
 onRequestCorrelation(processCustody.reconcileExecRequestOwner);
 export const {
-  onBackgroundExecChange, runningExecProcesses, stopExecProcess,
+  onBackgroundExecChange, runningExecProcesses, runningIdenticalExec, stopExecProcess,
   executionPrincipal,
   provenConversation,
   provenSession,

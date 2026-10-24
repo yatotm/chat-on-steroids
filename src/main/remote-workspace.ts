@@ -1,3 +1,4 @@
+import { isSftpRemote } from '../shared/projects.js';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { isManagedRemote, type LocalProject } from '../shared/projects.js';
@@ -202,11 +203,12 @@ export async function remoteProjectInstructions(project: LocalProject): Promise<
 
 /** 健康检查验证真实远端目录；保存的项目记录本身不是可用性证明。 */
 export async function checkRemoteProjectAccess(): Promise<{ configured: number; verified: number; detail: string }> {
-  const projects = (await listProjects()).filter(project => !!project.remote);
+  const projects = (await listProjects()).filter(project => !!project.remote && !isSftpRemote(project.remote));
   const unavailable = new Set<string>();
   let detail = '';
   for (const project of projects) {
     const binding = project.remote!;
+    if (isSftpRemote(binding)) continue;
     const identity = isManagedRemote(binding) ? binding.hostId : isCoreRemote(binding) ? binding.url : binding.pluginId;
     if (unavailable.has(identity)) continue;
     try { await prepare(project); return { configured: projects.length, verified: 1, detail: '' }; }

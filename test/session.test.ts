@@ -33,6 +33,7 @@ import {
   appendEvent,
   autoCompactionReady,
   observeSessionModel,
+  recordWorkerAssignment,
   createSession,
   deleteSession,
   endSession,
@@ -109,6 +110,38 @@ const evidence = (patch: Partial<ReturnType<typeof emptyEvidence>> = {}) => ({ .
 // ------------------------------------------------------------------- store
 
 describe('session store', () => {
+  it('reports the same unreadable recent event only once until the journal recovers or worsens (#1269)', async () => {
+    const session = await createSession({ title: 'damaged recent journal', conversationId: 'recent-warning-test' });
+    await appendEvent(session.id, { time: 100, source: 'extension', kind: 'turn_start', turnId: 'known-good' });
+    await flushSessions();
+    const file = path.join(sessionsRoot(), session.id, 'events.jsonl');
+    const good = await fs.readFile(file, 'utf8');
+    const warnings = () => getLog().filter(entry => entry.message.includes(`session ${session.id}: skipped`) &&
+      entry.message.includes('unreadable recent event line(s)'));
+
+    await fs.appendFile(file, '{unreadable one}\n');
+    expect(await readRecentEvents(session.id, 10)).toHaveLength(1);
+    expect(await readRecentEvents(session.id, 10)).toHaveLength(1);
+    expect(warnings()).toHaveLength(1);
+
+    // A second damaged line is new information, not a reason to suppress all warnings.
+    await fs.appendFile(file, '{unreadable two}\n');
+    expect(await readRecentEvents(session.id, 10)).toHaveLength(1);
+    expect(warnings()).toHaveLength(2);
+
+    // Once the journal is readable, a later new corruption must be reported again.
+    await fs.writeFile(file, good);
+    expect(await readRecentEvents(session.id, 10)).toHaveLength(1);
+    await fs.appendFile(file, '{unreadable again}\n');
+    expect(await readRecentEvents(session.id, 10)).toHaveLength(1);
+    expect(warnings()).toHaveLength(3);
+    // Ordinary new activity must not turn one old malformed line into new warnings.
+    await fs.appendFile(file, `${JSON.stringify({ seq: 2, time: 101, source: 'extension',
+      kind: 'turn_end', turnId: 'known-good', outcome: 'completed' })}\n`);
+    expect(await readRecentEvents(session.id, 10)).toHaveLength(2);
+    expect(warnings()).toHaveLength(3);
+  });
+
   it('keeps an exact tool edit review after later edits, but never invents one for failed or oversized calls', async () => {
     const conversationId = 'conv-exact-edit-review';
     const sessionId = await sessionForConversation(conversationId);
@@ -1421,6 +1454,32 @@ describe('session store', () => {
     });
 
     expect((await getSession(summary.id))?.lastAssistantFinalAt).toBe(200);
+  });
+
+  it('keeps the final boundary when a reloaded page reports the same finished answer again', async () => {
+    const summary = await createSession({ title: 'final reread' });
+    const messageId = 'assistant-final-reread';
+    const final = (time: number, text: string, extra: { goalEligible?: boolean; providerMessageId?: string } = {}) =>
+      upsertMessageEvent(summary.id, {
+        time,
+        source: 'extension',
+        kind: 'assistant_message',
+        messageId,
+        message: { text, truncated: false, chars: text.length },
+        state: 'final',
+        final: true,
+        ...extra
+      });
+    await final(200, 'Finished.');
+
+    // ChatGPT redraws the same answer after a reload or a branch and the page learns more about
+    // it: a revision of the stored answer, not a new one.
+    expect((await final(900, 'Finished.', { goalEligible: true, providerMessageId: messageId })).changed).toBe(true);
+    expect((await getSession(summary.id))?.lastAssistantFinalAt).toBe(200);
+
+    // A final whose text changed is a new answer.
+    await final(1000, 'Finished, revised.');
+    expect((await getSession(summary.id))?.lastAssistantFinalAt).toBe(1000);
   });
 
   it('projects a successful worker finish report as the session finish boundary', async () => {
@@ -4182,4 +4241,18 @@ it('ships the long-standing handoff brief rules as the editable default, unchang
     'FAILED / UNRESOLVED —', 'FILES —', 'VERIFICATION —', 'ENVIRONMENT —', 'NEXT —', 'DO NOT —']) {
     expect(DEFAULT_HANDOFF_PROMPT, heading).toContain(heading);
   }
+});
+
+it('persists worker presentation independently of broker retention and rejects stale or foreign projections', async () => {
+  const session = await createSession({ conversationId: 'archive-worker', title: 'Original',
+    origin: { kind: 'worker', fromSessionId: null, agentId: 'worker-1', task: 'Original task' } });
+  const assignment = { conversationId: 'archive-worker', agentId: 'worker-1', label: 'Review', task: 'New task', recordedAt: 20 };
+  await recordWorkerAssignment(assignment);
+  await recordWorkerAssignment({ ...assignment, label: 'Stale', recordedAt: 10 });
+  await recordWorkerAssignment({ ...assignment, agentId: 'worker-2', label: 'Foreign', recordedAt: 30 });
+  await flushSessions(); resetSessionStoreForTests();
+  const restored = await getSession(session.id);
+  expect(restored?.workerAssignment).toEqual(assignment);
+  expect(restored?.origin?.task).toBe('Original task');
+  expect(restored?.title).toBe('Original');
 });

@@ -95,6 +95,17 @@ it('names the pending error action without presenting it as a second silence cou
   expect(host.textContent).toContain('Reload in 0:30');
 });
 
+it('shows the history throttle as a wait without claiming a header was provided or promising a reload', () => {
+  renderRecoveryCountdowns(host, [{ kind: 'provider-limit', deadline: 31_000 }], 0);
+  expect(host.textContent).toContain('ChatGPT history temporarily rate-limited');
+  expect(host.textContent).toContain('Retry check in 0:31');
+  expect(host.textContent).not.toContain('Reload');
+  expect(host.querySelector('.recovery-notice')?.getAttribute('title')).toContain('history rate-limit wait');
+  expect(host.querySelector('.recovery-notice')?.getAttribute('title')).not.toContain('Retry-After');
+  renderRecoveryCountdowns(host, [{ kind: 'provider-limit', deadline: 31_000 }], 31_000);
+  expect(host.textContent).toContain('Retry window ended');
+});
+
 it('reveals Pro silence at five minutes using the UI clock and hides again when activity renews it', () => {
   const countdown = { kind: 'silence' as const, deadline: 600_000, visibleAt: 300_000 };
   expect(renderRecoveryCountdowns(host, [countdown], 299_999)).toBe(true);
@@ -136,6 +147,15 @@ it('shows the existing ticket pickup deadline after the native busy wait', () =>
   expect(host.textContent).not.toContain('sent');
 });
 
+it('shows a stopped pickup persistently with its attempt count and recovery reason', () => {
+  renderRecoveryCountdowns(host, [{ kind: 'pickup-stopped', deadline: 120_000, attempts: 3, next: 'queue' }], 0);
+  expect(host.hidden).toBe(false);
+  expect(host.textContent).toContain('Recovery stopped · next: Queued message');
+  expect(host.textContent).toContain('Stopped after 3 attempts');
+  expect(host.querySelector('.recovery-notice')?.getAttribute('title')).toContain('original queued input or Goal obligation remains saved');
+  expect(host.querySelector('[role="timer"]')?.getAttribute('aria-live')).toBe('off');
+});
+
 it('offers an action only where the caller supplies one, and explains what the interrupted-response reload does (#1032)', () => {
   const action = (countdown: { kind: string }) => {
     if (countdown.kind !== 'assistant-error') return null;
@@ -148,4 +168,22 @@ it('offers an action only where the caller supplies one, and explains what the i
   expect(row.getAttribute('title')).not.toContain('New activity cancels');
   renderRecoveryCountdowns(host, [{ kind: 'silence', deadline: 120_000 }], 0, action);
   expect(host.querySelector('.cancel-reload')).toBeNull();
+});
+
+it('says where an automatic Compact & Resume stands before its request goes out, without a clock (2026-10-12)', () => {
+  // The chat looked idle while the handoff waited; then "waiting for this turn to end" stayed up
+  // over a turn that had already died, with a "Check in" clock that meant nothing to the user.
+  renderRecoveryCountdowns(host, [{ kind: 'compaction', phase: 'waiting', deadline: 120_000 }], 0);
+  expect(host.hidden).toBe(false);
+  expect(host.textContent).toContain('Compact & Resume · waiting for this turn to end');
+  expect(host.textContent).not.toContain('Check in');
+  expect(host.querySelector('.recovery-notice')!.getAttribute('title')).toContain('sent as soon as this turn ends');
+  renderRecoveryCountdowns(host, [{ kind: 'compaction', phase: 'asking', deadline: 120_000 }], 0);
+  expect(host.textContent).toContain('Compact & Resume · asking ChatGPT for the handoff');
+  expect(host.textContent).not.toContain('Check in');
+  // #1643: the ChatGPT tab tried and could not ask; "asking" stayed up for twenty minutes.
+  renderRecoveryCountdowns(host, [{ kind: 'compaction', phase: 'held', deadline: 120_000 }], 0);
+  expect(host.textContent).toContain('Compact & Resume · the ChatGPT tab could not ask yet');
+  expect(host.textContent).not.toContain('Check in');
+  expect(host.querySelector('.recovery-notice')!.getAttribute('title')).toContain('tries again on its own');
 });

@@ -184,6 +184,8 @@ export class CosBrowser {
     preloadDir: string; rendererUrl: () => string | null; rendererDir: string;
     /** The user closed or minimized a shown window: it hides to the tray and goes on running. */
     onUserHide?: () => void;
+    /** Where a window the user minimizes goes: the taskbar or Dock (default), or the tray. */
+    minimizeTo?: () => 'taskbar' | 'tray';
   }) {
     cosSignInTransfer.onChange(change => this.signInEnded(change));
   }
@@ -446,13 +448,16 @@ export class CosBrowser {
     base.on('blur', () => {
       if (![...this.frames.values()].some(other => other.base.isFocused())) this.model.focusWindow(WINDOW_ID_NONE);
     });
-    // The window belongs to the tray: closing or minimizing it hides it, and its chats go on.
+    // The window belongs to the tray: closing it hides it, and its chats go on.
     base.on('close', event => {
       if (this.stopping || this.quitting) return;
       event.preventDefault();
       this.userHide(id);
     });
-    base.on('minimize', () => this.userHide(id));
+    // Minimizing is the ordinary kind by default: the window stays in the taskbar or Dock to be
+    // restored from there (#1464). People who prefer the tray choose that in Settings.
+    base.on('minimize', () => this.userMinimize(id));
+    base.on('restore', () => this.userRestore(id));
     this.layout(id);
     return frame;
   }
@@ -486,6 +491,22 @@ export class CosBrowser {
       if (active !== null) this.views.get(active)?.webContents.focus();
     }
     frame.shown = true;
+    this.model.setWindowState(id, frame.base.isMaximized() ? 'maximized' : 'normal');
+    this.layout(id);
+    this.notify();
+  }
+
+  /** The user minimized the window: the extension sees it minimized; it stays shown in the taskbar unless the tray is chosen. */
+  private userMinimize(id: number): void {
+    if (!this.frames.has(id)) return;
+    if (this.assets.minimizeTo?.() === 'tray') return this.userHide(id);
+    this.model.setWindowState(id, 'minimized');
+    this.notify();
+  }
+
+  private userRestore(id: number): void {
+    const frame = this.frames.get(id);
+    if (!frame) return;
     this.model.setWindowState(id, frame.base.isMaximized() ? 'maximized' : 'normal');
     this.layout(id);
     this.notify();
@@ -705,13 +726,14 @@ export class CosBrowser {
 
   private paintSignIn(): void {
     const panel = this.signIn;
-    if (!panel || panel.view.webContents.isDestroyed()) return;
+    const contents = panel?.view.webContents;
+    if (!panel || !contents || contents.isDestroyed()) return;
     const state: CosBrowserSignInState = {
       phase: panel.phase, browser: panel.browser, launching: panel.launching, notice: panel.notice, appIcon: this.appMark(),
       browsers: panel.browsers.map(({ id, label, icon }) => ({ id, label, icon })),
       language: getConfig().ui.language ?? 'en', tokens: themeTokens('background')
     };
-    panel.view.webContents.send('cos-browser-sign-in:state', state);
+    contents.send('cos-browser-sign-in:state', state);
   }
 
   private appMarkData: string | null | undefined;
@@ -821,14 +843,15 @@ export class CosBrowser {
     this.signIn = null;
     if (panel.expiry) clearTimeout(panel.expiry);
     if (panel.offerId) cosSignInTransfer.cancel(panel.offerId);
+    const viewContents = panel.view.webContents;
     const remove = () => {
       const frame = this.frames.get(panel.windowId);
       if (frame && !frame.base.isDestroyed()) frame.base.contentView.removeChildView(panel.view);
-      if (!panel.view.webContents.isDestroyed()) panel.view.webContents.close();
+      if (viewContents && !viewContents.isDestroyed()) viewContents.close();
       if (!panel.contents.isDestroyed() && this.model.tab(panel.contents.id)?.active) panel.contents.focus();
     };
-    if (!animate || panel.view.webContents.isDestroyed()) { remove(); return; }
-    panel.view.webContents.send('cos-browser-sign-in:leave');
+    if (!animate || !viewContents || viewContents.isDestroyed()) { remove(); return; }
+    viewContents.send('cos-browser-sign-in:leave');
     setTimeout(remove, SIGN_IN_EXIT_MS).unref?.();
   }
 

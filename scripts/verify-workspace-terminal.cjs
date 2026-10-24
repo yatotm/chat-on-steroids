@@ -1,4 +1,5 @@
 // Isolated Electron + actual project/projectless PTYs + current renderer. No provider or production state.
+const { withoutScripts } = require('./ui-check-page.cjs');
 const { app, BrowserWindow } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -27,13 +28,20 @@ const sh = WINDOWS ? {
 };
 const output = path.join(root, 'outputs/terminal-acceptance');
 fs.mkdirSync(output, { recursive: true });
+// 每次验收使用干净的夹具状态，避免上次停在打开的终端布局影响下一次点击。
+for (const name of ['runtime', 'state']) fs.rmSync(path.join(output, name), { recursive: true, force: true });
 app.setPath('userData', path.join(output, 'runtime'));
+// Without a listener, destroying the only window quits Electron at once, before the cleanup below
+// can wait for the shell the check closed last. Its ConPTY exit then lands while Node tears down,
+// which aborts the process with 0xC0000409 on Windows (3 in 30 runs on a test VM, 2026-10-10).
+app.on('window-all-closed', () => {});
 app.whenReady().then(async () => {
   const { createServer } = await import('vite');
   const { buildSync } = require('esbuild');
   const helper = path.join(output, 'main.cjs');
   buildSync({ stdin: { contents: [
     "export {registerWorkspaceTerminalIpc} from './src/main/workspace-terminal-ipc.ts';",
+    "export {workspaceTerminalsExited} from './src/main/workspace-terminal.ts';",
     "export {initConfigPath, defaultConfig, saveConfig} from './src/main/config.ts';",
     "export {initDurableStore, flushDurable} from './src/main/durable.ts';",
     "export {addProject} from './src/main/projects.ts';"
@@ -54,7 +62,8 @@ app.whenReady().then(async () => {
       onTerminalEvent:listener=>{const fn=(_,value)=>listener(value);ipcRenderer.on('workspaceTerminal:event',fn);return()=>ipcRenderer.removeListener('workspaceTerminal:event',fn)},
       writeClipboard:()=>Promise.resolve({ok:true,data:true})
     });`);
-  let win = new BrowserWindow({ show: false, width: 1100, height: 800, webPreferences: { preload, sandbox: true, contextIsolation: true, backgroundThrottling: false } });
+  // 隐藏窗口可能暂停抽屉动画；几何与真实键盘验收需要像应用一样显示窗口。
+  let win = new BrowserWindow({ show: true, width: 1100, height: 800, webPreferences: { preload, sandbox: true, contextIsolation: true, backgroundThrottling: false } });
   backend.registerWorkspaceTerminalIpc(() => win);
   const fixture = `
     window.errors=[];window.addEventListener('error',e=>window.errors.push(e.message));window.addEventListener('unhandledrejection',e=>window.errors.push(String(e.reason)));
@@ -82,7 +91,7 @@ app.whenReady().then(async () => {
     window.ready=true;`;
   const server = await createServer({ configFile: false, root: path.join(root, 'src/renderer'), server: { host: '127.0.0.1', port: 0 }, plugins: [{ name: 'terminal-fixture', configureServer(vite) {
     vite.middlewares.use('/fixture.html', async (_, response) => {
-      const source = fs.readFileSync(path.join(root, 'src/renderer/index.html'), 'utf8').replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '').replace('</body>', '<script type="module">' + fixture + '</script></body>');
+      const source = withoutScripts(fs.readFileSync(path.join(root, 'src/renderer/index.html'), 'utf8')).replace('</body>', '<script type="module">' + fixture + '</script></body>');
       response.setHeader('Content-Type', 'text/html'); response.end(await vite.transformIndexHtml('/fixture.html', source));
     });
   } }] });
@@ -175,17 +184,26 @@ app.whenReady().then(async () => {
     }
     await js(`window.api.terminalWrite(${JSON.stringify(second)}, ${JSON.stringify(sh.second + '\r')})`);
     await until(`outputs[${JSON.stringify(second)}]?.includes('SECOND_project')`);
-    // PowerShell prints a fresh "PS C:" prompt after Ctrl+C; elsewhere the marker below arriving
-    // long before the 30 s sleep ends is the proof that the interrupt landed.
-    const promptsBeforeInterrupt = WINDOWS ? await js(`(outputs[${JSON.stringify(second)}].match(/PS C:/g) || []).length`) : 0;
-    await js(`window.api.terminalWrite(${JSON.stringify(second)}, "\\u0003")`);
-    if (WINDOWS) await until(`(outputs[${JSON.stringify(second)}].match(/PS C:/g) || []).length > ${promptsBeforeInterrupt}`);
-    await js(`window.api.terminalWrite(${JSON.stringify(second)}, ${JSON.stringify(sh.interrupt + '\r')})`);
-    await until(`outputs[${JSON.stringify(second)}]?.includes('INTERRUPT_OK')`);
+    // Ctrl+C must stop the 30 s sleep: the marker command typed after it has to run long before the
+    // sleep would have ended. PowerShell discards anything typed while it is still handling Ctrl+C,
+    // and ConPTY's output can't say when that is over (it answers Ctrl+C with a repaint of the old
+    // prompts, and draws the new one with or without a trailing space). So press Ctrl+C, give the
+    // shell a moment, type the marker, and try again until it runs. 12 s stays inside the sleep, so an
+    // interrupt that never lands still fails here.
+    const interruptDeadline = Date.now() + 12_000;
+    const interrupted = () => js(`outputs[${JSON.stringify(second)}]?.includes('INTERRUPT_OK')`);
+    while (!(await interrupted())) {
+      assert.ok(Date.now() < interruptDeadline, 'Ctrl+C did not interrupt the sleep: ' + JSON.stringify(await js(`outputs[${JSON.stringify(second)}]`)));
+      await js(`window.api.terminalWrite(${JSON.stringify(second)}, "\\u0003")`);
+      await new Promise(resolve => setTimeout(resolve, 250));
+      await js(`window.api.terminalWrite(${JSON.stringify(second)}, ${JSON.stringify(sh.interrupt + '\r')})`);
+      const attemptEnd = Date.now() + 1_500;
+      while (Date.now() < attemptEnd && !(await interrupted())) await new Promise(resolve => setTimeout(resolve, 40));
+    }
     win.setSize(830, 700); await new Promise(resolve => setTimeout(resolve, 300));
-    const geometry = await js(`(()=>{const p=document.getElementById('workspaceTerminal').getBoundingClientRect();return {width:p.width,height:p.height,fits:p.right<=innerWidth+1&&p.bottom<=innerHeight+1}})()`);
-    assert.ok(geometry.fits, JSON.stringify(geometry));
+    const geometry = await js(`(()=>{const p=document.getElementById('workspaceTerminal').getBoundingClientRect();return {width:p.width,height:p.height,right:p.right,bottom:p.bottom,viewportWidth:innerWidth,viewportHeight:innerHeight,fits:p.right<=innerWidth+1&&p.bottom<=innerHeight+1}})()`);
     fs.writeFileSync(path.join(output, 'terminal.png'), (await win.webContents.capturePage(undefined, { stayHidden: true, stayAwake: true })).toPNG());
+    assert.ok(geometry.fits, JSON.stringify(geometry));
     await js(`window.api.terminalWrite(${JSON.stringify(second)}, "exit 7\\r")`); await until(`exits[${JSON.stringify(second)}]===7`);
     await js("document.querySelector('#workDockRight .work-dock-tab[data-terminal-id] .btn-icon').click()");
     assert.equal((await js(`window.api.terminalWrite(${JSON.stringify(second)}, 'echo closed\\r')`)).ok, false);
@@ -196,6 +214,8 @@ app.whenReady().then(async () => {
     assert.deepEqual(await js('errors'), []);
     const result = { actualPty: true, projectCwd: true, projectlessHomeCwd: true, singleRightTabRow: true, rightTabClosesPty: true, rightPanelHidePreservesPty: true, persistentEnvironmentAndCd: true, keyboardInput: true, hiddenPanelContinuity: true, bottomPanelClose: true, bottomMenuVisible: true, rightMenuClickable: true, rightAndBottomIndependent: true, lastBottomTabClosesPanel: true, multipleTabs: true, ctrlC: true, exitCode: 7, closeRetiresShell: true, geometry };
     fs.writeFileSync(path.join(output, 'results.json'), JSON.stringify(result, null, 2)); console.log(JSON.stringify(result));
-  } finally { win.destroy(); win = null; await server.close(); await backend.flushDurable(); }
-  app.exit(0);
+  } finally { win.destroy(); win = null; await server.close(); await backend.flushDurable(); await backend.workspaceTerminalsExited(); }
+  // Let Electron run before-quit so the IPC owner disposes any remaining PTYs before the
+  // native ConPTY backend unloads. app.exit() skips those handlers and can crash Windows CI.
+  app.quit();
 }).catch(error => { console.error(error); app.exit(1); });

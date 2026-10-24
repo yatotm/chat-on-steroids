@@ -10,9 +10,15 @@
  */
 import { promises as fs } from 'node:fs';
 import { setImmediate as yieldToEvents } from 'node:timers/promises';
-import type { SessionSearchReply, SessionSearchResult, SessionSummary } from '../../shared/session.js';
+import type { SessionSearchLocation, SessionSearchReply, SessionSearchResult, SessionSummary } from '../../shared/session.js';
+import { positionOf } from '../../shared/chronology.js';
 import { transcriptEntries } from '../../shared/markdown-export.js';
 import { indexedSessions, readEvents, readOverflowText, sessionSearchIndexPath } from './store.js';
+import { providerEntitiesAsMarkdown } from '../../shared/content-reference.js';
+import { markdownVisibleText } from '../../shared/markdown-text.js';
+import { foldCase } from '../../shared/fold-case.js';
+
+export { foldCase };
 import { logWarn } from '../logger.js';
 
 /** Plenty for a long chat's words; a runaway transcript is cut, not stored whole. */
@@ -23,21 +29,6 @@ const SNIPPET_CHARS = 140;
 export const MAX_SEARCH_RESULTS = 50;
 const INDEX_VERSION = 1;
 
-
-/**
- * Lowercase without accents ("Prüfung", "café" and "İstanbul" match "prufung", "cafe" and
- * "istanbul") that keeps every character's length, so match offsets in it are offsets in the
- * original. A character whose folded form would change length keeps a same-length form or itself.
- */
-export function foldCase(text: string): string {
-  return text.replace(/[A-Z]+|[^\x00-\x7f]/gu, chunk => {
-    if (chunk.charCodeAt(0) < 0x80) return chunk.toLowerCase();
-    const lower = chunk.toLowerCase();
-    const base = lower.length === chunk.length ? lower : chunk;
-    const bare = base.normalize('NFD').replace(/\p{M}+/gu, '').toLowerCase();
-    return bare.length === chunk.length ? bare : base;
-  });
-}
 
 /** What makes an index current: the chat's last change and its event count. */
 const stampOf = (summary: SessionSummary): string => `${INDEX_VERSION}:${summary.updatedAt}:${summary.events ?? 0}`;
@@ -71,9 +62,9 @@ async function transcriptText(id: string): Promise<string> {
   const parts: string[] = [];
   let size = 0;
   for (const entry of transcriptEntries(events)) {
-    const text = entry.stored.truncated && entry.stored.assetId
+    const text = providerEntitiesAsMarkdown(entry.stored.truncated && entry.stored.assetId
       ? (await readOverflowText(id, entry.stored.assetId)) ?? entry.stored.text
-      : entry.stored.text;
+      : entry.stored.text);
     const clean = text.replace(/\s+/g, ' ').trim();
     if (!clean) continue;
     parts.push(clean);
@@ -174,28 +165,42 @@ export async function searchSessions(query: string, limit = MAX_SEARCH_RESULTS):
   startIndexing();
   const indexed = summaries.filter(summary => current.get(summary.id) === stampOf(summary)).length;
   if (!terms.length) return { results: [], indexed, total: summaries.length };
-  const byTitle: SessionSearchResult[] = [], byText: SessionSearchResult[] = [];
+  const results: SessionSearchResult[] = [];
+  const textCandidates: Array<{ summary: SessionSummary; title: string }> = [];
+  const resultFor = (summary: SessionSummary, title: string): SessionSearchResult => {
+    const titleMatches = matchRanges(title, terms);
+    return { id: summary.id, title: summary.title, projectId: summary.projectId ?? null, ...(titleMatches.length ? { titleMatches } : {}) };
+  };
+  // Rank the entire title catalog before touching text. An early text cutoff previously
+  // hid older title matches, while common title queries allocated every matching result.
   for (const summary of summaries) {
     const title = foldCase(summary.title);
-    const titleMatches = matchRanges(title, terms);
-    const result: SessionSearchResult = { id: summary.id, title: summary.title, projectId: summary.projectId ?? null, ...(titleMatches.length ? { titleMatches } : {}) };
-    if (terms.every(term => title.includes(term))) { byTitle.push(result); continue; }
+    if (terms.every(term => title.includes(term))) {
+      results.push(resultFor(summary, title));
+      if (results.length > limit) return { results: results.slice(0, limit), indexed, total: summaries.length, limited: true };
+    } else textCandidates.push({ summary, title });
+  }
+  for (const { summary, title } of textCandidates) {
+    const stamp = stampOf(summary);
+    // An old cache entry is not evidence of what a revised chat currently says. Until
+    // its new index commits, it belongs only to the indexing progress, not the results.
+    if (current.get(summary.id) !== stamp) continue;
     let entry = cache.get(summary.id);
-    if (!entry && current.has(summary.id)) {
+    if (!entry || entry.stamp !== stamp) {
       // Indexed earlier but pushed out of memory: read the stored index again.
-      const text = await storedIndex(summary.id, current.get(summary.id)!);
-      if (text !== null) entry = remember(summary.id, current.get(summary.id)!, text);
+      const text = await storedIndex(summary.id, stamp);
+      if (current.get(summary.id) !== stamp) continue;
+      entry = text !== null ? remember(summary.id, stamp, text) : undefined;
     }
     if (!entry) continue;
     // A word may be in the title and the rest in the text.
     if (terms.every(term => title.includes(term) || entry!.lower.includes(term))) {
       const inText = terms.filter(term => entry!.lower.includes(term));
-      byText.push({ ...result, snippet: snippetFor(entry.text, entry.lower, inText) });
+      results.push({ ...resultFor(summary, title), snippet: snippetFor(entry.text, entry.lower, inText) });
     }
-    if (byTitle.length + byText.length >= limit * 2) break;
+    if (results.length > limit) break;
   }
-  const found = byTitle.length + byText.length;
-  return { results: [...byTitle, ...byText].slice(0, limit), indexed, total: summaries.length, ...(found > limit ? { limited: true } : {}) };
+  return { results: results.slice(0, limit), indexed, total: summaries.length, ...(results.length > limit ? { limited: true } : {}) };
 }
 
 /** Waits for background indexing to finish; for tests. */
@@ -205,4 +210,75 @@ export async function searchIndexingSettled(): Promise<void> {
 
 export function resetSessionSearchForTests(): void {
   cache.clear(); cachedChars = 0; current.clear(); indexingWanted = false;
+}
+
+/** Most matches one find returns; a chat with more is searched with a longer phrase. */
+const MAX_FIND_RESULTS = 500;
+
+/**
+ * Find in chat (Codex's ⌘F): every message of one chat holding the phrase, in the order they were
+ * said. Case and runs of white space do not matter. Read from the whole recording, so a match far
+ * above the page the window holds is found too. A message matches as written or as drawn: answers
+ * are recorded as Markdown, and "File: /src" is what the person reads in "**File:** `/src`".
+ */
+export async function findInSession(id: string, query: string): Promise<SessionSearchLocation[]> {
+  const phrase = foldCase(query.replace(/\s+/g, ' ').trim());
+  if (!phrase) return [];
+  const events = await readEvents(id, { kinds: ['user_message', 'assistant_message'] });
+  const found: SessionSearchLocation[] = [];
+  for (const entry of transcriptEntries(events)) {
+    const text = entry.stored.truncated && entry.stored.assetId
+      ? (await readOverflowText(id, entry.stored.assetId)) ?? entry.stored.text
+      : entry.stored.text;
+    const matches = (written: string): boolean => foldCase(written.replace(/\s+/g, ' ')).includes(phrase);
+    // Only text with Markdown syntax in it can read differently once drawn.
+    if (!matches(text) && !(/[*_`[\]<&|\\~#]/.test(text) && matches(markdownVisibleText(providerEntitiesAsMarkdown(text))))) continue;
+    const event = events.find(candidate => candidate.seq === entry.seq);
+    if (!event || (event.kind !== 'user_message' && event.kind !== 'assistant_message')) continue;
+    const messageId = event.messageId ?? null;
+    const position = Math.min(...events
+      .filter(other => other === event || (messageId !== null && other.kind === event.kind && other.messageId === messageId))
+      .map(other => positionOf(other)));
+    found.push({ seq: event.seq, kind: event.kind, messageId, position });
+    if (found.length >= MAX_FIND_RESULTS) break;
+  }
+  return found;
+}
+
+/**
+ * The first message of a chat holding any of the query's words: where its snippet came from, so the
+ * chat can open there instead of at its end. Read only when a result is opened, from the recording.
+ */
+/** Where one recorded reply is, by its native message id (#482: a branch links back to it). */
+export async function locateMessage(id: string, messageId: string): Promise<SessionSearchLocation | null> {
+  const events = await readEvents(id, { kinds: ['assistant_message'] });
+  // Bookmarks keep ids in lower case; the recorded id is compared the same way.
+  const wanted = messageId.toLowerCase();
+  const revisions = events.filter(event => event.kind === 'assistant_message' && typeof event.messageId === 'string' && event.messageId.toLowerCase() === wanted);
+  const latest = revisions.at(-1);
+  if (!latest || latest.kind !== 'assistant_message') return null;
+  // A revised message keeps the place where it first appeared.
+  return { seq: latest.seq, kind: 'assistant_message', messageId: latest.messageId ?? messageId, position: Math.min(...revisions.map(event => positionOf(event))) };
+}
+
+export async function locateSearchMatch(id: string, query: string): Promise<SessionSearchLocation | null> {
+  const terms = queryTerms(query);
+  if (!terms.length) return null;
+  const events = await readEvents(id, { kinds: ['user_message', 'assistant_message'] });
+  for (const entry of transcriptEntries(events)) {
+    const text = providerEntitiesAsMarkdown(entry.stored.truncated && entry.stored.assetId
+      ? (await readOverflowText(id, entry.stored.assetId)) ?? entry.stored.text
+      : entry.stored.text);
+    const lower = foldCase(text.replace(/\s+/g, ' '));
+    if (!terms.some(term => lower.includes(term))) continue;
+    const event = events.find(candidate => candidate.seq === entry.seq);
+    if (!event || (event.kind !== 'user_message' && event.kind !== 'assistant_message')) return null;
+    const messageId = event.messageId ?? null;
+    // A revised message keeps the place where it first appeared.
+    const position = Math.min(...events
+      .filter(other => other === event || (messageId !== null && other.kind === event.kind && other.messageId === messageId))
+      .map(other => positionOf(other)));
+    return { seq: event.seq, kind: event.kind, messageId, position };
+  }
+  return null;
 }

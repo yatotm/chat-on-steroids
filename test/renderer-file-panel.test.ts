@@ -75,6 +75,24 @@ const submitEntryDialog = async (value: string): Promise<void> => {
   await tick();
 };
 
+it('rearms a lost watch without resending watches for ordinary file changes or another project', async () => {
+  const panel = createFilePanel({ host, toggle });
+  panel.update(projectA);
+  toggle.click();
+  await tick();
+  const before = vi.mocked(window.api.watchProjectFiles).mock.calls.length;
+  projectFilesChanged!({ projectId: projectA.id, directory: '' });
+  await tick();
+  expect(window.api.watchProjectFiles).toHaveBeenCalledTimes(before);
+  projectFilesChanged!({ projectId: projectB.id, directory: '', watchLost: true });
+  await tick();
+  expect(window.api.watchProjectFiles).toHaveBeenCalledTimes(before);
+  projectFilesChanged!({ projectId: projectA.id, directory: '', watchLost: true });
+  await tick();
+  expect(window.api.watchProjectFiles).toHaveBeenCalledTimes(before + 1);
+  expect(window.api.watchProjectFiles).toHaveBeenLastCalledWith(projectA.id, ['']);
+});
+
 beforeEach(() => {
   codeMount.wait = null; codeMount.calls = 0;
   dom = new JSDOM('<body><section id="host"></section><button id="toggle"></button></body>', { url: 'https://cos.local/' });
@@ -145,6 +163,27 @@ it('replaces local file views with a remote notice and releases their watches wi
   expect(listing).toHaveBeenCalledWith(projectA.id, '');
 });
 
+it('keeps every Files action on screen as icons when the labels do not fit', async () => {
+  // German labels pushed Delete, Reveal and Changes past a hidden scrollbar (2.1.41 pass).
+  const panel = createFilePanel({ host, toggle, onAttach: () => undefined });
+  panel.update(projectA); toggle.click(); await tick();
+  const actions = host.querySelector<HTMLElement>('.file-panel-toolbar-actions')!;
+  // jsdom has no layout: the labels need 627 px, the icons alone 180 px, the toolbar has 294 px.
+  Object.defineProperty(actions, 'clientWidth', { configurable: true, get: () => 294 });
+  Object.defineProperty(actions, 'scrollWidth', { configurable: true, get: () => actions.classList.contains('is-compact') ? 180 : 627 });
+  const buttons = [...actions.querySelectorAll<HTMLButtonElement>('.file-panel-action')];
+  expect(buttons.map(button => button.getAttribute('aria-label'))).toEqual(['New file', 'New folder', 'Rename', 'Delete', 'Reveal', 'Changes']);
+  try {
+    setLanguage('de');
+    expect(actions.classList.contains('is-compact')).toBe(true);
+    // Icons only, and each still names its action for screen readers and on hover.
+    expect(buttons.every(button => button.getAttribute('aria-label') === button.title && button.title)).toBe(true);
+    Object.defineProperty(actions, 'clientWidth', { configurable: true, get: () => 700 });
+    setLanguage('en');
+    expect(actions.classList.contains('is-compact')).toBe(false);
+  } finally { setLanguage('en'); }
+});
+
 it('is unavailable without a local project and lazily expands only the chosen directory', async () => {
   const onShow = vi.fn();
   const panel = createFilePanel({ host, toggle, onShow, onAttach: file => attached.push(file.name) });
@@ -206,6 +245,13 @@ it('shows real Git groups, tree markers, unified diffs, and reconciles metadata 
   expect(host.textContent).toContain('Deleted (1)');
   expect(host.textContent).toContain('Renamed (1)');
   expect(host.textContent).toContain('Untracked (1)');
+  // The list follows a language change while it is shown (it kept the old language, 2.1.41 pass).
+  try {
+    setLanguage('es');
+    expect(host.textContent).toContain("Sin seguimiento (1)");
+    expect(host.textContent).not.toContain('Untracked (1)');
+  } finally { setLanguage('en'); }
+  expect(host.textContent).toContain('Untracked (1)');
   expect(host.querySelector('.file-change-row[data-path="src/new.ts"] .file-change-status')?.textContent).toBe('U');
   expect(host.querySelector('.file-change-row[data-path="src/new.ts"] .file-change-stats')?.textContent).toBe('1 line');
   expect(host.querySelector('.file-change-row[data-path="src/staged.ts"] .file-change-stats')?.textContent).toContain('+1');
@@ -226,6 +272,10 @@ it('shows real Git groups, tree markers, unified diffs, and reconciles metadata 
     expect(host.querySelector('.file-changes-header-title')?.textContent).toBe('Diferencias');
     expect(host.querySelector('.file-changes-back')?.getAttribute('aria-label')).toBe('Volver a cambios');
     expect(host.querySelector('.file-panel-refresh')?.getAttribute('aria-label')).toBe('Actualizar cambios');
+    // The Changes button keeps its count through a language change.
+    const changesButton = host.querySelector('.file-panel-changes-toggle')!;
+    expect(changesButton.getAttribute('title')).toMatch(/^Cambios \(\d+\)$/);
+    expect(changesButton.getAttribute('aria-label')).toBe(changesButton.getAttribute('title'));
   } finally { setLanguage('en'); }
   expect(host.querySelector('.test-diff-viewer')?.textContent).toContain('# old\n---\n# new');
   expect(host.querySelector('.file-preview-title > strong')?.textContent).toBe('README.md');
@@ -319,6 +369,22 @@ it('searches a comparison branch without checking out and keeps the chosen diff 
   expect(window.api.getProjectGitSnapshot).toHaveBeenLastCalledWith(projectB.id, undefined);
 });
 
+it('gives focus back to the branch trigger when a branch is chosen with the keyboard', async () => {
+  const branches = [{ ref: 'refs/heads/main', label: 'main' }];
+  (window.api.getProjectGitSnapshot as any).mockImplementation(() => ok({ ...cleanGit(), currentBranch: 'feature', branches }));
+  const panel = createFilePanel({ host, reviewOnly: true });
+  panel.update(projectA); await panel.show(); await tick();
+  const trigger = host.querySelector<HTMLButtonElement>('.file-branch-trigger')!;
+  trigger.focus(); trigger.click();
+  const search = document.querySelector<HTMLInputElement>('.file-branch-search')!;
+  expect(document.activeElement).toBe(search);
+  search.value = 'main'; search.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+  search.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+  await tick();
+  expect(window.api.getProjectGitSnapshot).toHaveBeenLastCalledWith(projectA.id, 'refs/heads/main');
+  expect(document.activeElement).toBe(trigger);
+});
+
 it('lets Review leave a comparison whose branch disappeared', async () => {
   const baseRef = 'refs/heads/removed';
   (window.api.getProjectGitSnapshot as any).mockImplementation((_id: string, selected?: string) => ok(selected
@@ -335,6 +401,85 @@ it('lets Review leave a comparison whose branch disappeared', async () => {
   await tick();
   expect(window.api.getProjectGitSnapshot).toHaveBeenLastCalledWith(projectA.id, undefined);
   expect(host.textContent).toContain('Working tree is clean');
+});
+
+it('shows a conflicted file as ours, base and theirs, and asks chat to resolve it without sending', async () => {
+  // Review showed a conflict only as HEAD against the marker-filled file (2.1.41).
+  (window.api.getProjectGitSnapshot as any).mockImplementation(() => ok({
+    ...cleanGit(), revision: 'merging',
+    changes: [{ status: 'C', path: 'src/both.ts', additions: null, deletions: null, binary: false }]
+  }));
+  (window.api.getProjectGitDiff as any).mockImplementation(() => ok({
+    projectId: projectA.id, status: 'C', path: 'src/both.ts', additions: null, deletions: null,
+    binary: false, tooLarge: false, baseText: 'ours', currentText: '<<<<<<< HEAD',
+    conflict: { base: null, ours: 'export const side = "main";', theirs: 'export const side = "feature";' }
+  } satisfies ProjectGitDiff));
+  const asked: string[] = [];
+  const panel = createFilePanel({ host, reviewOnly: true, onAskChat: request => asked.push(request) });
+  panel.update(projectA); await panel.show(); await tick();
+  host.querySelector<HTMLButtonElement>('.file-change-row[data-path="src/both.ts"]')!.click(); await tick(); await tick();
+
+  const panes = [...host.querySelectorAll<HTMLElement>('.file-conflict-pane')];
+  expect(panes.map(pane => pane.querySelector('.file-conflict-pane-label')?.textContent)).toEqual(['Ours (HEAD)', 'Common base', 'Theirs (incoming)']);
+  expect(panes.map(pane => pane.querySelector<HTMLTextAreaElement>('.test-code-input')?.value ?? pane.textContent))
+    .toEqual(['export const side = "main";', 'Common baseNot in this version', 'export const side = "feature";']);
+  expect(host.querySelector('.test-diff-viewer')).toBeNull();
+
+  const toggleView = host.querySelector<HTMLButtonElement>('.file-conflict-toggle')!;
+  expect(toggleView.getAttribute('aria-pressed')).toBe('true');
+  toggleView.focus(); toggleView.click(); await tick();
+  expect(host.querySelector('.file-conflict-pane')).toBeNull();
+  expect(host.querySelector('.test-diff-viewer')?.textContent).toContain('<<<<<<< HEAD');
+  // The header is rebuilt; a keyboard user stays on the toggle.
+  expect(document.activeElement).toBe(host.querySelector('.file-conflict-toggle'));
+  expect(document.activeElement?.getAttribute('aria-pressed')).toBe('false');
+  host.querySelector<HTMLButtonElement>('.file-conflict-toggle')!.click(); await tick();
+  expect(host.querySelectorAll('.file-conflict-pane')).toHaveLength(3);
+
+  [...host.querySelectorAll<HTMLButtonElement>('.file-preview-actions button')].find(button => button.title === 'Ask chat to resolve')!.click();
+  expect(asked).toHaveLength(1);
+  expect(asked[0]).toContain('src/both.ts');
+  expect(asked[0]).toContain('git show :1:./src/both.ts, :2:./src/both.ts and :3:./src/both.ts');
+});
+
+it('shows a binary note, or conflict panes over a too large file, instead of staying on Loading diff', async () => {
+  // The loading view recorded the revision, so a binary or too large result returned before rendering.
+  (window.api.getProjectGitSnapshot as any).mockImplementation(() => ok({
+    ...cleanGit(), revision: 'dirty', changes: [
+      { status: 'M', path: 'a.bin', additions: null, deletions: null, binary: true },
+      { status: 'C', path: 'big.txt', additions: null, deletions: null, binary: false }
+    ]
+  }));
+  (window.api.getProjectGitDiff as any).mockImplementation((_id: string, file: string) => ok(file === 'a.bin' ? {
+    projectId: projectA.id, status: 'M', path: 'a.bin', additions: null, deletions: null,
+    binary: true, tooLarge: false, baseText: null, currentText: null, note: 'Binary diff · preview unavailable'
+  } : {
+    projectId: projectA.id, status: 'C', path: 'big.txt', additions: null, deletions: null, binary: false, tooLarge: true,
+    baseText: null, currentText: null, note: 'This diff is too large to display.', conflict: { base: 'base', ours: 'ours', theirs: 'theirs' }
+  } satisfies ProjectGitDiff));
+  const panel = createFilePanel({ host, reviewOnly: true });
+  panel.update(projectA); await panel.show(); await tick();
+  host.querySelector<HTMLButtonElement>('.file-change-row[data-path="a.bin"]')!.click(); await tick(); await tick();
+  expect(host.querySelector('.file-preview')?.textContent).toContain('Binary diff · preview unavailable');
+  host.querySelector<HTMLButtonElement>('.file-preview-actions button[title="Close preview"]')!.click(); await tick();
+  host.querySelector<HTMLButtonElement>('.file-change-row[data-path="big.txt"]')!.click(); await tick(); await tick();
+  expect(host.querySelectorAll('.file-conflict-pane')).toHaveLength(3);
+  expect(host.querySelector('.file-preview')?.textContent).not.toContain('Loading diff');
+});
+
+it('offers neither conflict action on an ordinary diff', async () => {
+  (window.api.getProjectGitSnapshot as any).mockImplementation(() => ok({
+    ...cleanGit(), revision: 'dirty', changes: [{ status: 'M', path: 'README.md', additions: 1, deletions: 1, binary: false }]
+  }));
+  (window.api.getProjectGitDiff as any).mockImplementation(() => ok({
+    projectId: projectA.id, status: 'M', path: 'README.md', additions: 1, deletions: 1,
+    binary: false, tooLarge: false, baseText: 'before', currentText: 'after'
+  } satisfies ProjectGitDiff));
+  const panel = createFilePanel({ host, reviewOnly: true, onAskChat: () => undefined });
+  panel.update(projectA); await panel.show(); await tick();
+  host.querySelector<HTMLButtonElement>('.file-change-row[data-path="README.md"]')!.click(); await tick(); await tick();
+  expect(host.querySelector('.test-diff-viewer')).not.toBeNull();
+  expect([...host.querySelectorAll<HTMLButtonElement>('.file-preview-actions button')].map(button => button.title)).toEqual(['Close preview']);
 });
 
 it('marks every ancestor folder, including paths of deleted and renamed files, then clears them from Git truth', async () => {
@@ -1165,4 +1310,178 @@ it('does not restart a pending code mount when the directory watcher refreshes',
   expect(codeMount.calls).toBe(1);
   release(); await tick();
   expect(host.querySelector<HTMLTextAreaElement>('.test-code-input')?.value).toBe(code.text);
+});
+
+// #1469: a project on a server is browsed and previewed in Files, but v1 changes its files only
+// through ChatGPT's tools. The panel offers no action that could only fail there.
+it('offers no file changes for a project on a server, and still previews it', async () => {
+  const panel = createFilePanel({ host, toggle });
+  panel.update({ ...projectA, path: 'me@devbox:/srv/alpha', remote: { host: 'me@devbox', path: '/srv/alpha' } });
+  toggle.click(); await tick();
+  const action = (label: string) => [...host.querySelectorAll<HTMLButtonElement>('.file-panel-toolbar-actions button')]
+    .find(button => button.getAttribute('aria-label') === label || button.title === label);
+  for (const label of ['New file', 'New folder', 'Rename', 'Delete', 'Reveal']) expect(action(label)?.hidden, label).toBe(true);
+  host.querySelector<HTMLButtonElement>('[data-path="README.md"]')!.click(); await tick(); await tick();
+  expect(host.querySelector('.file-preview-markdown h1')?.textContent).toBe('hello');
+  const previewActions = [...host.querySelectorAll<HTMLButtonElement>('.file-preview-actions button')].map(button => button.title);
+  expect(previewActions).toContain('Attach');
+  expect(previewActions).not.toContain('Edit');
+
+  panel.update(projectB); await tick();
+  for (const label of ['New file', 'New folder', 'Reveal']) expect(action(label)?.hidden, label).toBe(false);
+});
+
+const untrackedGit = (): ProjectGitSnapshot => ({
+  projectId: projectA.id, state: 'ready', truncated: false, revision: 'untracked-1',
+  changes: [
+    { status: 'M', path: 'README.md', additions: 1, deletions: 0, binary: false },
+    { status: 'U', path: 'dist/app.js', additions: 3, deletions: 0, binary: false }
+  ]
+});
+const gitignorePreview = (text: string, revision = 'c'.repeat(64)): ProjectFilePreview => ({
+  ...preview, path: '.gitignore', name: '.gitignore', bytes: text.length, text, revision
+});
+const openRowContextMenu = (path: string): void => {
+  host.querySelector(`.file-change-row[data-path="${path}"]`)!
+    .dispatchEvent(new dom.window.MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 40, clientY: 60 }));
+};
+const menuLabels = (): string[] => [...document.querySelectorAll('.row-menu .row-menu-item')].map(item => item.textContent ?? '');
+const confirmButton = (): HTMLButtonElement => [...document.querySelectorAll<HTMLButtonElement>('.file-confirm-dialog button')]
+  .find(button => button.textContent === 'Add')!;
+
+it('adds an untracked file\'s folder to .gitignore from its Changes row, saving against the revision read before the dialog', async () => {
+  vi.mocked(window.api.getProjectGitSnapshot).mockImplementation(() => ok(untrackedGit()));
+  vi.mocked(window.api.previewProjectFile).mockImplementation((_projectId: string, path: string) =>
+    ok(path === '.gitignore' ? gitignorePreview('node_modules\r\n') : preview));
+  const review = createFilePanel({ host, mount: host, toggle, reviewOnly: true });
+  review.update(projectA); await review.show(); await tick();
+
+  openRowContextMenu('README.md');
+  expect(document.querySelector('.row-menu')).toBeNull();
+  openRowContextMenu('dist/app.js');
+  expect(menuLabels()).toEqual(['Add “app.js” to .gitignore', 'Add “dist/” to .gitignore']);
+
+  document.querySelector<HTMLButtonElement>('.row-menu [data-row-action="gitignore-folder"]')!.click(); await tick();
+  expect(window.api.previewProjectFile).toHaveBeenCalledWith(projectA.id, '.gitignore');
+  expect(document.querySelector('.file-confirm-dialog h2')?.textContent).toBe('Add to .gitignore?');
+  expect(document.querySelector('.file-confirm-dialog')?.textContent).toContain('Add the line “/dist/” to .gitignore?');
+  expect(confirmButton().classList.contains('file-dialog-danger')).toBe(false);
+  expect(window.api.saveProjectFile).not.toHaveBeenCalled();
+  const snapshotReads = vi.mocked(window.api.getProjectGitSnapshot).mock.calls.length;
+
+  confirmButton().click(); await tick(); await tick();
+  expect(window.api.saveProjectFile).toHaveBeenCalledWith(projectA.id, '.gitignore', 'node_modules\r\n/dist/\r\n',
+    preview.modifiedAt, 'node_modules\r\n'.length, 'c'.repeat(64));
+  expect(window.api.createProjectFileEntry).not.toHaveBeenCalled();
+  expect(document.querySelector('.toast')?.textContent).toBe('Added /dist/ to .gitignore');
+  expect(vi.mocked(window.api.getProjectGitSnapshot).mock.calls.length).toBeGreaterThan(snapshotReads);
+});
+
+it('creates a missing .gitignore only after the dialog and reports a save conflict instead of overwriting', async () => {
+  vi.mocked(window.api.getProjectGitSnapshot).mockImplementation(() => ok(untrackedGit()));
+  let exists = false;
+  vi.mocked(window.api.previewProjectFile).mockImplementation((_projectId: string, path: string) => path !== '.gitignore'
+    ? ok(preview)
+    : exists ? ok(gitignorePreview('', 'd'.repeat(64))) : Promise.resolve({ ok: false as const, error: 'ENOENT: no such file or directory' }));
+  vi.mocked(window.api.createProjectFileEntry).mockImplementation(() => { exists = true; return ok({ projectId: projectA.id, path: '.gitignore', kind: 'file' as const }); });
+  const panel = createFilePanel({ host, toggle });
+  panel.update(projectA); toggle.click(); await tick();
+  host.querySelector<HTMLButtonElement>('.file-panel-changes-toggle')!.click(); await tick(); await tick();
+
+  openRowContextMenu('dist/app.js');
+  document.querySelector<HTMLButtonElement>('.row-menu [data-row-action="gitignore-file"]')!.click(); await tick();
+  expect(document.querySelector('.file-confirm-dialog')?.textContent).toContain('This project has no .gitignore yet.');
+  expect(window.api.createProjectFileEntry).not.toHaveBeenCalled();
+  confirmButton().click(); await tick(); await tick();
+  expect(window.api.createProjectFileEntry).toHaveBeenCalledWith(projectA.id, '', '.gitignore', 'file');
+  expect(window.api.saveProjectFile).toHaveBeenLastCalledWith(projectA.id, '.gitignore', '/dist/app.js\n', preview.modifiedAt, 0, 'd'.repeat(64));
+
+  // .gitignore was edited elsewhere while the dialog was open: the save's revision check refuses it.
+  vi.mocked(window.api.saveProjectFile).mockImplementationOnce(() =>
+    Promise.resolve({ ok: false as const, error: 'File changed on disk. Reload it before saving your edits.' }));
+  openRowContextMenu('dist/app.js');
+  document.querySelector<HTMLButtonElement>('.row-menu [data-row-action="gitignore-file"]')!.click(); await tick();
+  confirmButton().click(); await tick(); await tick();
+  expect(window.api.createProjectFileEntry).toHaveBeenCalledTimes(1);
+  expect(document.querySelector('.toast')?.textContent).toBe('File changed on disk. Reload it before saving your edits.');
+});
+
+it('closes the .gitignore dialog and gives focus back to the row on Cancel', async () => {
+  vi.mocked(window.api.getProjectGitSnapshot).mockImplementation(() => ok(untrackedGit()));
+  vi.mocked(window.api.previewProjectFile).mockImplementation((_projectId: string, path: string) =>
+    ok(path === '.gitignore' ? gitignorePreview('') : preview));
+  // jsdom has no modal dialog; a minimal one records that the dialog is closed rather than just removed.
+  const closed: string[] = [];
+  const proto = dom.window.HTMLDialogElement.prototype as unknown as Record<string, unknown>;
+  proto.showModal = function (this: HTMLElement) { this.setAttribute('open', ''); };
+  proto.close = function (this: HTMLElement) { closed.push(this.className); this.removeAttribute('open'); };
+  const review = createFilePanel({ host, mount: host, toggle, reviewOnly: true });
+  review.update(projectA); await review.show(); await tick();
+
+  openRowContextMenu('dist/app.js');
+  document.querySelector<HTMLButtonElement>('.row-menu [data-row-action="gitignore-file"]')!.click(); await tick();
+  const row = host.querySelector<HTMLElement>('.file-change-row[data-path="dist/app.js"]')!;
+  expect(document.activeElement).toBe(confirmButton());
+  [...document.querySelectorAll<HTMLButtonElement>('.file-confirm-dialog button')].find(button => button.textContent === 'Cancel')!.click();
+  await tick();
+  expect(closed).toEqual(['file-confirm-dialog']);
+  expect(document.querySelector('.file-confirm-dialog')).toBeNull();
+  expect(window.api.saveProjectFile).not.toHaveBeenCalled();
+  expect(document.activeElement).toBe(row);
+});
+
+it('moves focus to a surviving Review control when the saved .gitignore line removes the row', async () => {
+  let git = untrackedGit();
+  vi.mocked(window.api.getProjectGitSnapshot).mockImplementation(() => ok(git));
+  vi.mocked(window.api.previewProjectFile).mockImplementation((_projectId: string, path: string) =>
+    ok(path === '.gitignore' ? gitignorePreview('') : preview));
+  const review = createFilePanel({ host, mount: host, toggle, reviewOnly: true });
+  review.update(projectA); await review.show(); await tick();
+
+  openRowContextMenu('dist/app.js');
+  document.querySelector<HTMLButtonElement>('.row-menu [data-row-action="gitignore-file"]')!.click(); await tick();
+  git = { ...git, revision: 'untracked-2', changes: git.changes.filter(change => change.path !== 'dist/app.js') };
+  confirmButton().click(); await tick(); await tick();
+  expect(window.api.saveProjectFile).toHaveBeenCalledTimes(1);
+  expect(host.querySelector('.file-change-row[data-path="dist/app.js"]')).toBeNull();
+  expect(document.activeElement).toBe(host.querySelector('.file-change-row[data-path="README.md"]'));
+
+  // No row left: focus goes to the header's Refresh button instead of the page body.
+  git = { ...git, revision: 'untracked-3', changes: [{ status: 'U', path: 'tmp/x.log', additions: 1, deletions: 0, binary: false }] };
+  await review.show(); await tick();
+  openRowContextMenu('tmp/x.log');
+  document.querySelector<HTMLButtonElement>('.row-menu [data-row-action="gitignore-file"]')!.click(); await tick();
+  git = { ...git, revision: 'untracked-4', changes: [] };
+  confirmButton().click(); await tick(); await tick();
+  expect(host.querySelector('.file-change-row')).toBeNull();
+  expect(document.activeElement).toBe(host.querySelector('.file-panel-refresh'));
+});
+
+it('offers no .gitignore action on a server project or while comparing branches', async () => {
+  vi.mocked(window.api.getProjectGitSnapshot).mockImplementation(() => ok(untrackedGit()));
+  const review = createFilePanel({ host, mount: host, toggle, reviewOnly: true });
+  review.update({ ...projectA, path: 'me@devbox:/srv/alpha', remote: { host: 'me@devbox', path: '/srv/alpha' } });
+  await review.show(); await tick();
+  openRowContextMenu('dist/app.js');
+  expect(document.querySelector('.row-menu')).toBeNull();
+
+  review.update(projectB);
+  vi.mocked(window.api.getProjectGitSnapshot).mockImplementation(() => ok({
+    ...untrackedGit(), projectId: projectB.id, comparison: { ref: 'refs/heads/main', label: 'main', baseOid: 'a'.repeat(40), headOid: 'b'.repeat(40) }
+  }));
+  await review.show(); await tick();
+  openRowContextMenu('dist/app.js');
+  expect(document.querySelector('.row-menu')).toBeNull();
+});
+
+it('offers no .gitignore action for an untracked name with a line break', async () => {
+  vi.mocked(window.api.getProjectGitSnapshot).mockImplementation(() => ok({
+    ...untrackedGit(), changes: [{ status: 'U', path: 'notes/a\nb.md', additions: 1, deletions: 0, binary: false }]
+  }));
+  const review = createFilePanel({ host, mount: host, toggle, reviewOnly: true });
+  review.update(projectA); await review.show(); await tick();
+  const row = host.querySelector<HTMLElement>('.file-change-row')!;
+  expect(row.dataset.path).toBe('notes/a\nb.md');
+  row.dispatchEvent(new dom.window.MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 40, clientY: 60 }));
+  expect(document.querySelector('.row-menu')).toBeNull();
 });

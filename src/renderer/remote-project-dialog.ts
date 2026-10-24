@@ -1,4 +1,4 @@
-import { isCoreRemote, isManagedRemote, type LocalProject } from '../shared/projects.js';
+import { isCoreRemote, isManagedRemote, isSftpRemote, type LocalProject } from '../shared/projects.js';
 import type { RemoteHostView, RemoteHostState, SaveRemoteHost } from '../shared/remote-hosts.js';
 import { el } from './dom.js';
 import { t, ui } from './i18n.js';
@@ -17,7 +17,7 @@ export async function requestRemoteProject(options: DialogOptions = {}): Promise
   if (!discovery.ok) throw new Error(discovery.error);
   if (!discovery.data.supported) throw new Error(t('Managed SSH requires macOS or Linux.'));
   const hosts = [...connections.data];
-  const legacy = catalog.data.filter(project => project.remote && !isManagedRemote(project.remote));
+  const legacy = catalog.data.filter(project => project.remote && !isSftpRemote(project.remote) && !isManagedRemote(project.remote));
   const known = (id: string) => hosts.find(host => host.id === id);
   if (options.hostId && !known(options.hostId)) throw new Error(t('This development server connection is unavailable.'));
   const oldProject = (id: string) => legacy.find(project => project.id === id);
@@ -88,7 +88,7 @@ export async function requestRemoteProject(options: DialogOptions = {}): Promise
     submit.type = 'submit'; actions.append(cancel, submit);
     body.append(field('Development server', choice), hint, sshField,
       credentialHint, serviceSettings, rootSection, projectField, createField,
-      el('p', 'meta', () => t('CoS opens and closes its own SSH mapping. Closing the CoS window quits the app and disconnects these mappings. Core remains the only required ChatGPT connector.')));
+      el('p', 'meta', () => t('CoS opens and closes its own SSH mapping. Closing the CoS window quits the app and disconnects these mappings. Core remains the only required ChatGPT plugin.')));
     footer.append(status, actions); form.append(title, body, footer);
     dialog.append(form); document.body.append(dialog);
     let pending = false, settled = false;

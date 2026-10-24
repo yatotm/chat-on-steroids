@@ -6,7 +6,7 @@ let dom: JSDOM;
 afterEach(() => dom?.window.close());
 
 function setup() {
-  dom = new JSDOM('<div class="app"><button id="headerConnect"></button><main data-panel="chat"><article class="is-session"></article></main></div>', { pretendToBeVisual: true });
+  dom = new JSDOM('<div class="app"><div class="app-topbar"></div><main data-panel="chat"><article class="is-session"><header class="chat-head"><span class="state"></span></header></article></main></div>', { pretendToBeVisual: true });
   Object.assign(globalThis, { document: dom.window.document, window: dom.window });
   const host = document.querySelector<HTMLElement>('main')!;
   return { host, docks: createWorkspaceDocks(host) };
@@ -16,6 +16,9 @@ it('orders expansion, bottom and right controls; toggles panels and shows expans
   const { host } = setup();
   const controls = [...document.querySelectorAll<HTMLButtonElement>('.header-dock-controls > button')];
   expect(controls.map(button => button.id)).toEqual(['rightDockExpand', 'terminalToggle', 'rightDockToggle']);
+  // In the title bar, not in the chat header.
+  expect(document.querySelector('.app-topbar > .header-dock-controls')).not.toBeNull();
+  expect(document.querySelector('header .header-dock-controls')).toBeNull();
   const right = document.getElementById('workDockRight')!, bottom = document.getElementById('workDockBottom')!;
   expect(controls[0]!.hidden).toBe(true);
   controls[1]!.click(); expect(bottom.hidden).toBe(false);
@@ -77,7 +80,7 @@ it('keeps right and bottom Terminal actions in their own dock', () => {
   const rightCloseTab = vi.fn((id: string) => terminalTabs.splice(terminalTabs.findIndex(tab => tab.id === id), 1));
   const rightSelectTab = vi.fn();
   docks.registerTerminal({ show: rightShow, hide: rightHide, canCreate: () => true, newTab: rightNewTab,
-    tabs: () => terminalTabs, selectTab: rightSelectTab, closeTab: rightCloseTab },
+    tabs: () => terminalTabs, selectTab: rightSelectTab, closeTab: rightCloseTab, moveTab: vi.fn() },
     { show: bottomShow, hide: bottomHide });
   const right = document.getElementById('workDockRight')!, bottom = document.getElementById('workDockBottom')!;
   document.getElementById('rightDockToggle')!.click();
@@ -116,7 +119,7 @@ it('interleaves individual terminal sessions with tools and keeps one selected d
   const selectTerminal = vi.fn(), showFiles = vi.fn(), hideFiles = vi.fn();
   docks.registerTerminal({ show: vi.fn(), hide: vi.fn(), canCreate: () => true,
     newTab: () => { const id = `pty-${terminalTabs.length + 1}`; terminalTabs.push({ id, title: `Shell ${id}`, exited: false }); return id; },
-    tabs: () => terminalTabs, selectTab: selectTerminal, closeTab: closeTerminal },
+    tabs: () => terminalTabs, selectTab: selectTerminal, closeTab: closeTerminal, moveTab: vi.fn() },
     { show: vi.fn(), hide: vi.fn() });
   docks.register('files', 'Files', 'i-folder', showFiles, hideFiles, () => true);
   const right = document.getElementById('workDockRight')!;
@@ -137,6 +140,48 @@ it('interleaves individual terminal sessions with tools and keeps one selected d
   expect(right.querySelector('.work-dock-tab:not([data-terminal-id])')).not.toBeNull();
 });
 
+it('lists right terminal tabs remembered from the last launch as dock tabs marked previous session', () => {
+  const { docks } = setup();
+  const terminalTabs = [{ id: 'pty-1', title: 'project · bash', exited: false, previous: true }];
+  const show = vi.fn(), selectTab = vi.fn();
+  docks.registerTerminal({ show, hide: vi.fn(), canCreate: () => true, newTab: () => null,
+    tabs: () => terminalTabs, selectTab, closeTab: vi.fn(), moveTab: vi.fn() }, { show: vi.fn(), hide: vi.fn() });
+  const right = document.getElementById('workDockRight')!;
+  document.getElementById('rightDockToggle')!.click();
+  expect(right.querySelector('.work-dock-bar')!.hasAttribute('hidden')).toBe(false);
+  expect(right.querySelector('[data-terminal-id=pty-1] [role=tab]')?.textContent).toBe('project · bash · previous session');
+  // The Terminal quick action opens the remembered tab instead of starting another shell.
+  right.querySelector<HTMLButtonElement>('.work-dock-quick[data-view=terminal]')!.click();
+  expect(selectTab).toHaveBeenCalledWith('pty-1'); expect(show).toHaveBeenCalledWith(docks.body, false);
+  terminalTabs[0]!.previous = false; docks.sync();
+  expect(right.querySelector('[data-terminal-id=pty-1] [role=tab]')?.textContent).toBe('project · bash');
+});
+
+it('tells the terminal where a moved terminal tab sits among the terminals, so a restart keeps the order', () => {
+  const { docks } = setup();
+  const terminalTabs = ['pty-1', 'pty-2'].map(id => ({ id, title: id, exited: false }));
+  const moveTab = vi.fn();
+  docks.registerTerminal({ show: vi.fn(), hide: vi.fn(), canCreate: () => true, newTab: () => null,
+    tabs: () => terminalTabs, selectTab: vi.fn(), closeTab: vi.fn(), moveTab }, { show: vi.fn(), hide: vi.fn() });
+  docks.register('files', 'Files', 'i-folder', vi.fn(), vi.fn(), () => true);
+  docks.activate('files');
+  const right = document.getElementById('workDockRight')!;
+  expect([...right.querySelectorAll<HTMLElement>('.work-dock-tab')].map(tab => tab.dataset.terminalId ?? 'files'))
+    .toEqual(['pty-1', 'pty-2', 'files']);
+  right.querySelector<HTMLButtonElement>('[data-terminal-id=pty-1] [role=tab]')!.click();
+  const press = (key: 'ArrowLeft' | 'ArrowRight') => right.querySelector('[role=tablist]')!
+    .dispatchEvent(new dom.window.KeyboardEvent('keydown', { key, ctrlKey: true, shiftKey: true, bubbles: true }));
+  press('ArrowRight');
+  expect([...right.querySelectorAll<HTMLElement>('.work-dock-tab')].map(tab => tab.dataset.terminalId ?? 'files'))
+    .toEqual(['pty-2', 'pty-1', 'files']);
+  expect(moveTab).toHaveBeenLastCalledWith('pty-1', 1);
+  // Past the tool tab, the index counts terminals only.
+  press('ArrowRight'); press('ArrowRight');
+  expect(moveTab).toHaveBeenLastCalledWith('pty-1', 1);
+  press('ArrowLeft'); press('ArrowLeft'); press('ArrowLeft');
+  expect(moveTab).toHaveBeenLastCalledWith('pty-1', 0);
+});
+
 it('hides the old right view when a recorded edit directly adopts Review', () => {
   const { docks } = setup();
   const hideFiles = vi.fn();
@@ -154,7 +199,7 @@ it('keeps Ctrl+backtick for bottom visibility and Ctrl+Shift+1–4 for scoped ac
   const terminalTabs: { id: string; title: string; exited: boolean }[] = [];
   docks.registerTerminal({ show: rightTerminal, hide: vi.fn(), canCreate: () => true,
     newTab: () => { terminalTabs.push({ id: 'pty-1', title: 'powershell', exited: false }); return 'pty-1'; },
-    tabs: () => terminalTabs, selectTab: vi.fn(), closeTab: vi.fn() },
+    tabs: () => terminalTabs, selectTab: vi.fn(), closeTab: vi.fn(), moveTab: vi.fn() },
     { show: bottomTerminal, hide: vi.fn() });
   docks.register('files', 'Files', 'i-folder', files, vi.fn(), () => true);
   docks.register('agents', 'Sub-agents', 'i-agents', agents, vi.fn(), () => true);
@@ -201,3 +246,17 @@ it('resizes the bottom dock from its top edge with drag feedback', () => {
   expect(app.classList.contains('is-resizing-bottom-dock')).toBe(false);
   expect(handle.getAttribute('aria-valuenow')).toBe('330');
 });
+
+it('keeps a greyed-out tab\'s reason in the app\'s language when the language changes', async () => {
+  const { docks } = setup();
+  docks.register('files', 'Files', 'i-folder', vi.fn(), vi.fn(), () => false);
+  const quick = document.querySelector<HTMLButtonElement>('#workDockRight .work-dock-quick[data-view=files]')!;
+  expect(quick.title).toBe('Open a project to use Files and Review');
+  const { setLanguage } = await import('../src/renderer/i18n.js');
+  setLanguage('de');
+  // The reason was written once, so it stayed English until the next unrelated refresh.
+  expect(quick.title).toBe('Öffne ein Projekt, um Dateien und Review zu nutzen');
+  setLanguage('en');
+  expect(quick.title).toBe('Open a project to use Files and Review');
+});
+

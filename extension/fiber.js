@@ -41,7 +41,7 @@
   'use strict';
 
   /** Bumped when the descriptor shape changes, so a stale pair cannot half-understand. */
-  const VERSION = 21;
+  const VERSION = 22;
   // The MAIN world survives an extension reload because the ChatGPT document survives it.
   // Recovery may therefore execute this file again in a page that still has an older helper
   // listener. Retire it across versions too: picker/plugin replies use their own v1
@@ -89,6 +89,9 @@
   const GENERATED_IMAGE = '[class~="group/imagegen-image"] img, [class~="group/generated-image-preview"] img';
   const OWN_SURFACES = '.clf-stream, .clf-stage, .clf-composer, .clf-boot';
   const MAX_RENDERED_HTML = 120_000;
+  // An exact, stable assistant final can have far more than 120k of decorative
+  // markup around the prose. Carry a compact text rendering, not a cut HTML tag.
+  const MAX_LARGE_FINAL_HTML = 256_000;
   // A 15k–20k-token compaction answer is routinely 60k–90k characters. Capping public
   // assistant prose at 32k here made the canonical session transcript lose the back half
   // even though Compact & Resume itself carried the full DOM answer. One event still stays
@@ -99,8 +102,11 @@
   /** Aggregate authored text/HTML copied through MAIN -> isolated world in one scan. */
   const MAX_RESPONSE_TEXT = MAX_TURNS * 512 * 1024;
   const MAX_TURN_TEXT = 512 * 1024;
-  /** One live caption line; the full text is recorded once ChatGPT publishes its message. */
-  const MAX_PREVIEW_TEXT = 300;
+  /** A turn outline (`shellTurnTrace`): items, one sentence block, one recap, and all of its text. */
+  const MAX_TRACE_ITEMS = 400;
+  const MAX_TRACE_SAY = 8000;
+  const MAX_TRACE_RECAP = 300;
+  const MAX_TRACE_TEXT = 128 * 1024;
 
   function budgetedText(value, budget, perValueLimit) {
     if (typeof value !== 'string' || !value || !budget || budget.remaining <= 0) return '';
@@ -148,18 +154,84 @@
     return name === PLAIN_APPS[2] || SUFFIXED_APP.exec(typeof name === 'string' ? name : '')?.[1] === 'Plugins';
   }
 
-  /** Whether an `invoked_resource.app_name` names one of this app's own connectors. */
-  function ourApp(name) {
-    if (typeof name !== 'string') return false;
-    for (let at = 0; at < OUR_APPS.length; at++) if (OUR_APPS[at] === name) return true;
-    return false;
+  /**
+   * This install's proven connector apps ({ surface, appId, linkId, name }), from the app's
+   * status (connector-identity.ts). ChatGPT keeps an app's `asdk_app_…` and `link_…` ids when the
+   * user renames it (measured 2026-10-11), so a renamed connector is still recognized by them.
+   */
+  const APP_ID = /^asdk_app_[A-Za-z0-9_-]{1,160}$/, LINK_ID = /^link_[A-Za-z0-9_-]{1,160}$/;
+  const SURFACES = ['core', 'desktop', 'plugins'];
+  let OUR_APP_IDS = [];
+  function adoptAppIds(list) {
+    if (!Array.isArray(list)) return;
+    const next = [];
+    for (let at = 0; at < list.length && next.length < 12; at++) {
+      const app = list[at];
+      if (!app || typeof app.appId !== 'string' || !APP_ID.test(app.appId) || !SURFACES.includes(app.surface)) continue;
+      next.push({ surface: app.surface, appId: app.appId,
+        linkId: typeof app.linkId === 'string' && LINK_ID.test(app.linkId) ? app.linkId : null,
+        name: typeof app.name === 'string' && app.name ? app.name : null });
+    }
+    OUR_APP_IDS = next;
   }
-
+  /** This install's Plugins connector, by name or (after a rename) by its proven app id. */
+  function pluginsConnectorApp(name, appId) {
+    return pluginsConnectorName(name) || (typeof appId === 'string' && OUR_APP_IDS.some(app => app.surface === 'plugins' && app.appId === appId));
+  }
+  /** `/asdk_app_…/link_…/tool` → the app id, or null. */
+  function appIdOf(resource) {
+    if (typeof resource !== 'string' || resource.charCodeAt(0) !== 47) return null;
+    const end = resource.indexOf('/', 1), id = resource.slice(1, end > 0 ? end : undefined);
+    return APP_ID.test(id) ? id : null;
+  }
+  /** `/<name or app id>/link_…/tool` → the link id, or null. */
+  function linkIdOf(path) {
+    if (typeof path !== 'string' || path.charCodeAt(0) !== 47) return null;
+    const parts = path.split('/');
+    return parts.length >= 4 && LINK_ID.test(parts[2]) ? parts[2] : null;
+  }
+  /** Which surface a configured or proven name belongs to, or null. */
+  function surfaceOfName(name) {
+    for (let at = 0; at < 3; at++) if (OUR_APPS[at] === name) return SURFACES[at];
+    for (let at = 0; at < OUR_APP_IDS.length; at++) if (OUR_APP_IDS[at].name === name) return OUR_APP_IDS[at].surface;
+    return null;
+  }
+  /**
+   * A name is ours, exactly as before, unless its surface already has a proven app and this row
+   * names a different one: then a same-named app is somebody else's.
+   */
+  function ownByName(name, appId, linkId) {
+    if (typeof name !== 'string') return false;
+    for (let at = 0; at < LEGACY_APPS.length; at++) if (LEGACY_APPS[at] === name) return true;
+    const surface = surfaceOfName(name);
+    if (!surface) return false;
+    const known = OUR_APP_IDS.filter(app => app.surface === surface);
+    if (!known.length) return true;
+    if (appId) return known.some(app => app.appId === appId);
+    if (linkId) return known.some(app => app.linkId === linkId);
+    return true;
+  }
+  /** Whether a result row (`invoked_resource`) belongs to one of this app's own connectors. */
+  function ownResult(result) {
+    if (!result) return false;
+    const appId = appIdOf(result.resource);
+    if (appId && OUR_APP_IDS.some(app => app.appId === appId)) return true;
+    return ownByName(result.app, appId, linkIdOf(result.resource));
+  }
   /** Whether a request path — `/<connector>/link_…/<tool>` — is one of ours. */
-  function ourPath(path) {
+  function ownRequestPath(path) {
     if (typeof path !== 'string' || path.charCodeAt(0) !== 47) return false;
+    const linkId = linkIdOf(path);
+    if (linkId && OUR_APP_IDS.some(app => app.linkId === linkId)) return true;
     const end = path.indexOf('/', 1);
-    return end > 1 && ourApp(path.slice(1, end));
+    return end > 1 && ownByName(path.slice(1, end), null, linkId);
+  }
+  /** Names `mcp-tool-call` steps may carry for ours: configured and proven (spaces may be `_`). */
+  function ownServerName(name) {
+    if (typeof name !== 'string') return null;
+    const names = [...OUR_APPS];
+    for (let at = 0; at < OUR_APP_IDS.length; at++) if (OUR_APP_IDS[at].name) names.push(OUR_APP_IDS[at].name);
+    return names.find(app => name === app || name === app.replaceAll(' ', '_')) || null;
   }
   /**
    * The tool path at the very front of a request payload.
@@ -660,6 +732,12 @@
    * it after a reload. The model id is already ChatGPT's durable identity, so there is no
    * reason to make user capture depend on the DOM having caught up.
    */
+  /** A question's parent in ChatGPT's message tree: a message id, or "root" for a chat's first turn. */
+  function parentIdOf(message) {
+    const parent = message.metadata?.parent_id;
+    return typeof parent === 'string' && (parent === 'root' || /^[A-Za-z0-9:_-]{8,190}$/.test(parent)) ? parent : null;
+  }
+
   function authoredUserMessages(messages, budget) {
     const out = [];
     const seen = new Set();
@@ -690,7 +768,13 @@
         role: 'user',
         stable: true,
         rawText,
+        // ChatGPT's own mark for text it stored as escaped Markdown (page-inserted text).
+        ...(message.metadata?.serialization_metadata?.render_format === 'markdown' ? { markdown: true } : {}),
         ...(attachments.length ? { attachments } : {}),
+        // Its place in ChatGPT's message tree; `parentExact` says two questions sharing it are versions
+        // of one message (always, for a real parent id; for the shell's predecessor, only with ChatGPT's
+        // own versions control on that turn).
+        ...(parentIdOf(message) ? { parentId: parentIdOf(message), parentExact: message.metadata?.clf_parent_exact !== false } : {}),
         order: index,
         createTime: authoredTime(message)
       });
@@ -942,6 +1026,15 @@
       try {
         const holder = block.closest && block.closest('[data-message-id]');
         id = holder ? str(holder.getAttribute('data-message-id')) : null;
+        if (!id && conversationId) {
+          // GPT-6's DIL wrapper may expose its owner only here, not on a
+          // data-message-id parent. Match both identities, never the DOM order.
+          const selected = block.closest && block.closest(
+            '[data-chatgpt-selection-message-id][data-chatgpt-selection-conversation-id]');
+          if (selected?.getAttribute('data-chatgpt-selection-conversation-id') === conversationId) {
+            id = str(selected.getAttribute('data-chatgpt-selection-message-id'));
+          }
+        }
       } catch {
         id = null;
       }
@@ -1044,7 +1137,9 @@
         order: userCandidates[c].order,
         createTime: userCandidates[c].createTime,
         rawText: userCandidates[c].rawText,
+        ...(userCandidates[c].markdown ? { markdown: true } : {}),
         ...(userCandidates[c].attachments ? { attachments: userCandidates[c].attachments } : {}),
+        ...(userCandidates[c].parentId ? { parentId: userCandidates[c].parentId, parentExact: userCandidates[c].parentExact === true } : {}),
         renderedHtml: ''
       });
     }
@@ -1063,10 +1158,22 @@
         // lost while the visible remainder ends as an unclosed box. The canonical raw text is
         // always carried beside this, so an absent capture costs presentation, never content.
         const markup = block.innerHTML;
-        renderedHtml =
-          markup.length <= Math.min(MAX_RENDERED_HTML, budget.remaining)
-            ? budgetedText(markup, budget, MAX_RENDERED_HTML)
-            : '';
+        if (markup.length <= Math.min(MAX_RENDERED_HTML, budget.remaining)) {
+          renderedHtml = budgetedText(markup, budget, MAX_RENDERED_HTML);
+        } else if (out[target].role === 'assistant' && id === turnEndMessageId(messages) &&
+                   exactAnchors.get(block) === id) {
+          // The native model text remains the canonical answer (#1205). For a
+          // uniquely owned completed answer, save its visible long-form prose too.
+          // A positional/ambiguous match cannot authorize this larger capture.
+          const visible = typeof block.innerText === 'string' && block.innerText.trim()
+            ? block.innerText : block.textContent || '';
+          const escaped = visible.trim().replace(/&/g, '&amp;').replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;').replace(/\r\n?/g, '\n').replace(/\n/g, '<br>');
+          const compact = `<div>${escaped}</div>`;
+          if (visible.trim() && compact.length <= Math.min(MAX_LARGE_FINAL_HTML, budget.remaining)) {
+            renderedHtml = budgetedText(compact, budget, MAX_LARGE_FINAL_HTML);
+          }
+        }
       } catch {
         renderedHtml = '';
       }
@@ -1294,6 +1401,24 @@
   }
 
   /** The connector a result came back through, and whether it came back at all. */
+  /**
+   * Every connector result row's identity in these messages, ours or not: request id, app id,
+   * link id and the name ChatGPT shows. The app learns its own connectors from these, but only
+   * for request ids it served itself (connector-identity.ts). No arguments or result bytes.
+   */
+  function sightingsOf(messages) {
+    const out = [];
+    if (!Array.isArray(messages)) return out;
+    for (let at = 0; at < messages.length && out.length < 50; at++) {
+      const message = messages[at];
+      if (!message || message.author?.role !== 'tool' || message.author.name !== 'api_tool.call_tool') continue;
+      const result = resultOf(message), requestId = str(message.metadata?.request_id), appId = appIdOf(result?.resource);
+      if (!requestId || !appId) continue;
+      out.push({ requestId, appId, linkId: linkIdOf(result.resource), appName: result.app });
+    }
+    return out;
+  }
+
   function resultOf(message) {
     if (!message || typeof message !== 'object') return null;
     const meta = message.metadata;
@@ -1318,7 +1443,7 @@
     }
     for (const message of messages || []) {
       const result = resultOf(message);
-      if (!result || !ourApp(result.app)) continue;
+      if (!result || !ownResult(result)) continue;
       const visited = new Set();
       let id = str(message.metadata?.parent_id), parentId = null;
       while (id && visited.size < MAX_CALLS && !visited.has(id)) {
@@ -1345,7 +1470,7 @@
     const result = resultOf(message);
     const messageId = str(message.id), requestId = str(message.metadata?.request_id);
     const tool = result && toolName(result.resource);
-    if (!result || !ourApp(result.app) || !messageId || !requestId || !tool) return null;
+    if (!result || !ownResult(result) || !messageId || !requestId || !tool) return null;
     return { ...result, messageId, requestId, tool, createTime: num(message.create_time) };
   }
   /** Exact number of this app's own invocations represented by the whole turn, or null. */
@@ -1365,12 +1490,12 @@
     for (let at = 0; at < messages.length; at++) {
       const message = messages[at];
       const request = requestOf(message);
-      if (request && ourPath(request.path)) {
+      if (request && ownRequestPath(request.path)) {
         remember(request.messageId);
       }
 
       const result = resultOf(message);
-      if (result && ourApp(result.app)) {
+      if (result && ownResult(result)) {
         remember(resultParents.get(message) || completedCallOf(message)?.messageId);
       }
     }
@@ -1427,7 +1552,7 @@
     // Never borrow a neighbor's result to complete that request or a still-running group.
     if (request && !result && group.isCompletionRequestInProgress === false && messages.length === 2 &&
         messages[0].status === 'finished_successfully' && messages[1].status === 'finished_successfully' &&
-        !conflictingRequestScope(messages[0], messages[1]) && ourPath(request.path)) {
+        !conflictingRequestScope(messages[0], messages[1]) && ownRequestPath(request.path)) {
       const displayed = completedCallOf(messages[1]);
       if (displayed && displayed.requestId === request.requestId && identify(request, displayed) === displayed.tool) completed = displayed;
     }
@@ -1435,7 +1560,7 @@
       resource: completed.resource, messageId: completed.messageId, turnId: str(group.turnId),
       conversationId: str(group.clientThreadId) || str(group.conversationId), createTime: completed.createTime,
       hidden: int(own.call(group, 'collapsedSameToolCallCount') ? group.collapsedSameToolCallCount : null),
-      localCount, answered: true };
+      localCount, answered: true, own: ownResult(completed) };
     if (!request) return null;
 
     /**
@@ -1463,7 +1588,9 @@
       // Turn-wide cardinality only. No request arguments or message bodies cross worlds.
       localCount,
       /** Whether the page has shown a result for the representative call yet. */
-      answered: result !== null
+      answered: result !== null,
+      /** Whether this row is one of this install's connectors (app id, link, then name). */
+      own: result ? ownResult(result) : ownRequestPath(request.path)
     };
   }
 
@@ -1561,7 +1688,7 @@
     for (let at = 0; at < messages.length && answered.size < MAX_CALLS; at++) {
       const message = messages[at];
       const result = resultOf(message);
-      if (!result || !ourApp(result.app)) continue;
+      if (!result || !ownResult(result)) continue;
       const parent = resultParents.get(message);
       if (parent) answered.add(parent);
     }
@@ -1570,7 +1697,7 @@
     for (let at = 0; at < messages.length && out.length < MAX_CALLS; at++) {
       const request = requestOf(messages[at]);
       const completed = request ? null : completedCallOf(messages[at]);
-      if ((!request || !ourPath(request.path)) && !completed) continue;
+      if ((!request || !ownRequestPath(request.path)) && !completed) continue;
       const tool = completed ? completed.tool : toolName(request.path);
       const id = completed ? completed.messageId : request.messageId;
       if (!tool || !id) continue;
@@ -1691,7 +1818,7 @@
         const app = invocation ? str(invocation.server) : null;
         const tool = invocation ? toolName(str(invocation.tool)) : null;
         const id = str(item.callId);
-        if (!app || !ourApp(app) || !tool || !id) continue;
+        if (!app || !ownServerName(app) || !tool || !id) continue;
         if (seen.has(id)) duplicated.add(id);
         seen.add(id);
         out.push({
@@ -1787,7 +1914,7 @@
   }
   /** #318 identified the history cache. Both sources project only explicitly named
    * messages. Typed public items own presentation; cache text cannot supply a final. */
-  function shellRequestMetadata(fiber, queries, shell, conversation) {
+  function shellRequestMetadata(fiber, queries, shell, conversation, sightings = []) {
     if (conversation.conflict) return [];
     const entry = shell.entry;
     const ids = entry.turn.messageIds;
@@ -1826,7 +1953,7 @@
       const message = messageAt(id);
       if (message?.author?.role === 'assistant' && message.recipient === 'functions.exec') invocationIds.add(id);
     }
-    const serverName = name => OUR_APPS.find(app => name === app || name === app.replaceAll(' ', '_'));
+    const serverName = name => ownServerName(name);
     for (const call of shell.calls) {
       const reference = shell.callSources.get(call.messageId);
       if (!reference?.id || !selected.has(reference.id) || sourceCounts.get(reference.id) !== 1) continue;
@@ -1854,6 +1981,8 @@
       if (typeof id !== 'string' || !id || id.length > MAX_TEXT || !own.call(mapping, id)) continue;
       const node = Object.getOwnPropertyDescriptor(mapping, id)?.value, message = node?.message;
       if (node?.id !== id || message?.id !== id) continue;
+      // The stripped entries below carry no app identity; read it here, ids only (sightingsOf).
+      for (const sighting of sightingsOf([message])) if (sightings.length < 50 && !sightings.some(prior => prior.requestId === sighting.requestId && prior.appId === sighting.appId)) sightings.push(sighting);
       const request = str(message.metadata?.request_id), cached = data?.mapping?.[id]?.message;
       if (live && cached?.id === id && request && cached.metadata?.request_id && cached.metadata.request_id !== request) return [];
       const publicMessage = selected.has(id) && message.author?.role === 'assistant' && !hiddenMessage(message) &&
@@ -1867,6 +1996,24 @@
         ...(preamble ? { preamble: budgetedText(preamble, publicBudget, MAX_RENDERED_TEXT),
           publicIdentity: { parent_id: str(message.metadata?.parent_id), working_turn_id: str(message.metadata?.working_turn_id),
             turn_exchange_id: str(message.metadata?.turn_exchange_id) } } : {}) });
+    }
+    // A result row can sit outside the turn's message ids (a new chat, measured 2026-10-11). Find
+    // the result rows of this turn's own request ids anywhere in the mapping; bounded, ids only.
+    const turnRequests = new Set();
+    for (const entry of out) if (entry.metadata.request_id) turnRequests.add(entry.metadata.request_id);
+    if (turnRequests.size && sightings.length < 50) {
+      const known = new Set(sightings.map(sighting => `${sighting.requestId} ${sighting.appId}`));
+      let visited = 0;
+      for (const key in mapping) {
+        if (++visited > 5000 || sightings.length >= 50) break;
+        if (!own.call(mapping, key)) continue;
+        const message = Object.getOwnPropertyDescriptor(mapping, key)?.value?.message;
+        if (!message || !turnRequests.has(str(message.metadata?.request_id))) continue;
+        for (const sighting of sightingsOf([message])) {
+          const seen = `${sighting.requestId} ${sighting.appId}`;
+          if (!known.has(seen)) { known.add(seen); sightings.push(sighting); }
+        }
+      }
     }
     return out;
   }
@@ -1914,30 +2061,206 @@
     rendered.sort((a, b) => a.order - b.order);
     return { events, notifications: [] };
   }
-  /** The newest public preamble of a running shell turn whose source message ChatGPT has not
-   * published (#942: a new chat's first turn keeps them out of every mapping until history is
-   * fetched again). Presentation only: no identity, never recorded, gone once the turn ends or
-   * its source message becomes readable and is recorded the ordinary way. */
-  function shellLivePreview(shell, metadata) {
-    if (shell.endMessageId) return null;
-    const preambles = shell.entry.turn.items.flatMap(item => item?.type === 'chatgpt-reasoning-group' &&
-      Array.isArray(item.items) && item.reasoningRecap?.type !== 'hide_all' ? item.items : []).filter(item => item?.type === 'reasoning' &&
-        item.isTransient !== true && item.presentation === 'preamble' && typeof item.content === 'string');
-    const newest = preambles.at(-1);
-    if (!newest || metadata.some(source => source.preamble === newest.content)) return null;
-    return budgetedText(visibleText(newest.content), { remaining: MAX_PREVIEW_TEXT }, MAX_PREVIEW_TEXT) || null;
+  /** A reply that is nothing but content references to other messages. */
+  const ONLY_CONTENT_REFERENCES = /^\s*(?:::chatgpt-content-reference\{[^}\n]*\}\s*)+$/;
+  /**
+   * The Markdown a shell item says. ChatGPT's newer renderer (DIL, GPT-6 on 2026-10-08) leaves
+   * only `::chatgpt-content-reference{…}` in `content` and keeps the reply itself as
+   * `fallbackMarkdown` on the one `dil` reference that names this same message: the text the page
+   * shows when its widget cannot render, so the text the model wrote. Anything else keeps its
+   * content as it is.
+   */
+  function shellItemText(item) {
+    const content = typeof item?.content === 'string' ? item.content : '';
+    if (!ONLY_CONTENT_REFERENCES.test(content)) return content;
+    const id = str(item.messageId);
+    const own = (Array.isArray(item.contentReferences) ? item.contentReferences : []).filter(reference =>
+      reference?.type === 'dil' && id && reference.source_message_id === id &&
+      typeof reference.model_dil_v2?.fallbackMarkdown === 'string' && reference.model_dil_v2.fallbackMarkdown.trim());
+    return own.length === 1 ? unescapeFallbackMarkdown(own[0].model_dil_v2.fallbackMarkdown).slice(0, MAX_RENDERED_TEXT) : content;
+  }
+  /** A display formula longer than this is not looked for; its lines are read as plain text. */
+  const MAX_FORMULA_LINES = 400;
+  /**
+   * The reply as the model wrote it. `fallbackMarkdown` keeps its formatting but backslash-escapes
+   * every literal punctuation mark in plain text (measured on GPT-6, 2026-10-09: `2\^10 = 1024 \[ok\]`,
+   * and the Goal marker as `\[\[COS\_GOAL:COMPLETE\]\]`), while code spans and fenced code keep
+   * theirs verbatim. Every reader of a reply (Goal markers, Loop decisions, compaction briefs) expects
+   * the model's own text, so outside code each `\` before ASCII punctuation is dropped, as Markdown
+   * itself would on rendering.
+   *
+   * Formulas are verbatim too (measured 2026-10-12, #1342): a display formula is a block from a line
+   * holding only `\[` to a line holding only `\]`, an inline one sits in `\( … \)`, and both hold raw
+   * LaTeX. Literal brackets are escaped inside their text line and literal parentheses never are,
+   * so neither is mistaken for one. An opening without its closing is plain text.
+   */
+  /**
+   * Entities in the fallback's plain text (measured on GPT-6, 2026-10-16: `|` arrives as `&#124;`,
+   * `&` as `&amp;`). A literal `&` is always `&amp;` there, so one left-to-right pass is exact: a
+   * literal `&#124;` the model wrote arrives as `&amp;#124;` and comes back as `&#124;`.
+   */
+  const FALLBACK_ENTITY = /^&(amp|lt|gt|quot|apos|#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6});/;
+  const NAMED_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
+  function fallbackEntity(name) {
+    if (name[0] !== '#') return NAMED_ENTITIES[name] ?? null;
+    const code = name[1] === 'x' || name[1] === 'X' ? parseInt(name.slice(2), 16) : parseInt(name.slice(1), 10);
+    return code > 0 && code <= 0x10ffff && (code < 0xd800 || code > 0xdfff) ? String.fromCodePoint(code) : null;
+  }
+  function unescapeFallbackMarkdown(markdown) {
+    const lines = markdown.split('\n');
+    const out = [];
+    let fence = null;
+    for (let index = 0; index < lines.length; index++) {
+      const line = lines[index];
+      const marker = /^ {0,3}(`{3,}|~{3,})/.exec(line)?.[1];
+      if (fence) {
+        if (marker && marker[0] === fence[0] && marker.length >= fence.length && !line.slice(line.indexOf(marker) + marker.length).trim()) fence = null;
+        out.push(line);
+        continue;
+      }
+      if (marker && !(marker[0] === '`' && line.slice(line.indexOf(marker) + marker.length).includes('`'))) { fence = marker; out.push(line); continue; }
+      if (line.trim() === '\\[') {
+        let close = -1;
+        for (let at = index + 1; at < lines.length && at <= index + MAX_FORMULA_LINES; at++) if (lines[at].trim() === '\\]') { close = at; break; }
+        if (close > index) { for (; index <= close; index++) out.push(lines[index]); index--; continue; }
+      }
+      let text = '';
+      for (let at = 0; at < line.length;) {
+        const char = line[at];
+        if (char === '\\' && line[at + 1] === '(') {
+          const close = line.indexOf('\\)', at + 2);
+          if (close >= 0) { text += line.slice(at, close + 2); at = close + 2; continue; }
+        }
+        if (char === '\\' && /[!-\/:-@[-`{-~]/.test(line[at + 1] || '')) { text += line[at + 1]; at += 2; continue; }
+        if (char === '&') {
+          const entity = FALLBACK_ENTITY.exec(line.slice(at));
+          const decoded = entity && fallbackEntity(entity[1]);
+          if (decoded !== null && decoded !== undefined) { text += decoded; at += entity[0].length; continue; }
+        }
+        if (char === '`') {
+          const run = /^`+/.exec(line.slice(at))[0];
+          const close = new RegExp(`(?<!\`)${run}(?!\`)`).exec(line.slice(at + run.length));
+          if (close) { const end = at + run.length + close.index + run.length; text += line.slice(at, end); at = end; continue; }
+          text += run; at += run.length; continue;
+        }
+        text += char; at++;
+      }
+      out.push(text);
+    }
+    return out.join('\n');
+  }
+  /**
+   * The provider's own outline of a shell turn's work, in its order: what the model said between
+   * steps, each call of this app's connectors, and the recap ChatGPT closes each round with.
+   *
+   * ChatGPT draws a turn's work as reasoning groups. Inside one, a round is the model's sentences
+   * (`assistant-message` items under GPT-6, id-less `reasoning` preambles under GPT-5.x), its calls,
+   * and a public `thought` that recaps them ("Created the test files"). In a new chat's first turn
+   * none of the sentences or recaps reach any message mapping (#942), so the outline is the only
+   * place they exist while the turn runs. It is presentation: it names no message the recorder
+   * does not already know, and the app places its recorded calls in rounds by tool and order
+   * (renderer/timeline-rounds.ts), never by an id. Hidden groups and transient reasoning stay out.
+   */
+  /**
+   * The user message that opened a shell turn, by ChatGPT's id (#1301). A message the user sends
+   * into a running answer opens a turn of its own in ChatGPT's model, while the request id of the
+   * answer runs on; the app files each turn's outline only under the local turn that message opened.
+   */
+  function shellQuestion(shell) {
+    const first = shell?.entry?.turn?.items?.[0];
+    return first?.type === 'user-message' ? str(first.messageId) || str(first.serverMessageId) || null : null;
+  }
+  function shellTurnTrace(shell) {
+    const out = [], budget = { remaining: MAX_TRACE_TEXT };
+    for (const item of shell.entry.turn.items) {
+      // The turn's answer stands outside its rounds; naming it keeps it from reading as one more sentence.
+      if (item?.type === 'assistant-message' && item.phase === 'final_answer' && str(item.messageId)) {
+        out.push({ kind: 'answer', id: str(item.messageId) });
+        continue;
+      }
+      if (item?.type !== 'chatgpt-reasoning-group' || !Array.isArray(item.items) || item.reasoningRecap?.type === 'hide_all') continue;
+      for (const step of item.items) {
+        if (out.length >= MAX_TRACE_ITEMS) return out;
+        if (step?.type === 'assistant-message') {
+          const text = shellItemText(step).trim();
+          if (!text || ONLY_CONTENT_REFERENCES.test(text)) continue;
+          const id = str(step.messageId), said = budgetedText(text, budget, MAX_TRACE_SAY);
+          if (said) out.push({ kind: 'say', ...(id ? { id } : {}), text: said, done: step.completed === true });
+        } else if (step?.type === 'reasoning' && step.isTransient !== true && typeof step.content === 'string' && step.content.trim()) {
+          if (step.presentation === 'preamble') {
+            const said = budgetedText(step.content.trim(), budget, MAX_TRACE_SAY);
+            if (said) out.push({ kind: 'say', text: said, done: step.completed !== false });
+          } else if (step.presentation === 'thought') {
+            const recap = budgetedText(visibleText(step.content), budget, MAX_TRACE_RECAP);
+            if (recap) out.push({ kind: 'recap', text: recap });
+          }
+        } else if (step?.type === 'mcp-tool-call' && ownServerName(step.invocation?.server)) {
+          const id = str(step.callId), tool = toolName(step.invocation?.tool);
+          if (id && tool) out.push({ kind: 'call', id, tool, done: step.completed === true });
+        } else if (step?.type === 'dynamic-tool-call' && step.tool === 'exec') {
+          // ChatGPT's own code mode: one item for any number of this app's calls it makes.
+          const id = str(step.callId);
+          if (id) out.push({ kind: 'exec', id, done: step.completed === true });
+        }
+      }
+    }
+    // What ChatGPT says the turn is doing right now ("Comparing three layouts…"): the open thought of
+    // the newest group, which becomes that round's recap once it closes. Only while the turn runs.
+    if (shell.entry.turn.status !== 'complete') {
+      const groups = shell.entry.turn.items.filter(item => item?.type === 'chatgpt-reasoning-group' && item.reasoningRecap?.type !== 'hide_all');
+      const active = groups.at(-1)?.activeReasoning;
+      const now = active && active.completed !== true && active.isTransient !== true && active.presentation === 'thought' &&
+        typeof active.content === 'string' ? budgetedText(visibleText(active.content), budget, MAX_TRACE_RECAP) : '';
+      if (now) out.push({ kind: 'now', text: now });
+    }
+    return out;
   }
   /** Translate only publicly identified items in the mounted exchange. Missing item ids
    * stay missing; a stopped turn does not manufacture replies to its tool calls. */
+  /**
+   * Where a shell turn's question sits in ChatGPT's message tree (Edit & resubmit, #365). The shell
+   * model carries no parent ids, but the thread's ordered `entries` (a few levels up) does: the
+   * question follows the previous turn's last message, and the first turn follows the root. Two
+   * questions after the same message are versions of one: a thread holds one question after each
+   * message. "root" is weaker, since a thread list that starts later would call its first turn the
+   * root too; there only ChatGPT's versions control (its handler asks the versions endpoint) proves
+   * it. ChatGPT draws that control only once the page is loaded again after an edit (live 2.1.41).
+   */
+  function shellQuestionPlace(fiber, entry, section) {
+    let entries = null, index = -1;
+    for (let at = fiber, up = 0; at && up < 40; up++, at = at.return) {
+      const list = at.memoizedProps?.entries;
+      if (!Array.isArray(list)) continue;
+      // The same entry, or the same turn re-rendered as a new object; one match only.
+      const matches = list.reduce((found, item, at) => item === entry || (item?.id && item.id === entry.id) ? [...found, at] : found, []);
+      if (matches.length === 1) { entries = list; index = matches[0]; break; }
+    }
+    if (!entries || index < 0) return null;
+    const previous = index > 0 ? entries[index - 1]?.turn?.messageIds : null;
+    const parentId = index === 0 ? 'root' : Array.isArray(previous) && previous.length ? str(previous[previous.length - 1]) : null;
+    if (!parentId) return null;
+    let versioned = false;
+    for (const button of section.querySelectorAll('button')) {
+      if (button.closest('[data-turn-key]') !== section) continue;
+      const onClick = fiberOf(button)?.memoizedProps?.onClick;
+      if (typeof onClick === 'function' && /usesVersionsEndpoint/.test(Function.prototype.toString.call(onClick))) { versioned = true; break; }
+    }
+    return { parentId, versioned: versioned || parentId !== 'root' };
+  }
+
   function shellTurnSource(fiber, section, turnId) {
-    let entry = null;
+    let entry = null, entryFiber = null;
     for (let at = fiber, up = 0; at && up < 16; up++, at = at.return) {
-      if (Array.isArray(at.memoizedProps?.entry?.turn?.items)) { entry = at.memoizedProps.entry; break; }
+      if (Array.isArray(at.memoizedProps?.entry?.turn?.items)) { entry = at.memoizedProps.entry; entryFiber = at; break; }
     }
     if (!entry || !turnId || entry.id !== turnId || entry.turn.items.length > MAX_ROWS) return null;
+    const place = shellQuestionPlace(entryFiber, entry, section);
     const messages = [], calls = [], slots = [], seen = new Set(), callSources = new Map(), executionIds = [], images = new Map();
-    let lastAnswer = null;
+    let lastAnswer = null, previousId = null;
     const remember = id => { if (!id || seen.has(id)) return false; seen.add(id); return true; };
+    // GPT-6 (2026-10-12) writes each interim sentence as an assistant message inside the working
+    // group while the turn runs. A top-level item owns its id; a nested copy of it is not read twice.
+    const topLevel = new Set(entry.turn.items.filter(item => item?.type === 'assistant-message').map(item => str(item.messageId)).filter(Boolean));
     let work = 0;
     for (const [index, item] of entry.turn.items.entries()) {
       if (++work > MAX_ROWS) return null;
@@ -1945,13 +2268,19 @@
         const user = item.type === 'user-message', id = str(item.messageId) || (user ? str(item.serverMessageId) : null);
         if (!id) continue;
         if (!remember(id) || (user && item.serverMessageId && item.messageId && item.serverMessageId !== item.messageId)) return null;
-        const role = user ? 'user' : 'assistant', text = user ? item.message : item.content;
+        const role = user ? 'user' : 'assistant', text = user ? item.message : shellItemText(item);
         const final = !user && item.phase === 'final_answer';
         if (final) lastAnswer = item;
         const completed = final && item.completed === true && entry.turn.status === 'complete';
         messages.push({ id, author: { role }, content: { content_type: 'text', parts: [typeof text === 'string' ? text : ''] },
           channel: user ? null : final ? 'final' : 'commentary', end_turn: completed,
-          status: completed ? 'finished_successfully' : 'in_progress', metadata: {} });
+          status: completed ? 'finished_successfully' : 'in_progress',
+          // The turn's place belongs to its first message. A message sent into the running answer
+          // follows the message before it in this turn; given the turn's place it read as a version
+          // of the turn's question, and Edit & resubmit folded that question away (2.1.41 round).
+          metadata: !user ? {} : previousId ? { parent_id: previousId, clf_parent_exact: true }
+            : place ? { parent_id: place.parentId, clf_parent_exact: place.versioned } : {} });
+        previousId = id;
         const key = `${turnId}:${index}:${role}`;
         const nodes = [...section.querySelectorAll('[data-content-search-unit-key]')].filter(node =>
           node.closest('[data-turn-key]') === section && node.getAttribute('data-content-search-unit-key') === key);
@@ -1972,6 +2301,14 @@
         const steps = item?.type === 'chatgpt-reasoning-group' && Array.isArray(item.items) ? item.items : [item];
         for (const step of steps) {
           if (++work > MAX_ROWS) return null;
+          if (step?.type === 'assistant-message' && item !== step) {
+            // Interim prose whatever phase it carries: only a top-level answer can end the turn.
+            const id = str(step.messageId), text = shellItemText(step);
+            if (!id || topLevel.has(id) || !remember(id) || !text || ONLY_CONTENT_REFERENCES.test(text)) continue;
+            messages.push({ id, author: { role: 'assistant' }, content: { content_type: 'text', parts: [text] },
+              channel: 'commentary', end_turn: false, status: step.completed === true ? 'finished_successfully' : 'in_progress', metadata: {} });
+            continue;
+          }
           if (step?.type === 'dynamic-tool-call' && step.tool === 'exec') {
             const id = str(step.callId);
             if (!id) continue;
@@ -1979,8 +2316,7 @@
             executionIds.push(id);
             continue;
           }
-          if (step?.type !== 'mcp-tool-call' || !OUR_APPS.some(app =>
-            step.invocation?.server === app || step.invocation?.server === app.replaceAll(' ', '_'))) continue;
+          if (step?.type !== 'mcp-tool-call' || !ownServerName(step.invocation?.server)) continue;
           const id = str(step.callId), tool = toolName(step.invocation?.tool);
           if (!id || !tool) continue;
           if (!remember(id) || calls.length >= MAX_CALLS) return null;
@@ -1999,7 +2335,7 @@
       entry.turn.items.filter(item => item?.type === 'generated-image').every(item =>
         images.has(item) && item.status === 'completed' && item.isPreview !== true)
       ? lastAnswer.chatGptMessageId : null;
-    return { entry, messages, calls, slots, callSources, executionIds, images,
+    return { entry, place, messages, calls, slots, callSources, executionIds, images,
       endMessageId: imageAnswer ? imageEnd : turnEndMessageId(messages) };
   }
   /**
@@ -2036,6 +2372,8 @@
     const desiredMessageStamps = new Map();
     // An exchange whose user slot the shell did not render (see below, `data-clf-fiber-user`).
     const desiredUserStamps = new Map();
+    // A chat's first exchange while it runs without its question (see below, `data-clf-fiber-first`).
+    const desiredFirstStamps = new Map();
     const desiredThoughtStamps = new Map();
     const desiredImageStamps = new Map();
     const groups = [];
@@ -2097,7 +2435,8 @@
         const calls = legacyCalls.length ? legacyCalls : group.search ? viewCallsOf(fiber) : legacyCalls;
         const queries = shell ? shellQueries(fiber) : [];
         const conversation = shell ? shellConversation(queries, shell.entry.conversationId, conversationEvidenceOf(fiber)) : conversationEvidenceOf(fiber);
-        const metadata = shell ? shellRequestMetadata(fiber, queries, shell, conversation) : messages;
+        const shellSightings = [];
+        const metadata = shell ? shellRequestMetadata(fiber, queries, shell, conversation, shellSightings) : messages;
         const requests = requestIdsOf(metadata);
         if (shell) for (const call of calls) {
           const invocation = metadata.find(message => message.id === call.messageId);
@@ -2117,7 +2456,7 @@
         const generatedImages = generatedImagesOf(group.sections, messages, exactImageNodes, shell?.images);
         const activities = nativeActivities.events;
         const endMessageId = shell ? shell.endMessageId : turnEndMessageId(messages);
-        const preview = shell ? shellLivePreview(shell, metadata) : null;
+        const trace = shell ? shellTurnTrace(shell) : [];
         // The shell supplies the completed final item's own exact message id,
         // without the classic thought-parent/timestamp tuple. Preserve that
         // identity for handoff capture; streaming and cancelled items stay weak.
@@ -2129,7 +2468,7 @@
           codeModeCalls.length === 0 && calls.length === 0 &&
           requests.length === 0 &&
           renderedMessages.length === 0 &&
-          activities.length === 0 && nativeActivities.notifications.length === 0 && generatedImages.length === 0 && !endMessageId && !preview
+          activities.length === 0 && nativeActivities.notifications.length === 0 && generatedImages.length === 0 && !endMessageId && trace.length === 0
         ) continue;
         const index = out.length;
         entry = {
@@ -2142,11 +2481,13 @@
           calls,
           codeModeCalls,
           requests,
+          sightings: shell ? shellSightings : sightingsOf(metadata),
           messages: renderedMessages,
           activities,
           thoughtNotifications: nativeActivities.notifications,
           images: generatedImages,
-          ...(preview ? { preview } : {})
+          ...(trace.length ? { trace } : {}),
+          ...(shellQuestion(shell) ? { question: shellQuestion(shell) } : {})
         };
         // The isolated-world renderer needs to know which visible section this exact Fiber
         // turn descriptor came from. Remember the desired ephemeral scan index now and apply
@@ -2173,6 +2514,12 @@
           if (!conversation.conflict && !userSlot && users.length === 1 && users[0].rawMessageId) {
             desiredUserStamps.set(section, `${scanToken}:${index}:${encodeURIComponent(users[0].rawMessageId)}`);
           }
+          // A chat's first exchange can hold no user message at all while it runs (2026-10-19:
+          // ChatGPT draws it under `fallback-turn-0` with only its reasoning group until the turn
+          // completes). Its place is exact even so: the conversation's first exchange answers the
+          // conversation's first question. Say only that; the question's id stays the app's.
+          if (!conversation.conflict && !userSlot && !users.length && shell.place?.parentId === 'root' &&
+              shell.entry.turn.status === 'in_progress') desiredFirstStamps.set(section, `${scanToken}:${index}`);
           // Busy hint only, never a completion receipt or a Stop action target.
           const running = shell.entry.turn.status === 'in_progress' ? location.pathname : null;
           if (running && section.getAttribute('data-clf-shell-running') !== running) section.setAttribute('data-clf-shell-running', running);
@@ -2260,6 +2607,11 @@
         if (wantedUser === undefined) {
           if (currentUser !== null) section.removeAttribute('data-clf-fiber-user');
         } else if (currentUser !== wantedUser) section.setAttribute('data-clf-fiber-user', wantedUser);
+        const wantedFirst = desiredFirstStamps.get(section);
+        const currentFirst = section.getAttribute('data-clf-fiber-first');
+        if (wantedFirst === undefined) {
+          if (currentFirst !== null) section.removeAttribute('data-clf-fiber-first');
+        } else if (currentFirst !== wantedFirst) section.setAttribute('data-clf-fiber-first', wantedFirst);
         for (const stamped of [section, ...section.querySelectorAll('[data-content-search-unit-key], [data-chatgpt-search-unit-key]')]) {
           const wanted = desiredTurnStamps.get(stamped);
           const current = stamped.getAttribute('data-clf-fiber-turn');
@@ -2405,6 +2757,12 @@
     return /^(?:pro|(?:gpt-?)?\d+(?:[.-]\d+)?-pro)$/.test(normalized);
   }
 
+  /** A shell lane's transport effort when its label is translated. The Extra High lane sends max
+   * (English and German pages alike, 2026-10-09), as the September picker's non-Work max did. */
+  function shellLaneTransportEffort(value) {
+    return ({ none:'none', minimal:'minimal', low:'low', medium:'medium', high:'high', xhigh:'xhigh', max:'xhigh' })[value] ?? null;
+  }
+
   // The native closed picker does not mount composerIntelligencePickerState.
   // Its own ancestor carries the current execution model; its visible label
   // carries the selected effort. These are observation, never catalog discovery.
@@ -2419,9 +2777,12 @@
       // The shell picker's selected lane carries the visible effort name: the machine
       // attribute reports its transport value (medium/max) for Pro/Extra High lanes.
       const sel = fiber.memoizedProps?.selectedPowerSelection ?? fiber.memoizedProps?.selectedLabelCandidate;
-      if (lane === null && sel) lane = { model: sel.model,
-        effort: ({ instant:'none', minimal:'minimal', low:'low', medium:'medium', high:'high',
-          'extra high':'xhigh', max:'max', ultra:'ultra', pro:'pro' })[String(sel.labels?.effort ?? sel.sliderLabel ?? '').trim().toLowerCase()] ?? null };
+      if (lane === null && sel) {
+        const caption = String(sel.labels?.effort ?? sel.sliderLabel ?? '').trim().toLowerCase();
+        lane = { model: sel.model,
+          effort: ({ instant:'none', minimal:'minimal', low:'low', medium:'medium', high:'high',
+            'extra high':'xhigh', max:'max', ultra:'ultra', pro:'pro' })[caption] ?? (caption ? shellLaneTransportEffort(sel.reasoningEffort) : null) };
+      }
       const current = fiber.memoizedProps?.currentModelId;
       if (current === undefined) continue;
       if (typeof current !== 'string' || !/^[a-zA-Z0-9._-]{1,80}$/.test(current) || (model && model !== current)) return null;
@@ -2489,19 +2850,38 @@
       // The machine reasoningEffort is a lane's transport setting, not its identity: the
       // Pro and Extra High lanes still report medium/max. The lane's visible label is what
       // the picker offers, matching readPickerSnapshot's modelLane/thinkingEffort mapping.
+      // A translated label ("Sehr hoch") falls back to that transport value, where max is Extra High.
       const laneEffort = c => shellProExecutionModel(c?.model) ? 'pro' :
-        effort(String(c?.labels?.effort ?? c?.sliderLabel ?? '').trim().toLowerCase()) ?? effort(c?.reasoningEffort);
+        effort(String(c?.labels?.effort ?? c?.sliderLabel ?? '').trim().toLowerCase()) ??
+        ((c?.labels?.effort ?? c?.sliderLabel) ? shellLaneTransportEffort(c?.reasoningEffort) : effort(c?.reasoningEffort));
       const current = options.filter(o => o?.selected === true);
       if (current.length !== 1) return null;
       const version = group(current[0].id);
       const versions = options.filter(o => o && o.disabled !== true).map(o => ({ id: group(o.id), label: label(o.label) }));
+      // The shell names older models by number alone ("5.6"); the September picker's own rule
+      // names them in full, so the list reads GPT-6, GPT-5.6, GPT-5.5 alike.
+      const modelName = value => { const name = label(value); return name && /^\d/.test(name) ? `GPT-${name}` : name; };
       const choices = p.powerSelections.map(c => ({ bucket: c?.powerSettingIndex, id: id(c?.model),
-        label: label(c?.modelLabel), familyId: id(c?.model), familyLabel: label(c?.modelLabel), effort: laneEffort(c),
+        label: modelName(c?.modelLabel), familyId: id(c?.model), familyLabel: modelName(c?.modelLabel), effort: laneEffort(c),
         available: p.modelSelectionDisabled !== true && c?.disabled !== true &&
           (!c?.availability || c.availability.status === 'available') && !p.modelSwitcherDenialsBySlug?.[c?.model] }));
       if (!version || !versions.length || versions.some(v => !v.id || !v.label) || !choices.length ||
           choices.some(c => !Number.isInteger(c.bucket) || !c.id || !c.label || !c.effort) ||
           new Set(versions.map(v => v.id)).size !== versions.length || new Set(choices.map(c => c.bucket)).size !== choices.length || !versions.some(v => v.id === version)) return null;
+      // One model's Instant and thinking lanes are separate slugs under one name (gpt-6 and
+      // gpt-6-thinking, both "GPT-6"; observed 2026-10-07). They are one family, as the September
+      // picker had them, so the effort control offers Instant, Medium and High together. Lanes join
+      // only under one name in this version and with distinct efforts: a mixed group never merges.
+      // GPT-6's Instant lane is ChatGPT's automatic `gpt-6`, which its server may answer with the
+      // thinking lane; the fixed `gpt-6-instant` exists but no native view offers it (2026-10-08).
+      for (const name of new Set(choices.map(c => c.label))) {
+        const lanes = choices.filter(c => c.label === name);
+        if (lanes.length < 2 || new Set(lanes.map(c => c.effort)).size !== lanes.length) continue;
+        const shared = lanes.map(c => c.id).reduce((a, b) => { let i = 0; while (i < a.length && a[i] === b[i]) i++; return a.slice(0, i); })
+          .replace(/[-._]+$/, '');
+        const family = id(shared) && /\d/.test(shared) ? shared : lanes[0].id;
+        for (const lane of lanes) lane.familyId = family;
+      }
       const matches = choices.filter(c => c.id === id(selected.model) && c.effort === laneEffort(selected));
       if (matches.length !== 1 || (selected.powerSettingIndex !== undefined && selected.powerSettingIndex !== matches[0].bucket)) return null;
       return { version, currentBucket: matches[0].bucket, versions, choices };
@@ -2580,8 +2960,11 @@
       }
     }
     if (!connector || !Array.isArray(connector.actions) || typeof connector.name !== 'string') return null;
-    const externalPlugins = pluginsConnectorName(connector.name);
-    if ((!connector.actions.length && !externalPlugins) || connector.actions.length > (externalPlugins ? 257 : 16)) return null;
+    const externalPlugins = pluginsConnectorApp(connector.name, connector.id);
+    // A sanity bound, not a catalog: the app's own Core and Desktop declare a few dozen tools at most
+    // (Windows Desktop 24 in 2.1.44, which the old bound of 16 refused, #1763); Plugins holds every
+    // enabled external plugin's tools. A test keeps 64 above what Core and Desktop declare.
+    if ((!connector.actions.length && !externalPlugins) || connector.actions.length > (externalPlugins ? 257 : 64)) return null;
     const budget = { bytes: PLUGIN_SCHEMA_READ_BYTES, nodes: 20000 };
     // Measured 2026-09-27: this page sends `description_model: ""` rather than null, so `??`
     // read every declaration as empty and no refresh could ever match the published schema.
@@ -2626,8 +3009,8 @@
         if (props.actions === observedActions) continue;
         if (observedActions) return null;
         observedActions = props.actions;
-        const externalPlugins = pluginsConnectorName(props.connector.name);
-        if ((!props.actions.length && !externalPlugins) || props.actions.length > (externalPlugins ? 257 : 16) || typeof props.connector.name !== 'string') return null;
+        const externalPlugins = pluginsConnectorApp(props.connector.name, props.connector.id);
+        if ((!props.actions.length && !externalPlugins) || props.actions.length > (externalPlugins ? 257 : 64) || typeof props.connector.name !== 'string') return null;
         const budget = { bytes: PLUGIN_SCHEMA_READ_BYTES, nodes: 20000 };
         const tools = props.actions.map(action => ({ name: action.name, description: copySchema(action.description_model ?? action.description, budget), inputSchema: copySchema(action.params, budget) }));
         if (tools.some(tool => !NAME.test(tool.name) || typeof tool.description !== 'string' || !tool.inputSchema || tool.inputSchema.type !== 'object') ||
@@ -2643,17 +3026,92 @@
     return { ...result, refreshAvailable: !!control };
   }
 
+  /**
+   * Branch in new chat (#482): marks ChatGPT's own "new chat" entry in the open Branch submenu.
+   *
+   * The submenu's entries differ only by label and handler: Work mode's handler names its
+   * upsell/work surface, the new chat's does not. Labels are translated, so the handler decides,
+   * and exactly one entry must qualify. Reads handler source only; calls nothing.
+   */
+  function markBranchNewChat(nonce) {
+    const triggers = [...document.querySelectorAll('[role="menuitem"][aria-haspopup="menu"][aria-expanded="true"]')]
+      .filter(item => item.querySelector('svg use[href*="#branch"]'));
+    if (triggers.length !== 1) return 0;
+    const menu = document.getElementById(triggers[0].getAttribute('aria-controls') || '');
+    if (!menu) return 0;
+    const items = [...menu.querySelectorAll('[role="menuitem"]')];
+    const handler = item => {
+      let fiber = null;
+      for (const key in item) if (key.indexOf('__reactFiber$') === 0) { fiber = item[key]; break; }
+      for (let depth = 0; fiber && depth < 24; depth++, fiber = fiber.return) {
+        const onSelect = fiber.memoizedProps && fiber.memoizedProps.onSelect;
+        if (typeof onSelect === 'function') return Function.prototype.toString.call(onSelect);
+      }
+      return null;
+    };
+    for (const item of items) item.removeAttribute('data-clf-branch-new-chat');
+    const plain = items.filter(item => { const source = handler(item); return typeof source === 'string' && !/work/i.test(source); });
+    if (plain.length !== 1) return plain.length;
+    plain[0].setAttribute('data-clf-branch-new-chat', nonce);
+    return 1;
+  }
+
+  /**
+   * Edit & resubmit (#365): marks the Edit control of one question with `nonce`, chosen by handler
+   * (ChatGPT's own edit action on a user message), never by its translated label. The question's
+   * turn is `[data-turn-key=<id>]` on the newer shell (its key is the question's id), or the turn
+   * holding `[data-message-id=<id>]` on the older page. Returns how many controls matched; only
+   * exactly one is marked.
+   */
+  function markQuestionEdit(nonce, messageId) {
+    if (typeof messageId !== 'string' || !/^[0-9a-f-]{36}$/i.test(messageId)) return 0;
+    for (const node of document.querySelectorAll('[data-clf-edit]')) node.removeAttribute('data-clf-edit');
+    const keyed = [...document.querySelectorAll('[data-turn-key]')].filter(node => node.getAttribute('data-turn-key') === messageId);
+    const legacy = [...document.querySelectorAll('[data-message-id]')].filter(node => node.getAttribute('data-message-id') === messageId)
+      .map(node => node.closest('[data-testid^="conversation-turn"], article'));
+    const turns = [...new Set([...keyed, ...legacy].filter(Boolean))];
+    if (turns.length !== 1) return 0;
+    const handler = button => {
+      let fiber = null;
+      for (const key in button) if (key.indexOf('__reactFiber$') === 0) { fiber = button[key]; break; }
+      for (let depth = 0; fiber && depth < 8; depth++, fiber = fiber.return) {
+        const onClick = fiber.memoizedProps && fiber.memoizedProps.onClick;
+        if (typeof onClick === 'function') return Function.prototype.toString.call(onClick);
+      }
+      return '';
+    };
+    const edits = [...turns[0].querySelectorAll('button')].filter(button => {
+      const source = handler(button);
+      return /action:\s*"edit"/.test(source) && /surface:\s*"user_message"/.test(source);
+    });
+    if (edits.length === 1) edits[0].setAttribute('data-clf-edit', nonce);
+    return edits.length;
+  }
+
   const listener = (event) => {
     // Only this window, only our own request shape. Anything else is not ours to answer.
     if (event.source !== window) return;
     const data = event.data;
-    if (!data || typeof data !== 'object' || ![ASK, 'clf-picker-ask', 'clf-plugin-ask'].includes(data.source)) return;
+    if (!data || typeof data !== 'object' || ![ASK, 'clf-picker-ask', 'clf-plugin-ask', 'clf-branch-ask', 'clf-edit-ask'].includes(data.source)) return;
     const nonce = typeof data.nonce === 'string' ? data.nonce.slice(0, 64) : '';
     if (!nonce) return;
     adoptAppNames(data.apps);
+    adoptAppIds(data.appIds);
     const previousPaths = currentPaths;
     currentPaths = new WeakMap();
     try {
+    if (data.source === 'clf-branch-ask') {
+      let marked = 0;
+      try { marked = markBranchNewChat(nonce); } catch { /* An unknown menu shape marks nothing. */ }
+      post({ source: 'clf-branch-reply', nonce, v: 1, marked }, location.origin);
+      return;
+    }
+    if (data.source === 'clf-edit-ask') {
+      let marked = 0;
+      try { marked = markQuestionEdit(nonce, data.messageId); } catch { /* An unknown turn shape marks nothing. */ }
+      post({ source: 'clf-edit-reply', nonce, v: 1, marked }, location.origin);
+      return;
+    }
     if (data.source === 'clf-plugin-ask') {
       let plugin = null;
       try { plugin = pluginSnapshot(); } catch { /* Unrecognized installed settings. */ }

@@ -11,8 +11,10 @@ type View = { label: string; glyph: string; available: () => boolean;
   show: (mount: HTMLElement) => void; hide: () => void };
 type TerminalView = { show: (mount: HTMLElement, createIfEmpty: boolean) => void;
   hide: () => void; canCreate: () => boolean; newTab: () => string | null;
-  tabs: () => { id: string; title: string; exited: boolean }[];
-  selectTab: (id: string) => void; closeTab: (id: string) => void };
+  tabs: () => { id: string; title: string; exited: boolean; previous?: boolean }[];
+  selectTab: (id: string) => void; closeTab: (id: string) => void;
+  /** Index among the terminals only; the saved order follows it. */
+  moveTab: (id: string, index: number) => void };
 type BottomTerminalView = Pick<TerminalView, 'show' | 'hide'>;
 
 /** The right dock owns tool selection; the bottom dock owns its own terminal view. */
@@ -40,7 +42,17 @@ export function createWorkspaceDocks(host: HTMLElement) {
   ui(expandToggle, 'aria-label', () => t(expanded ? 'Restore right panel' : 'Expand right panel'));
   expandToggle.hidden = true;
   const controls = el('div', 'header-dock-controls'); controls.append(expandToggle, bottomToggle, rightToggle);
-  document.getElementById('headerConnect')!.after(controls);
+  // The layout toggles live at the right end of the title bar. Where the system's own caption buttons
+  // share that end (Windows), the bar's right padding reserves their width (env(titlebar-area-*)); a
+  // divider then keeps the two groups apart. Electron's windowControlsOverlay reports no geometry, so
+  // the padding the CSS resolved is the source.
+  const topbar = document.querySelector<HTMLElement>('.app-topbar')!;
+  topbar.append(controls);
+  const markCaption = (): void => {
+    controls.classList.toggle('is-beside-caption', parseFloat(window.getComputedStyle(topbar).paddingRight) > 24);
+  };
+  window.addEventListener('resize', markCaption);
+  markCaption();
 
   const right = el('aside', 'work-dock work-dock-right'); right.id = 'workDockRight'; right.hidden = true;
   ui(right, 'aria-label', () => t('Right panel'));
@@ -114,11 +126,12 @@ export function createWorkspaceDocks(host: HTMLElement) {
     for (const kind of ['review', 'terminal', 'files', 'agents'] as DockView[]) {
       const enabled = kind === 'terminal' ? rightTerminal?.canCreate() ?? false : views.get(kind)?.available() ?? false;
       // A greyed-out entry says why, instead of leaving the user to guess.
-      const reason = enabled ? '' : kind === 'agents' ? t('Open a chat to see its sub-agents') : t('Open a project to use Files and Review');
       for (const button of [menu, launch].map(root => root.querySelector<HTMLButtonElement>(`[data-view="${kind}"]`))) {
         if (!button) continue;
         button.toggleAttribute('disabled', !enabled);
-        if (reason) button.title = reason; else button.removeAttribute('title');
+        // Bound, so the reason follows a language change; an enabled entry has no title.
+        ui(button, 'title', () => enabled ? '' : kind === 'agents' ? t('Open a chat to see its sub-agents') : t('Open a project to use Files and Review'));
+        if (enabled) button.removeAttribute('title');
       }
     }
   };
@@ -137,7 +150,7 @@ export function createWorkspaceDocks(host: HTMLElement) {
     const terminalTabs = rightTerminal?.tabs() ?? [];
     // Selection alone updates the pills in place; rebuilding them on every click reset hover and
     // focus and repainted the whole strip. Only a change of tabs, order or titles rebuilds.
-    const signature = `${opened.join(',')}|${terminalTabs.map(tab => `${tab.id}:${tab.title}:${tab.exited}`).join(',')}`;
+    const signature = `${opened.join(',')}|${terminalTabs.map(tab => `${tab.id}:${tab.title}:${tab.exited}:${!!tab.previous}`).join(',')}`;
     if (signature === tabSignature) {
       for (const tab of tabs.children as HTMLCollectionOf<HTMLElement>) {
         const selected = tab.dataset.key === active, pick = tab.querySelector<HTMLButtonElement>('[role=tab]')!;
@@ -159,7 +172,7 @@ export function createWorkspaceDocks(host: HTMLElement) {
         const pick = el('button', 'btn') as HTMLButtonElement;
         // The label is its own element so a long title truncates instead of running under the close.
         pick.append(icon(id ? 'i-terminal' : view!.glyph), el('span', 'tab-label', () => terminal
-          ? `${terminal.title}${terminal.exited ? ` · ${t('exited')}` : ''}` : t(view!.label)));
+          ? `${terminal.title}${terminal.exited ? ` · ${t('exited')}` : terminal.previous ? ` · ${t('previous session')}` : ''}` : t(view!.label)));
         pick.type = 'button'; pick.setAttribute('role', 'tab');
         if (terminal) pick.title = terminal.title;
         pick.setAttribute('aria-selected', String(active === key)); pick.tabIndex = active === key ? 0 : -1;
@@ -258,6 +271,8 @@ export function createWorkspaceDocks(host: HTMLElement) {
   };
   const registerTerminal = (right: TerminalView, bottom: BottomTerminalView): void => {
     rightTerminal = right; bottomTerminal = bottom;
+    // Tabs remembered from the previous launch are already there; they come back as dock tabs.
+    for (const tab of right.tabs()) if (!opened.includes(terminalKey(tab.id))) opened.push(terminalKey(tab.id));
     addAction('terminal', 'Terminal', 'i-terminal'); paint();
   };
 
@@ -281,6 +296,9 @@ export function createWorkspaceDocks(host: HTMLElement) {
   const moveTab = (key: DockTab, index: number): void => {
     const from = opened.indexOf(key); if (from < 0) return;
     opened.splice(from, 1); opened.splice(Math.max(0, Math.min(opened.length, index)), 0, key); paint();
+    // The terminal saves its tabs in its own order, so a restart brings them back as they are shown here.
+    const id = terminalId(key);
+    if (id) rightTerminal?.moveTab(id, opened.slice(0, opened.indexOf(key)).filter(entry => terminalId(entry) !== null).length);
   };
   enableTabReorder(tabs, { item: '.work-dock-tab', key: node => node.dataset.key, move: (key, index) => moveTab(key as DockTab, index) });
   tabs.addEventListener('keydown', event => {

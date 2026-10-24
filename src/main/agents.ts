@@ -17,14 +17,15 @@ import { randomUUID } from 'node:crypto';
 import type { AgentInfo, AgentMessage, AgentState, ReasoningEffort, SwarmState } from '../shared/session.js';
 import { REASONING_EFFORTS, isReasoningEffort } from '../shared/session.js';
 import { getConfig } from './config.js';
-import { connectorName } from '../shared/connector-names.js';
+import { liveConnectorName } from './mcp/surfaces.js';
+import { workerBrief, workerOwnTask } from '../shared/worker-brief.js';
 import { getChatModels, refreshForUnoffered } from './chat-models.js';
 import { resolveChatModel, type ChatModelOption } from '../shared/chat-models.js';
 import { logInfo, logWarn } from './logger.js';
 import { inheritWorkspace, releasePrimeWorkspace, bindAgentWorkspace } from './workspace.js';
 import { requestCorrelation } from './session/correlation.js';
-import { getSession, findSessionByConversation } from './session/store.js';
-import { continuationForSession } from './session/continuation.js';
+import { getSession, findSessionByConversation, recordWorkerAssignment } from './session/store.js';
+import { continuationForSession, continuationForSourceConversation } from './session/continuation.js';
 
 export const PRIME_ID = 'prime';
 
@@ -250,6 +251,8 @@ interface Run {
   primeConversationId: string | null;
   /** Inbound HTTP request that created this family before its chat was known. */
   primeRequestId?: string;
+  /** Trusted local control API principal; never a claimed ChatGPT conversation. */
+  localOwnerId?: string;
   startedAt: number;
   agents: Map<string, Agent>;
   /**
@@ -321,6 +324,7 @@ interface DormantRun {
   setupProfileId?: string;
   primeConversationId: string | null;
   primeRequestId?: string;
+  localOwnerId?: string;
   startedAt: number;
   parkedAt: number;
   agents: Map<string, Agent>;
@@ -353,6 +357,8 @@ let livenessFloor = 0;
 let spawnRequest: ((workers: WorkerSpawn[]) => void) | null = null;
 const listeners = new Set<() => void>();
 const endListeners = new Set<(reason: string, retired: RetiredChat[], runId: string) => void>();
+const retireListeners = new Set<(conversationIds: readonly string[]) => void>();
+const finishListeners = new Set<(conversationId: string) => void>();
 let persist: (() => void) | null = null;
 let persistNow: ((snapshot: SwarmSnapshot | null) => Promise<void>) | null = null;
 let criticalMutationRevision = 0;
@@ -362,6 +368,75 @@ let retiredPersist: (() => void) | null = null;
 let retiredPersistNow: ((snapshot: RetiredWorkersSnapshot) => Promise<void>) | null = null;
 const RETIRED_WORKER_TTL_MS = 30 * 60_000;
 const retiredWorkers = new Map<string, RetiredChat>();
+/**
+ * Denial-only worker identity after managed families leave bounded broker history.
+ * Recording may be Off, so SessionOrigin cannot be the only durable fence.
+ * No entry can authorize a checkout; snapshots preserve exact browser-bound IDs.
+ */
+const retiredManagedWorkerConversations = new Set<string>();
+/** Cheap negative guard for the common feature-off installation, where no worker ever had a checkout. */
+let managedWorktreeHistoryPossible = false;
+/**
+ * Durable cleanup authority for accepted worker checkouts after their broker family is
+ * cleared or evicted. A filesystem marker alone cannot authorize a retired allocation.
+ * This contains only identity, never a path or permission to delete any worker data.
+ */
+export interface ManagedWorktreeCleanupOffer {
+  runId: string;
+  agentId: string;
+  reason: 'completed' | 'failed' | 'cleared' | 'evicted';
+  createdAt: number;
+  /** Human-readable job name retained after the broker row is cleared or evicted. */
+  label?: string;
+}
+const managedWorktreeCleanupHistory = new Map<string, ManagedWorktreeCleanupOffer>();
+const managedAllocationRunPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const managedAllocationAgentPattern = /^worker-[1-9][0-9]{0,5}$/;
+
+function cleanupIdentity(info: AgentInfo): { runId: string; agentId: string } | null {
+  const runId = info.workerAllocationRunId;
+  if (info.role !== 'worker' || info.managedWorktree !== true ||
+      typeof runId !== 'string' || !managedAllocationRunPattern.test(runId) ||
+      !managedAllocationAgentPattern.test(info.id)) return null;
+  return { runId: runId.toLowerCase(), agentId: info.id };
+}
+
+function cleanupAcknowledged(info: AgentInfo): boolean {
+  return (info as AgentInfo & { managedWorktreeCleaned?: boolean }).managedWorktreeCleaned === true;
+}
+
+function cleanupOfferKey(identity: { runId: string; agentId: string }): string {
+  return `${identity.runId}:${identity.agentId}`;
+}
+
+/** A task-first row label, even when a worker was spawned without a custom label. */
+function cleanupDisplayLabel(info: AgentInfo): string {
+  // A wake replaces `task` with the waking message; the checkout keeps the job's own name.
+  const title = info.label && info.label !== info.id ? info.label : info.jobTitle || workerOwnTask(info.task);
+  return (title?.split(/[\r\n]/, 1)[0]?.trim() || info.label || info.id).slice(0, 160);
+}
+
+/** Preserve accepted cleanup authority before the last owner row is removed. */
+function retireManagedWorktreeCleanupOffers(agents: Iterable<Agent>, reason: 'cleared' | 'evicted'): void {
+  for (const agent of agents) {
+    if (unpublishedAgents.has(agent)) continue;
+    const identity = cleanupIdentity(agent.info);
+    if (!identity) continue;
+    const key = cleanupOfferKey(identity);
+    if (cleanupAcknowledged(agent.info)) {
+      managedWorktreeCleanupHistory.delete(key);
+      continue;
+    }
+    const existing = managedWorktreeCleanupHistory.get(key);
+    managedWorktreeCleanupHistory.set(key, {
+      ...identity, reason, createdAt: existing?.createdAt ?? Date.now(),
+      label: cleanupDisplayLabel(agent.info) || existing?.label
+    });
+  }
+  // Preserve every pending authorization until an explicit cleanup acknowledgement exists.
+  // Truncating by count would strand older checkouts: their markers may not independently
+  // authorize a delete once their broker family has been evicted.
+}
 /** Worker objects created by a spawn whose public durable acceptance has not succeeded yet. */
 const unpublishedAgents = new WeakSet<Agent>();
 /** A brand-new run is itself unpublished until its staged spawn crosses the acceptance barrier. */
@@ -369,6 +444,8 @@ const unpublishedRuns = new Set<Run>();
 interface SpawnStageState {
   run: Run;
   created: Agent[];
+  /** Resource allocation is complete; foreign critical writes must not admit an earlier stage. */
+  durableReady: boolean;
   becamePrime: boolean;
   /** Existing dormant history temporarily reactivated for this staged spawn, if any. */
   resumedDormant: DormantRun | null;
@@ -470,6 +547,9 @@ export async function persistCriticalSwarmNow(): Promise<boolean> {
         // succeeded. See snapshotSwarm() and stageMessages().
         const snapshot = snapshotSwarmIncludingUnpublished();
         await handler(snapshot);
+        // Presentation only (names and tasks for history): it follows the durable write and never
+        // holds up the acceptance this barrier exists for.
+        void archiveWorkerAssignments(snapshot);
         persistedCriticalRevision = Math.max(persistedCriticalRevision, targetRevision);
       }
       return true;
@@ -523,6 +603,32 @@ export async function persistAgentAuthorityNow(): Promise<boolean> {
 export function onSwarmEnd(listener: (reason: string, retired: RetiredChat[], runId: string) => void): () => void {
   endListeners.add(listener);
   return () => endListeners.delete(listener);
+}
+
+/**
+ * Worker chats that just became retired: the broker will never wake or message them again.
+ *
+ * Covers both ways a worker retires: its run ends (cleared, or the prime closed with nothing left
+ * to come back to) and Clear workers retiring parked histories. A parked run is not retirement;
+ * its prime can still wake those workers. Used to archive them in ChatGPT (#1460).
+ */
+export function onWorkerChatsRetired(listener: (conversationIds: readonly string[]) => void): () => void {
+  retireListeners.add(listener);
+  return () => retireListeners.delete(listener);
+}
+
+/**
+ * A worker's chat whose worker just reported its task done (#1701). The worker only sleeps: its
+ * prime can still give it more work. Used to archive the chat early in ChatGPT.
+ */
+export function onWorkerFinished(listener: (conversationId: string) => void): () => void {
+  finishListeners.add(listener);
+  return () => finishListeners.delete(listener);
+}
+
+function announceRetired(conversationIds: readonly string[]): void {
+  if (conversationIds.length === 0) return;
+  for (const listener of retireListeners) listener(conversationIds);
 }
 
 /** A worker chat whose run ended and whose conversation must not immediately become an ordinary chat. */
@@ -579,6 +685,8 @@ export function onSpawnRequest(handler: (workers: WorkerSpawn[]) => void): () =>
  * What a caller can offer as proof of who it is. No field is ever an agent id.
  */
 export interface Caller {
+  /** Set only by the authenticated local control API, absent from MCP caller arguments. */
+  localOwnerId?: string;
   /**
    * The ChatGPT conversation this call was proven to come from. A permitted unresolved
    * prime keeps its separate requestId until that proof arrives.
@@ -598,7 +706,7 @@ export interface Caller {
 }
 
 type Family = Run | DormantRun;
-type FamilyOwner = Pick<Run, 'primeConversationId' | 'primeRequestId' | 'setupProfileId'>;
+type FamilyOwner = Pick<Run, 'primeConversationId' | 'primeRequestId' | 'localOwnerId' | 'setupProfileId'>;
 
 /** Parked fleets keep their last incarnation, even when several have the same prime. */
 function familyKey(owner: Family): string {
@@ -676,10 +784,17 @@ function exactCaller(caller: Caller): Caller {
 }
 
 function hasCallerIdentity(caller: Caller): boolean {
+  if (caller.localOwnerId) return validLocalOwner(caller.localOwnerId) && !caller.conversationId && !caller.requestId;
   return Boolean(caller.conversationId || (getConfig().multiAgent.allowUnattributedCalls && caller.requestId));
 }
 
+function validLocalOwner(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
+}
+
 function ownsPrime(caller: Caller, owner: FamilyOwner): boolean {
+  if (owner.localOwnerId) return hasCallerIdentity(caller) && caller.localOwnerId === owner.localOwnerId;
+  if (caller.localOwnerId) return false;
   // Once attached, only the current frontend owns the fleet. In particular, an old request
   // from A cannot recover prime authority after the durable session has moved to B.
   if (owner.primeConversationId) return caller.conversationId === owner.primeConversationId;
@@ -922,6 +1037,7 @@ function reactivateDormantRun(dormant: DormantRun): Run | null {
     setupProfileId: dormant.setupProfileId,
     primeConversationId: dormant.primeConversationId,
     primeRequestId: dormant.primeRequestId,
+    localOwnerId: dormant.localOwnerId,
     // The browser-command fence gets a new incarnation id, but this is still the same prime's
     // worker history. Keep the original history start instead of pretending the workers were
     // created again when one of them wakes.
@@ -1237,7 +1353,7 @@ export function agentForFinishCaller(caller: Caller): string | null {
  * tool" reported to the other computer's Core (seen live, 2026-10-04: refused there as "no run").
  */
 export function ownCoreHint(): string {
-  return getConfig().connectorSuffix ? ` of ${connectorName('core', getConfig().connectorSuffix)}` : '';
+  return getConfig().connectorSuffix ? ` of ${liveConnectorName('core')}` : '';
 }
 
 function requireMember(caller: Caller): Agent {
@@ -1248,7 +1364,7 @@ function requireMember(caller: Caller): Agent {
   if (!run && runs.size > 0) throw new AgentsBusyError();
   if (!run) {
     throw new AgentError(
-      `No sub-agent run is active in ${connectorName('core', getConfig().connectorSuffix)}. ` +
+      `No sub-agent run is active in ${liveConnectorName('core')}. ` +
         'The chat that calls agents action=spawn becomes the prime agent of a new run.'
     );
   }
@@ -1282,15 +1398,7 @@ export function identify(caller: Caller): AgentInfo {
  * instruction for everyone in the run, the task is this worker's job — and a worker that
  * cannot tell them apart is one that reports back on the house rules.
  */
-function briefFor(context: string, task: string): string {
-  if (!context) return task;
-  return `Shared context for every worker in this run:
-${context}
-
-Your task:
-${task}`;
-}
-
+const briefFor = workerBrief;
 function makeWorker(id: string, label: string, task: string, model: string | null, reasoningEffort: ReasoningEffort | null): Agent {
   return {
     info: {
@@ -1298,6 +1406,7 @@ function makeWorker(id: string, label: string, task: string, model: string | nul
       role: 'worker',
       label,
       task,
+      jobTitle: (workerOwnTask(task).split(/[\r\n]/, 1)[0]?.trim() ?? '').slice(0, 160) || undefined,
       model,
       reasoningEffort,
       state: 'invited',
@@ -1453,6 +1562,7 @@ function primeAgent(run: Run | null): Agent {
  */
 function endRun(run: Run, reason: string): void {
   if (!run) return;
+  retireManagedWorktreeCleanupOffers(run.agents.values(), 'cleared');
   // The prime's tool calls switch from `agent:prime` back to its conversation identity the
   // instant this run disappears. Collapse that temporary workspace identity first so the next
   // relative path cannot revive the project the chat was using before it spawned workers.
@@ -1473,12 +1583,17 @@ function endRun(run: Run, reason: string): void {
       retiredAt: Date.now()
     }));
   for (const worker of retired) retiredWorkers.set(worker.conversationId, worker);
+  for (const agent of run.agents.values()) {
+    if (agent.info.role === 'worker' && agent.info.managedWorktree && agent.info.conversationId)
+      retiredManagedWorkerConversations.add(agent.info.conversationId);
+  }
   retiredPersist?.();
   const what = `${run.runId} (${[...run.agents.keys()].join(', ')})`;
   runs.delete(run.runId);
-  for (const worker of retired) consecutiveWakeFailures.delete(worker.conversationId);
+  for (const worker of retired) { consecutiveWakeFailures.delete(worker.conversationId); transientWakeRetries.delete(worker.conversationId); }
   logInfo(`multi-agent: ended run ${what} — ${reason}`);
   for (const listener of endListeners) listener(reason, retired, run.runId);
+  announceRetired(retired.map((worker) => worker.conversationId));
 }
 
 /**
@@ -1495,6 +1610,7 @@ function parkRun(run: Run | null, reason: string): boolean {
     setupProfileId: current.setupProfileId,
     primeConversationId: current.primeConversationId,
     primeRequestId: current.primeRequestId,
+    localOwnerId: current.localOwnerId,
     startedAt: current.startedAt,
     parkedAt: Date.now(),
     agents: current.agents,
@@ -1523,20 +1639,26 @@ function pruneDormantRuns(now = Date.now()): boolean {
     (dormant, index) => now - dormant.parkedAt >= DORMANT_RUN_TTL_MS || candidates.length - index > MAX_DORMANT_RUNS
   );
   if (evict.length === 0) return false;
+  const expired: string[] = [];
   for (const dormant of evict) {
     dormantRuns.delete(familyKey(dormant));
+    retireManagedWorktreeCleanupOffers(dormant.agents.values(), 'evicted');
     for (const agent of dormant.agents.values()) {
       if (agent.info.role !== 'worker' || !agent.info.conversationId) continue;
+      if (agent.info.managedWorktree) retiredManagedWorkerConversations.add(agent.info.conversationId);
       retiredWorkers.set(agent.info.conversationId, {
         id: agent.info.id,
         conversationId: agent.info.conversationId,
         reason: 'its parked worker history was dropped',
         retiredAt: now
       });
+      expired.push(agent.info.conversationId);
     }
-    logInfo(`multi-agent: dropped the parked worker history of conversation ${dormant.primeConversationId}`);
+    logInfo(`multi-agent: dropped the parked worker history of ${dormant.primeConversationId ? `conversation ${dormant.primeConversationId}` : 'a prime chat that never got a conversation'}`);
   }
   retiredPersist?.();
+  // These workers are retired for good too: the archive setting (#1460) must hear about them.
+  announceRetired(expired);
   return true;
 }
 
@@ -1597,6 +1719,12 @@ export interface SpawnResult {
  * safe snapshot, exactly like staged agent messages.
  */
 export interface StagedSpawn extends SpawnResult {
+  /** A replay of already accepted workers does not own a new allocation. */
+  newlyStaged: boolean;
+  /** Exact newly reserved workers, excluding existing matches and sleeping workers. */
+  newlyStagedWorkerIds: readonly string[];
+  /** Makes this stage eligible for critical snapshots only after resource setup completes. */
+  prepareDurability: () => void;
   commit: () => void;
   rollback: () => void;
 }
@@ -1760,12 +1888,146 @@ export function stageSpawn(input: SpawnInput): StagedSpawn {
   const stage = owner ? activeSpawnStages.get(owner) : undefined;
   // An exact retry can match workers that were already accepted earlier. That is not a new
   // mutation and therefore needs no publication transaction.
-  if (!stage) return { ...result, commit: () => undefined, rollback: () => undefined };
+  if (!stage) return { ...result, newlyStaged: false, newlyStagedWorkerIds: [], prepareDurability: () => undefined, commit: () => undefined, rollback: () => undefined };
   return {
     ...result,
+    newlyStaged: true,
+    newlyStagedWorkerIds: stage.created.map(agent => agent.info.id),
+    prepareDurability: () => {
+      if (stage.settled || activeSpawnStages.get(stage.run) !== stage) {
+        throw new AgentError('SPAWN_STAGE_EXPIRED: the worker reservation is no longer pending');
+      }
+      if (stage.durableReady) return;
+      stage.durableReady = true;
+      // B's in-flight writer could have flushed before this stage completed allocation.
+      // A new revision forces A's own acceptance barrier to publish its prepared topology.
+      changed();
+    },
     commit: () => settleSpawnStage(stage, true),
     rollback: () => settleSpawnStage(stage, false)
   };
+}
+
+/** A worktree lease is durable only after this same staged spawn crosses its write barrier. */
+export function markStagedWorkerWorktree(runId: string, agentId: string): void {
+  const run = runs.get(runId);
+  const stage = run ? activeSpawnStages.get(run) : undefined;
+  const agent = stage?.created.find(worker => worker.info.id === agentId);
+  if (!stage || stage.settled || !agent || agent.info.role !== 'worker') {
+    throw new AgentError('WORKTREE_OWNER_NOT_STAGED: only a newly reserved worker may claim a managed worktree');
+  }
+  if (agent.info.workerAllocationRunId !== runId) {
+    throw new AgentError('WORKTREE_OWNER_MISMATCH: worker allocation identity changed during staging');
+  }
+  agent.info.managedWorktree = true;
+  managedWorktreeHistoryPossible = true;
+  // Another family's acceptance writer may already be draining the staged topology. This
+  // policy change needs its own critical revision so that writer cannot certify an earlier
+  // snapshot lacking the worktree requirement as the final accepted spawn state.
+  changed();
+}
+
+/** Require isolation only for workers whose accepted broker record says it was allocated. */
+export function managedWorkerWorktreeRequired(input: Caller): boolean {
+  if (!managedWorktreeHistoryPossible) return false;
+  const caller = exactCaller(input);
+  if (!caller.conversationId) return false;
+  // Even a corrupt or multiply claimed restored conversation must retain its isolation
+  // requirement. Ambiguous identity must fail instead of reaching the prime's project.
+  return allFamilies().some(owner => [...owner.agents.values()].some(member =>
+    member.info.role === 'worker' && member.info.conversationId === caller.conversationId &&
+    member.info.managedWorktree === true));
+}
+
+/**
+ * The managed allocation is an accepted broker fact, not a property of a worker-origin
+ * recording. Legacy workers never allocated a worktree and retain their original cwd, even
+ * after their broker history expires. An isolated worker, by contrast, must remain fenced
+ * after its family and ordinary retired lease expire. The snapshot's exact-chat tombstones
+ * survive those limits even when recording is Off; they never restore checkout ownership.
+ *
+ * This is a synchronous, in-memory check on every workspace lookup. In particular, it must
+ * not touch the session store: ordinary chats and pre-feature worker chats can call this
+ * before the session store is initialized, or after their histories have been pruned.
+ */
+export function managedWorkerIsolationRequired(input: Caller): boolean {
+  if (!managedWorktreeHistoryPossible && retiredManagedWorkerConversations.size === 0) return false;
+  const caller = exactCaller(input);
+  if (managedWorkerWorktreeRequired(caller)) return true;
+  return Boolean(caller.conversationId && retiredManagedWorkerConversations.has(caller.conversationId));
+}
+
+/**
+ * A marker may be restored only if the accepted broker still owns a worker that could execute.
+ * Retained terminal rows remain isolation fences and cleanup offers, never startup leases.
+ * A non-revivable sleeper can still finish its original turn only with the exact durable
+ * turn/request authority captured when it was parked at the context ceiling.
+ * This projection never reconstructs ownership from marker filenames, display slots or
+ * recorded sessions. Duplicate/corrupt allocation identities are excluded fail-closed.
+ */
+export function managedWorkerRecoveryIdentities(): Array<{ runId: string; agentId: string }> {
+  const families = allFamilies();
+  const candidates = families.flatMap(owner => [...owner.agents.values()]
+    .filter(agent => agent.info.role === 'worker' && agent.info.managedWorktree === true &&
+      !cleanupAcknowledged(agent.info) &&
+      managedAllocationAgentPattern.test(agent.info.id) &&
+      (occupiesSlot(agent.info.state) ||
+        (agent.info.state === 'sleeping' && (agent.info.revivable === true ||
+          (agent.info.silenceParked === true && Boolean(agent.info.conversationId) &&
+            Boolean(agent.info.silenceRecoveryTurnId) &&
+            Number.isFinite(agent.info.silenceRecoveryRequestOriginMax))))) &&
+      !unpublishedAgents.has(agent) && !unpublishedRuns.has(owner as Run))
+    .map(agent => ({ runId: agent.info.workerAllocationRunId, agentId: agent.info.id, owner })));
+  return candidates.filter(candidate =>
+    typeof candidate.runId === 'string' &&
+    managedAllocationRunPattern.test(candidate.runId) &&
+    candidates.filter(other => other.runId === candidate.runId && other.agentId === candidate.agentId).length === 1 &&
+    families.filter(owner => owner.agents.get(candidate.agentId)?.info.workerAllocationRunId === candidate.runId).length === 1
+  ).map(candidate => ({ runId: candidate.runId!, agentId: candidate.agentId }));
+}
+
+/** Resolve worktree identity solely from unique, published, broker-owned conversation proof. */
+export function managedWorkerAllocationIdentity(input: Caller): { runId: string; agentId: string } | null {
+  const caller = exactCaller(input);
+  if (!caller.conversationId) return null;
+  const member = resolve({ ...caller, runId: undefined });
+  if (!member || member.info.role !== 'worker' || member.info.conversationId !== caller.conversationId ||
+      member.info.managedWorktree !== true || unpublishedAgents.has(member)) return null;
+  const owner = runForAgent(member);
+  if (!owner || unpublishedRuns.has(owner)) return null;
+  const allocation = member.info.workerAllocationRunId;
+  if (typeof allocation !== 'string' || !managedAllocationRunPattern.test(allocation)) return null;
+  const owners = allFamilies().filter(family =>
+    family.agents.get(member.info.id)?.info.workerAllocationRunId === allocation);
+  if (owners.length !== 1 || owners[0] !== owner) return null;
+  return { runId: allocation, agentId: member.info.id };
+}
+
+/**
+ * The bridge redeems a worker's first browser message before that worker has a conversation
+ * id. Its durable spawn command has the exact broker run + worker id instead. Never infer a
+ * checkout from the display slot or Prime's project: only this published worker can name its
+ * immutable allocation identity. A corrupt managed owner must not fall back to Prime's cwd.
+ */
+export function workerBootstrapWorktreeIdentity(runId: string, agentId: string): { runId: string; agentId: string } | null {
+  const run = runs.get(runId);
+  const member = run?.agents.get(agentId);
+  // A leased bootstrap can be redeemed again by its original browser document after
+  // binding was durably accepted but the HTTP reply was lost. Bridge command restoration
+  // already permits that exact `active` state; do not break that existing recovery path.
+  const awaitingBootstrap = member?.info.state === 'invited' ||
+    ((member?.info.state === 'waking' || member?.info.state === 'active') && Boolean(member.info.conversationId));
+  if (!run || unpublishedRuns.has(run) || !member || unpublishedAgents.has(member) ||
+      member.info.role !== 'worker' || !awaitingBootstrap) {
+    throw new AgentError('WORKTREE_BOOTSTRAP_OWNER_UNAVAILABLE: worker has no published bootstrap or revival owner in this run');
+  }
+  if (member.info.managedWorktree !== true) return null;
+  const allocation = member.info.workerAllocationRunId;
+  if (!allocation || !managedAllocationRunPattern.test(allocation) ||
+      allFamilies().filter(owner => owner.agents.get(agentId)?.info.workerAllocationRunId === allocation).length !== 1) {
+    throw new AgentError('WORKTREE_BOOTSTRAP_OWNER_INVALID: managed worker allocation identity could not be proven');
+  }
+  return { runId: allocation, agentId };
 }
 
 /**
@@ -1871,7 +2133,10 @@ export function spawn(input: SpawnInput, options: SpawnOptions = {}): SpawnResul
     if (run.transfer) throw new AgentError("PRIME_TRANSFER_IN_PROGRESS: this prime is being compacted/resumed.");
   }
 
-  if (conversationId && (isWorkerConversation(conversationId) || retiredWorkerForConversation(conversationId))) throw new AgentError("Workers must not create workers of their own.");
+  if (conversationId && (isWorkerConversation(conversationId) || retiredWorkerForConversation(conversationId) ||
+      retiredManagedWorkerConversations.has(conversationId))) {
+    throw new AgentError('WORKTREE_OWNER_UNAVAILABLE: retired worker conversations cannot create new prime runs or workers.');
+  }
   if (input.caller.runId && !run && !dormantRunForCaller(input.caller)) throw new AgentsBusyError();
   const becamePrime = run === null;
   let resumedDormant: DormantRun | null = null;
@@ -1885,6 +2150,11 @@ export function spawn(input: SpawnInput, options: SpawnOptions = {}): SpawnResul
         );
       }
     } else {
+      // A durable Compact & Resume ticket can predate the first worker spawn.
+      // beginPrimeTransfer() then saw no fleet, so this newly created prime
+      // must inherit the continuation owner's existing transfer intent.
+      // Otherwise the later session commit rightly refuses to strand workers in A.
+      const pendingHandoff = conversationId ? continuationForSourceConversation(conversationId) : null;
       run = {
         // This is an incarnation key, not a display id. Browser bootstrap commands persist
         // independently and quote it so a late `worker-1` from run A can never bind `worker-1`
@@ -1894,9 +2164,12 @@ export function spawn(input: SpawnInput, options: SpawnOptions = {}): SpawnResul
         setupProfileId: setupProfileId(input.caller.setupProfileId),
         primeConversationId: conversationId,
         primeRequestId: conversationId ? undefined : input.caller.requestId!,
+        localOwnerId: input.caller.localOwnerId,
         startedAt: Date.now(),
         agents: new Map([[PRIME_ID, makePrime(conversationId)]]),
-        transfer: null,
+        transfer: pendingHandoff
+          ? { from: pendingHandoff.from, at: pendingHandoff.openedAt, frozen: pendingHandoff.state === 'committing' }
+          : null,
         primeGoneAt: null
       };
       runs.set(run.runId, run);
@@ -1959,6 +2232,7 @@ export function spawn(input: SpawnInput, options: SpawnOptions = {}): SpawnResul
   for (const [index, worker] of planned.entries()) {
     const id = ids[index] as string;
     const agent = makeWorker(id, worker.label || id, worker.task, worker.model, worker.reasoningEffort);
+    agent.info.workerAllocationRunId = activeRun.runId;
     activeRun.agents.set(id, agent);
     stampOwner(activeRun);
     // A worker starts in the folder the prime was working in, so its first call can use the
@@ -1973,6 +2247,8 @@ export function spawn(input: SpawnInput, options: SpawnOptions = {}): SpawnResul
     const stage: SpawnStageState = {
       run: activeRun,
       created: createdAgents,
+      // Old direct/unit staging has no resource transaction; managed Git allocation does.
+      durableReady: getConfig().multiAgent.autoWorktrees !== true,
       becamePrime,
       resumedDormant,
       createdFreshRun,
@@ -2270,7 +2546,7 @@ export function stagePrimeMessage(
  */
 export function stageMessages(
   caller: Caller,
-  items: ReadonlyArray<{ to: string; text: string }>
+  items: ReadonlyArray<{ to: string; text: string; label?: string }>
 ): StagedAgentMessages {
   caller = exactCaller(caller);
   requireFamilySelection(caller);
@@ -2302,7 +2578,7 @@ export function stageMessages(
 
 function stageMessagesActive(
   caller: Caller,
-  items: ReadonlyArray<{ to: string; text: string }>,
+  items: ReadonlyArray<{ to: string; text: string; label?: string }>,
   resumedDormant: boolean
 ): StagedAgentMessages {
   const run = runForCaller(caller);
@@ -2326,6 +2602,7 @@ function stageMessagesActive(
   const perRecipient = new Map<string, number>();
   /** Sleeping recipients this batch is about to wake, and therefore about to take a slot for. */
   const reserved = new Set<Agent>();
+  const labels = new Map<Agent, string>();
   for (const [index, item] of items.entries()) {
     const where = items.length > 1 ? ` (message ${index + 1} of ${items.length})` : '';
     const trimmed = item.text?.trim() ?? '';
@@ -2349,6 +2626,15 @@ function stageMessagesActive(
       );
     }
     assertRoute(from, to);
+    if (item.label !== undefined) {
+      const label = item.label.trim();
+      if (!label || label.length > MAX_LABEL_CHARS) throw new AgentError('Worker label must contain 1–60 characters.');
+      if (from.info.role !== 'prime' || to.info.role !== 'worker' || to.info.state !== 'sleeping') {
+        throw new AgentError('label is only valid when the prime wakes a sleeping worker.');
+      }
+      if (labels.has(to) && labels.get(to) !== label) throw new AgentError('Conflicting labels for the same worker.');
+      labels.set(to, label);
+    }
     if (isOver(to.info.state)) {
       throw new AgentError(
         to.info.state === 'failed'
@@ -2414,7 +2700,7 @@ function stageMessagesActive(
   }
   // Reservation is part of the same all-or-nothing plan as the queue entries: every check
   // above has passed by now, so no recipient can still turn out to be unreachable.
-  const previousAssignments = new Map([...reserved].map((agent) => [agent, beginRevival(agent)]));
+  const previousAssignments = new Map([...reserved].map((agent) => [agent, beginRevival(agent, labels.get(agent))]));
   changed();
   const messages = planned.map(({ message }) => ({ ...message }));
   let settled = false;
@@ -2466,7 +2752,7 @@ function stageMessagesActive(
 /** Immediate broker API used by internal/unit callers that do not expose a durable-acceptance result. */
 export function sendMessages(
   caller: Caller,
-  items: ReadonlyArray<{ to: string; text: string }>
+  items: ReadonlyArray<{ to: string; text: string; label?: string }>
 ): AgentMessage[] {
   const staged = stageMessages(caller, items);
   staged.commit();
@@ -2555,7 +2841,7 @@ export function offerMessagesForCaller(
     let budget = MAX_INBOX_OFFER_CHARS;
     const messages = owned.flatMap(owner => offerAgentMessages(owner.agents.get(PRIME_ID)!, onFinish, budget).map(message => {
       budget -= message.text.length;
-      return owned.length > 1 ? { ...message, runId: familyKey(owner) } : message;
+      return owned.length > 1 || caller.localOwnerId ? { ...message, runId: familyKey(owner) } : message;
     }));
     return { agentId: PRIME_ID, messages };
   }
@@ -2583,11 +2869,13 @@ export function acknowledgeOffers(id: string, byFinish = false, callStartedAt = 
 function acknowledgeAgentOffers(
   agent: Agent,
   byFinish = false,
-  callStartedAt = Number.POSITIVE_INFINITY
+  callStartedAt = Number.POSITIVE_INFINITY,
+  messageIds?: ReadonlySet<string>
 ): AgentMessage[] {
   const offered = agent.queue.filter(
     (message) =>
       message.ackedAt === null &&
+      (!messageIds || messageIds.has(message.id)) &&
       message.offeredAt !== null &&
       // A call proves only what was already delivered before that call began. This matters for
       // revival ACKs because the browser can submit the user message while an older MCP handler
@@ -2643,6 +2931,18 @@ export function acknowledgeOffersForCaller(
     acknowledgeAgentOffers(owner.agents.get(PRIME_ID)!, byFinish, callStartedAt)) };
   if (caller.runId && !selectedFamily(caller)) return null;
   return acknowledgeOffersForConversation(caller.conversationId, byFinish, callStartedAt, allowDormantWorkerFinishRetry);
+}
+
+/** Explicit local receipts retire only report ids the caller says it consumed. */
+export function acknowledgeLocalReports(caller: Caller, messageIds: readonly string[]): AgentMessage[] {
+  requireEnabled();
+  if (!caller.localOwnerId || !hasCallerIdentity(caller)) throw new IdentityLostError();
+  requireFamilySelection(caller);
+  const ids = new Set(messageIds);
+  const acknowledged = familiesForCaller(caller).filter(owner => ownsPrime(caller, owner) && (!caller.runId || answersTo(owner, caller.runId)))
+    .flatMap(owner => acknowledgeAgentOffers(owner.agents.get(PRIME_ID)!, false, Number.POSITIVE_INFINITY, ids));
+  if (acknowledged.length) changed('critical');
+  return acknowledged;
 }
 
 export function pendingCount(id: string, runId?: string): number {
@@ -2873,6 +3173,8 @@ function publishFinish(agent: Agent, info: AgentInfo, report: AgentMessage, dura
   recount(prime);
   logInfo(`multi-agent: ${agent.info.id} ${info.state === 'finished' ? 'finished for good' : 'is sleeping'}`);
   changed(durability);
+  const conversationId = agent.info.conversationId;
+  if (agent.info.role === 'worker' && conversationId) for (const listener of finishListeners) listener(conversationId);
 }
 
 /** Whether this exact run object still owns its agent map, active or parked. */
@@ -3027,7 +3329,7 @@ export function failAgent(
   id: string,
   reason: string,
   note?: string,
-  options: { revivable?: boolean } = {}, runId?: string
+  options: { revivable?: boolean; startTimedOut?: boolean } = {}, runId?: string
 ): FinishResult | null {
   const run = scopedRun(runId);
   const agent = run?.agents.get(id);
@@ -3050,6 +3352,9 @@ export function failAgent(
   // A revivable failure keeps whatever the prime said to it. If the worker comes back, those
   // messages are still the instructions it never acknowledged; throwing them away here and
   // then reviving the worker would silently drop them.
+  // A start that only ran out of time may yet turn out to have happened (#1086): keep what the
+  // prime had said to it for adoptLateWorker(), which is the only reader.
+  if (options.startTimedOut) startTimeouts.set(agent, { queue: agent.queue.slice(), failedAt: Date.now() });
   if (!agent.info.revivable) agent.queue = [];
   recount(agent);
 
@@ -3066,6 +3371,107 @@ export function failAgent(
   logWarn(`multi-agent: ${id} failed — ${reason}`);
   changed();
   return { info: { ...agent.info }, report: { ...report }, repeat: false };
+}
+
+// ------------------------------------------------------------- late starts
+
+/** How long after a start ran out of time its chat may still turn out to have started. */
+export const LATE_START_WINDOW_MS = 15 * 60_000;
+
+/**
+ * Workers failed only because their chat did not report back in time, with the inbox they had.
+ *
+ * In memory on purpose: a late start is minutes, not restarts, and after a restart the chat is
+ * treated as it always was. Keyed by the agent object, so a replacement that reuses the
+ * friendly id is never mistaken for the worker that timed out.
+ */
+const startTimeouts = new WeakMap<Agent, { queue: AgentMessage[]; failedAt: number }>();
+
+export type LateStart = { outcome: 'adopted'; runId: string } | { outcome: 'stray'; why: string };
+
+/**
+ * A worker the app gave up on for time, whose chat then proved it received its task (#1086).
+ *
+ * On a memory-starved Windows machine (2026-10-18) pages sent their task within the deadline,
+ * but their reports reached the app 20–90 s late: the app failed the worker and its chat went
+ * on working, tracked by nothing. Heartbeats would have been late too, so the app cannot know
+ * sooner; it can only accept the truth when it arrives. The worker rejoins its run when that
+ * is still the same worker, its run (live or parked) still exists and a slot is free; the
+ * prime is told to expect its result. Otherwise its chat is fenced like a retired worker, so
+ * its next tool call tells it to stop, and the prime is told why.
+ */
+export function adoptLateWorker(id: string, conversationId: string, runId: string): LateStart {
+  const family = allFamilies().find((owner) => answersTo(owner, runId)) ?? null;
+  const agent = family?.agents.get(id) ?? null;
+  // A retried ACK whose first answer was lost: that first one already adopted it.
+  if (family && 'runId' in family && agent?.info.role === 'worker' && agent.info.conversationId === conversationId &&
+      !isOver(agent.info.state)) return { outcome: 'adopted', runId: family.runId };
+  const timedOut = agent ? startTimeouts.get(agent) : undefined;
+  const max = getConfig().multiAgent.maxWorkers;
+  const occupied = family ? [...family.agents.values()].filter((entry) =>
+    entry.info.role === 'worker' && occupiesSlot(entry.info.state) && !unpublishedAgents.has(entry)).length : 0;
+  const taken = boundAgent(conversationId) !== null || dormantAgentForConversation(conversationId) !== null ||
+    retiredWorkers.has(conversationId);
+  const why = !family ? 'its run has ended'
+    : !agent || agent.info.role !== 'worker' || !timedOut || agent.info.state !== 'failed' || agent.info.conversationId !== null
+      ? 'that worker has since been replaced or ended'
+      : Date.now() - timedOut.failedAt > LATE_START_WINDOW_MS ? 'it started more than fifteen minutes after it was reported as not started'
+        : family.transfer ? 'its main chat is being moved to a new chat'
+          : taken ? 'its chat is already in use'
+            : occupied >= max ? `all ${max} worker slots are in use`
+              : null;
+  // A chat that already belongs to somebody is theirs to keep; only a free chat is fenced.
+  if (why) return strayLateWorker(family, id, conversationId, why, !taken);
+  const run = 'runId' in family! ? family : reactivateDormantRun(family!);
+  if (!run) return strayLateWorker(family, id, conversationId, 'its run could not be resumed', true);
+  if (!bindWorkerConversation(agent!, conversationId)) {
+    if (run !== family) parkRun(run, 'a late-started worker could not rejoin it');
+    return strayLateWorker(family, id, conversationId, 'its chat could not be bound to it', false);
+  }
+  const worker = agent!;
+  const now = Date.now();
+  worker.info.state = 'active';
+  worker.info.activatedAt = now;
+  worker.info.finishedAt = null;
+  worker.info.detachedAt = null;
+  worker.info.lastSeenAt = now;
+  worker.info.result = null;
+  worker.info.revivable = false;
+  worker.queue = [...timedOut!.queue, ...worker.queue];
+  startTimeouts.delete(worker);
+  recount(worker);
+  bindAgentWorkspace(id, conversationId, run.runId);
+  const prime = primeAgent(run);
+  prime.queue.push(newMessage(id, PRIME_ID,
+    `[${id} started late] It was reported as not started, but its chat received its task after all and is working ` +
+      'on it now. Ignore that earlier report: do not redo its work or start a replacement for it, and expect its result normally.'));
+  recount(prime);
+  logInfo(`multi-agent: ${id} started late in conversation ${conversationId} — rejoined run ${run.runId}`);
+  changed();
+  return { outcome: 'adopted', runId: run.runId };
+}
+
+function strayLateWorker(family: Family | null, id: string, conversationId: string, why: string, fence: boolean): LateStart {
+  if (fence) {
+    retiredWorkers.set(conversationId, {
+      id,
+      conversationId,
+      reason: `its chat received its task after the app had given up on it, and ${why}`,
+      retiredAt: Date.now()
+    });
+    retiredPersist?.();
+  }
+  const prime = family?.agents.get(PRIME_ID);
+  if (prime) {
+    prime.queue.push(newMessage(id, PRIME_ID,
+      `[${id} started late, outside the run] It was reported as not started, but its chat received its task after all. ` +
+        `It could not rejoin because ${why}, so that chat's tool calls are refused and it will not report. Treat its part ` +
+        'of the work as not done.'));
+    recount(prime);
+  }
+  logWarn(`multi-agent: ${id}'s chat ${conversationId} started after the app gave up on it — not rejoined: ${why}`);
+  changed();
+  return { outcome: 'stray', why };
 }
 
 // -------------------------------------------------------------- sleep / wake
@@ -3305,7 +3711,7 @@ type WorkerAssignment = Pick<
  * slot, so the transition into `waking` — which {@link occupiesSlot} counts — happens here,
  * synchronously, before anything touches the browser.
  */
-function beginRevival(agent: Agent): WorkerAssignment {
+function beginRevival(agent: Agent, label?: string): WorkerAssignment {
   const previous = {
     label: agent.info.label,
     task: agent.info.task,
@@ -3314,10 +3720,10 @@ function beginRevival(agent: Agent): WorkerAssignment {
     silenceRecoveryTurnId: agent.info.silenceRecoveryTurnId,
     silenceRecoveryRequestOriginMax: agent.info.silenceRecoveryRequestOriginMax
   };
-  // The accepted inbox owns this assignment. A spawn label is not a label for later work,
-  // and an old report must not masquerade as the result of the waking assignment. Keep that
+  // The prime explicitly names new work; an omitted label preserves the existing name.
+  // An old report must not masquerade as the result of the waking assignment. Keep that
   // report in the prime's existing inbox/history; status carries only a bounded task preview.
-  agent.info.label = agent.info.id;
+  if (label !== undefined) agent.info.label = label;
   agent.info.task = agent.queue
     .filter((message) => message.ackedAt === null && !message.offeredViaRevival)
     .map((message) => message.text).join('\n\n').slice(0, MAX_TASK_CHARS);
@@ -3546,6 +3952,15 @@ function returnWakingWorkerToStopped(agent: Agent, sleptAt: number, reason: stri
 export const WAKE_FAILURES_BEFORE_GIVING_UP = 2;
 /** Failed wakes per worker conversation since that chat last proved alive. Memory-only: a restart forgives one. */
 const consecutiveWakeFailures = new Map<string, number>();
+/**
+ * Wakes the app repeats by itself after a page that redeemed the wake and failed before Send
+ * (#1086: no message box after choosing the model, or its own draft refused as changed). Those
+ * pages loaded the chat and typed nothing, so the chat is not in doubt: only after these does such
+ * a failure count as a strike. A chat that never loads still counts at once.
+ */
+export const TRANSIENT_WAKE_RETRIES = 2;
+export const TRANSIENT_WAKE_RETRY_MS = 15_000;
+const transientWakeRetries = new Map<string, number>();
 
 /**
  * The browser could not wake this worker, so the slot it was holding goes back.
@@ -3555,11 +3970,27 @@ const consecutiveWakeFailures = new Map<string, number>();
  * moment ago — so it returns to `sleeping` and the prime can try again. The prime is told,
  * because it is holding a message it believes was delivered.
  */
-export function failWorkerRevival(id: string, why: string, runId?: string): AgentMessage | null {
+export function failWorkerRevival(id: string, why: string, runId?: string, options: { transient?: boolean } = {}): AgentMessage | null {
   const run = scopedRun(runId);
   const agent = run?.agents.get(id);
   if (!agent || agent.info.state !== 'waking') return null;
   const chat = agent.info.conversationId ?? id;
+  if (options.transient) {
+    const retries = (transientWakeRetries.get(chat) ?? 0) + 1;
+    if (retries <= TRANSIENT_WAKE_RETRIES) {
+      // Still waking: the slot stays reserved and the prime is not troubled. The same broker
+      // incarnation asks again; a wake that was answered, withdrawn or ended meanwhile is not.
+      transientWakeRetries.set(chat, retries);
+      const forRun = run!.runId;
+      logWarn(`multi-agent: ${id}'s page was not ready (${why}); waking it again in ${TRANSIENT_WAKE_RETRY_MS / 1000} s (${retries}/${TRANSIENT_WAKE_RETRIES})`);
+      const timer = setTimeout(() => {
+        if (scopedRun(forRun)?.agents.get(id) === agent && agent.info.state === 'waking') requestWorkerRevivals([id], forRun);
+      }, TRANSIENT_WAKE_RETRY_MS);
+      timer.unref?.();
+      return null;
+    }
+    transientWakeRetries.delete(chat);
+  }
   const strikes = (consecutiveWakeFailures.get(chat) ?? 0) + 1;
   consecutiveWakeFailures.set(chat, strikes);
   if (strikes >= WAKE_FAILURES_BEFORE_GIVING_UP && !ceilingCrossed(agent.info)) {
@@ -3817,6 +4248,7 @@ export function noteAgentAlive(
   if (!agent) return null;
   // Reachability clears a failed browser wake, but does not renew the work deadline.
   consecutiveWakeFailures.delete(conversationId);
+  transientWakeRetries.delete(conversationId);
   const now = Date.now();
   // Page reports establish attachment, never work. Preserve the work clock even when a
   // closed tab returns, so repeated recovery cannot lease an inactive worker forever.
@@ -4248,6 +4680,11 @@ export function hasDormantWorkerLeases(): boolean {
  * already have durable proof of this exact A→B transition. We additionally fail closed if B is
  * bound to any worker in the restored run. Repeating the same proven repair is idempotent.
  */
+/** Whether a sub-agent fleet is led from this chat. */
+export function primeFleetIn(conversationId: string): boolean {
+  return allFamilies().some(owner => owner.primeConversationId === conversationId);
+}
+
 export function repairPrimeConversationAfterRecovery(
   fromConversationId: string,
   toConversationId: string
@@ -4286,6 +4723,8 @@ function stateForAgents(agents: Map<string, Agent>, running: boolean, retainedHi
 export function swarmState(runId?: string): SwarmState {
   const visible = [...runs.values()].filter(r => !unpublishedRuns.has(r) && (runId === undefined || r.runId === runId));
   return { enabled: getConfig().multiAgent.enabled, running: visible.length > 0, retainedHistory: dormantRuns.size > 0,
+    retainedWorkers: [...dormantRuns.values()].filter(r => runId === undefined || answersTo(r, runId))
+      .flatMap(r => stateForAgents(r.agents, false).agents.filter(agent => agent.role === 'worker')),
     agents: visible.flatMap(r => stateForAgents(r.agents, true).agents) };
 }
 
@@ -4489,7 +4928,7 @@ function bindWorkerConversation(agent: Agent, conversationId: string): boolean {
   }
   const taken = boundAgent(conversationId);
   if (taken && taken !== agent) {
-    logWarn(`multi-agent: refused to bind ${agent.info.id} to conversation ${conversationId}, already held by ${taken}`);
+    logWarn(`multi-agent: refused to bind ${agent.info.id} to conversation ${conversationId}, already held by ${taken.info.id}`);
     return false;
   }
   const dormantTaken = dormantAgentForConversation(conversationId);
@@ -4508,22 +4947,28 @@ export function resetSwarm(): void {
   const reason = 'the run was cleared in the app';
   for (const run of [...runs.values()]) endRun(run, reason);
   consecutiveWakeFailures.clear();
+  transientWakeRetries.clear();
   const retiredAt = Date.now();
   let retiredDormant = false;
+  const dormantChats: string[] = [];
   for (const dormant of dormantRuns.values()) {
+    retireManagedWorktreeCleanupOffers(dormant.agents.values(), 'cleared');
     for (const agent of dormant.agents.values()) {
       if (agent.info.role !== 'worker' || !agent.info.conversationId) continue;
+      if (agent.info.managedWorktree) retiredManagedWorkerConversations.add(agent.info.conversationId);
       retiredWorkers.set(agent.info.conversationId, {
         id: agent.info.id,
         conversationId: agent.info.conversationId,
         reason,
         retiredAt
       });
+      dormantChats.push(agent.info.conversationId);
       retiredDormant = true;
     }
   }
   dormantRuns.clear();
   if (retiredDormant) retiredPersist?.();
+  announceRetired(dormantChats);
   changed();
 }
 
@@ -4647,6 +5092,10 @@ export function clearAgent(id: string, runId?: string): ClearResult {
     `[${id} cleared] The user ended this worker from the app. It will not report and cannot be messaged. Carry on ` +
       'without it, or spawn a replacement worker if the work still needs doing.', {}, run?.runId
   );
+  if (outcome) {
+    retireManagedWorktreeCleanupOffers([agent], 'cleared');
+    changed();
+  }
   return { cleared: 'worker', report: outcome?.report ?? null, reason };
 }
 
@@ -4705,6 +5154,7 @@ interface DormantRunSnapshot {
   setupProfileId?: string;
   primeConversationId: string | null;
   primeRequestId?: string;
+  localOwnerId?: string;
   startedAt: number;
   parkedAt: number;
   agents: SerializedAgent[];
@@ -4720,19 +5170,124 @@ export interface SwarmSnapshot {
    * cannot honour.
    */
   version: 4 | 5 | 6 | 7;
-  activeRuns?: Array<{ runId: string; formerRunIds?: string[]; setupProfileId?: string; primeConversationId: string | null; primeRequestId?: string; startedAt: number; agents: SerializedAgent[] }>;
+  activeRuns?: Array<{ runId: string; formerRunIds?: string[]; setupProfileId?: string; primeConversationId: string | null; primeRequestId?: string; localOwnerId?: string; startedAt: number; agents: SerializedAgent[] }>;
   savedAt: number;
   /** Top-level fields are the active incarnation; all are null/empty while only history remains. */
   runId: string | null;
   setupProfileId?: string;
   primeConversationId: string | null;
+  localOwnerId?: string;
   startedAt: number | null;
   agents: SerializedAgent[];
   dormantRuns?: DormantRunSnapshot[];
+  /** Denial-only managed worker identities after family eviction or explicit Clear. */
+  managedRetiredConversations?: string[];
+  /** Cleanup-only authority retained when a managed worker's family leaves broker history. */
+  managedWorktreeCleanupOffers?: ManagedWorktreeCleanupOffer[];
+}
+
+/**
+ * Project eligible terminal workers from the exact snapshot generation being persisted.
+ * The immediate snapshot includes accepted finish overlays while the ordinary snapshot omits
+ * them, so a failed staged finish can never leak an offer into a debounced disk write.
+ */
+function collectManagedWorktreeCleanupOffers(groups: readonly (readonly SerializedAgent[])[]): ManagedWorktreeCleanupOffer[] {
+  const offers = new Map(managedWorktreeCleanupHistory);
+  const candidates = new Map<string, ManagedWorktreeCleanupOffer[]>();
+  for (const group of groups) for (const { info } of group) {
+    const identity = cleanupIdentity(info);
+    if (!identity || cleanupAcknowledged(info)) continue;
+    if (info.state !== 'finished' && !(info.state === 'failed' && info.revivable !== true)) continue;
+    const key = cleanupOfferKey(identity);
+    candidates.set(key, [...(candidates.get(key) ?? []), {
+      ...identity,
+      reason: info.state === 'finished' ? 'completed' : 'failed',
+      createdAt: info.finishedAt ?? info.sleptAt ?? Date.now(),
+      label: cleanupDisplayLabel(info)
+    }]);
+  }
+  // A duplicated restored identity cannot grant cleanup authorization by either record.
+  for (const [key, matches] of candidates) {
+    if (matches.length !== 1 || offers.has(key)) continue;
+    offers.set(key, matches[0]!);
+  }
+  return [...offers.values()]
+    .sort((a, b) => a.createdAt - b.createdAt || cleanupOfferKey(a).localeCompare(cleanupOfferKey(b)));
+}
+
+/**
+ * Authoritative broker identities eligible for an opt-in cleanup offer. Caller must cross
+ * persistAgentAuthorityNow() before publishing these to UI, and the worktree manager must
+ * independently verify the marker and Git lease before any filesystem operation.
+ */
+export function managedWorktreeCleanupOffers(): ManagedWorktreeCleanupOffer[] {
+  return snapshotSwarm()?.managedWorktreeCleanupOffers?.map(offer => ({ ...offer })) ?? [];
+}
+
+/** Compatibility name for consumers describing offers as allocation identities. */
+export const managedWorkerCleanupIdentities = managedWorktreeCleanupOffers;
+
+export function resolveManagedWorktreeCleanupOffer(runId: string, agentId: string): ManagedWorktreeCleanupOffer | null {
+  if (!managedAllocationRunPattern.test(runId) || !managedAllocationAgentPattern.test(agentId)) return null;
+  return managedWorktreeCleanupOffers().find(offer => offer.runId === runId.toLowerCase() && offer.agentId === agentId) ?? null;
+}
+
+/**
+ * Called only after the worktree manager confirms the checkout was removed. Preserve a durable
+ * closed marker on any retained broker row, so it cannot generate a fresh terminal offer after
+ * the retirement catalog entry is deleted. Caller persists this mutation before reporting success.
+ */
+export function acknowledgeManagedWorktreeCleanupOffer(runId: string, agentId: string): boolean {
+  const offer = resolveManagedWorktreeCleanupOffer(runId, agentId);
+  if (!offer) return false;
+  const key = cleanupOfferKey(offer);
+  const owned = allFamilies().flatMap(owner => [...owner.agents.values()]
+    .filter(agent => cleanupIdentity(agent.info) &&
+      cleanupOfferKey(cleanupIdentity(agent.info)!) === key));
+  if (owned.length > 1 || owned.some(agent =>
+    unpublishedAgents.has(agent) ||
+    (agent.info.state !== 'finished' && !(agent.info.state === 'failed' && agent.info.revivable !== true)))) {
+    return false;
+  }
+  for (const agent of owned) {
+    (agent.info as AgentInfo & { managedWorktreeCleaned?: boolean }).managedWorktreeCleaned = true;
+  }
+  managedWorktreeCleanupHistory.delete(key);
+  changed();
+  return true;
 }
 
 export function snapshotSwarm(): SwarmSnapshot | null {
   return buildSwarmSnapshot(false);
+}
+
+/** What each worker conversation's archive last received, so unchanged workers skip the store. */
+const archivedAssignments = new Map<string, string>();
+
+/**
+ * Project only a snapshot whose broker write succeeded. Also migrate saved history before TTL
+ * pruning. Callers do not wait on it, so it never rejects: a malformed entry is skipped.
+ */
+export async function archiveWorkerAssignments(snapshot: SwarmSnapshot | null): Promise<void> {
+  if (!snapshot || ![4, 5, 6, 7].includes(snapshot.version) || !Number.isFinite(snapshot.savedAt)) return;
+  const groups = snapshot.version >= 6 && Array.isArray(snapshot.activeRuns)
+    ? snapshot.activeRuns : [{ agents: snapshot.agents }];
+  const workers = [...groups, ...(Array.isArray(snapshot.dormantRuns) ? snapshot.dormantRuns : [])]
+    .flatMap(group => Array.isArray(group?.agents) ? group.agents : []);
+  for (const agent of workers) {
+    const info = agent?.info;
+    if (info?.role !== 'worker' || typeof info.conversationId !== 'string' || typeof info.id !== 'string' ||
+        typeof info.label !== 'string' || typeof info.task !== 'string') continue;
+    const key = JSON.stringify([info.id, info.label, info.task]);
+    if (archivedAssignments.get(info.conversationId) === key) continue;
+    try {
+      await recordWorkerAssignment({ conversationId: info.conversationId, agentId: info.id,
+        label: info.label, task: info.task, recordedAt: snapshot.savedAt });
+      archivedAssignments.set(info.conversationId, key);
+    } catch (err) {
+      logWarn(`could not archive worker presentation: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 }
 
 /**
@@ -4762,33 +5317,50 @@ function savedFormerRunIds(saved: unknown, current: string): string[] | undefine
 }
 
 function buildSwarmSnapshot(includeUnpublished: boolean): SwarmSnapshot | null {
-  const active = [...runs.values()].filter(r => includeUnpublished || !unpublishedRuns.has(r));
+  const stageEligible = (run: Run): boolean => {
+    const stage = activeSpawnStages.get(run);
+    return !stage || stage.durableReady;
+  };
+  const active = [...runs.values()].filter(r =>
+    (!unpublishedRuns.has(r) || (includeUnpublished && stageEligible(r))));
   const dormant = [...dormantRuns.values()];
-  if (active.length === 0 && dormant.length === 0) return null;
+  if (active.length === 0 && dormant.length === 0 && retiredManagedWorkerConversations.size === 0 &&
+      managedWorktreeCleanupHistory.size === 0) return null;
   // Legacy top-level projection is deliberately empty with multiple owners. Version 6 readers
   // use activeRuns exclusively; retaining a sole-owner projection keeps older diagnostic readers useful.
   const sole = active.length === 1 ? active[0] : null;
-  return { version: 7, savedAt: Date.now(), runId: sole?.runId ?? null,
+  const snapshot: SwarmSnapshot = { version: 7, savedAt: Date.now(), runId: sole?.runId ?? null,
     ...(sole?.setupProfileId ? { setupProfileId: sole.setupProfileId } : {}),
     primeConversationId: sole?.primeConversationId ?? null, startedAt: sole?.startedAt ?? null,
     agents: sole ? serializeAgents(sole.agents, includeUnpublished) : [],
     activeRuns: active.map(r => ({ runId: r.runId, ...(r.formerRunIds?.length ? { formerRunIds: r.formerRunIds } : {}),
       ...(r.setupProfileId ? { setupProfileId: r.setupProfileId } : {}), primeConversationId: r.primeConversationId,
       primeRequestId: r.primeRequestId,
+      localOwnerId: r.localOwnerId,
       startedAt: r.startedAt, agents: serializeAgents(r.agents, includeUnpublished) })),
+    ...(retiredManagedWorkerConversations.size ? { managedRetiredConversations: [...retiredManagedWorkerConversations] } : {}),
     dormantRuns: dormant.map(h => ({ ...(h.formerRunIds?.length ? { formerRunIds: h.formerRunIds } : {}),
       ...(h.setupProfileId ? { setupProfileId: h.setupProfileId } : {}), primeConversationId: h.primeConversationId, startedAt: h.startedAt,
       primeRequestId: h.primeRequestId,
+      localOwnerId: h.localOwnerId,
       parkedAt: h.parkedAt, agents: serializeAgents(h.agents, includeUnpublished) })) };
+  const offers = collectManagedWorktreeCleanupOffers([
+    ...(snapshot.activeRuns ?? []).map(run => run.agents),
+    ...(snapshot.dormantRuns ?? []).map(run => run.agents)
+  ]);
+  if (offers.length > 0) snapshot.managedWorktreeCleanupOffers = offers;
+  return snapshot;
 }
 
 function serializeAgents(agents: Map<string, Agent>, includeUnpublished: boolean): SerializedAgent[] {
+  const stage = [...activeSpawnStages.values()].find(candidate => candidate.run.agents === agents && !candidate.settled);
+  const stagedEligible = !stage || stage.durableReady;
   const stagedFinishes =
     includeUnpublished
       ? [...activeFinishStages.values()].filter((stage) => !stage.settled && stage.run.agents === agents)
       : [];
   return [...agents.values()]
-    .filter((agent) => includeUnpublished || !unpublishedAgents.has(agent))
+    .filter((agent) => !unpublishedAgents.has(agent) || (includeUnpublished && stagedEligible))
     .map((agent) => {
       const finish = includeUnpublished ? activeFinishStages.get(agent) : undefined;
       const info =
@@ -4850,6 +5422,9 @@ export function restoreSwarm(snapshot: SwarmSnapshot | null): void {
   requestOwnerRecoveryAgain = false;
   runs.clear();
   dormantRuns.clear();
+  retiredManagedWorkerConversations.clear();
+  managedWorktreeHistoryPossible = false;
+  managedWorktreeCleanupHistory.clear();
   unpublishedRuns.clear();
   activeSpawnStages.clear();
   activeFinishStages.clear();
@@ -4861,6 +5436,39 @@ export function restoreSwarm(snapshot: SwarmSnapshot | null): void {
     logInfo('multi-agent: discarded a run saved by an older build — spawn again to start a new one.');
     return;
   }
+  if (Array.isArray(snapshot.managedWorktreeCleanupOffers)) {
+    const seen = new Set<string>();
+    const ambiguous = new Set<string>();
+    for (const offer of snapshot.managedWorktreeCleanupOffers) {
+      if (!offer || typeof offer.runId !== 'string' || typeof offer.agentId !== 'string' ||
+          !managedAllocationRunPattern.test(offer.runId) || !managedAllocationAgentPattern.test(offer.agentId) ||
+          !['completed', 'failed', 'cleared', 'evicted'].includes(offer.reason) ||
+          !Number.isFinite(offer.createdAt) || offer.createdAt <= 0) continue;
+      const normalized: ManagedWorktreeCleanupOffer = {
+        runId: offer.runId.toLowerCase(), agentId: offer.agentId, reason: offer.reason,
+        createdAt: offer.createdAt,
+        ...(typeof offer.label === 'string' && offer.label.length <= 160 && offer.label.trim()
+          ? { label: offer.label } : {})
+      };
+      const key = cleanupOfferKey(normalized);
+      if (seen.has(key)) {
+        managedWorktreeCleanupHistory.delete(key);
+        ambiguous.add(key);
+        continue;
+      }
+      seen.add(key);
+      if (ambiguous.has(key)) continue;
+      managedWorktreeCleanupHistory.set(key, normalized);
+    }
+  }
+  // These rows deny access; they can never grant worker role, checkout ownership or revival.
+  // Restore them before seven-day history pruning adds any newly evicted managed workers.
+  if (Array.isArray(snapshot.managedRetiredConversations)) {
+    for (const conversationId of snapshot.managedRetiredConversations) {
+      if (typeof conversationId === 'string' && conversationId.length > 0 && conversationId.length <= 512)
+        retiredManagedWorkerConversations.add(conversationId);
+    }
+  }
   let repaired = false;
   const occupiedWorkers = new Set<string>();
   const occupiedPrimes = new Set<string>();
@@ -4869,10 +5477,11 @@ export function restoreSwarm(snapshot: SwarmSnapshot | null): void {
   const occupiedRequests = new Set<string>();
   const validRequestOwner = (value: unknown): value is string =>
     typeof value === 'string' && /^[a-z0-9_-]{1,100}$/i.test(value);
-  const acceptOwner = (primeConversationId: string | null, agents: Map<string, Agent>, primeRequestId?: string): boolean => {
+  const acceptOwner = (primeConversationId: string | null, agents: Map<string, Agent>, primeRequestId?: string, localOwnerId?: string): boolean => {
     const prime = agents.get(PRIME_ID);
     if (!prime || prime.info.role !== 'prime' || prime.info.conversationId !== primeConversationId) return false;
-    if (!primeConversationId && !validRequestOwner(primeRequestId)) return false;
+    if (localOwnerId !== undefined && (!validLocalOwner(localOwnerId) || primeConversationId || primeRequestId)) return false;
+    if (!primeConversationId && !validRequestOwner(primeRequestId) && !validLocalOwner(localOwnerId)) return false;
     if (primeRequestId && (!validRequestOwner(primeRequestId) || occupiedRequests.has(primeRequestId))) return false;
     if (primeConversationId && (occupiedWorkers.has(primeConversationId) ||
       (snapshot.version < 7 && occupiedPrimes.has(primeConversationId)) ||
@@ -4896,7 +5505,7 @@ export function restoreSwarm(snapshot: SwarmSnapshot | null): void {
   if (snapshot.version >= 5 && Array.isArray(snapshot.dormantRuns)) {
     for (const saved of snapshot.dormantRuns) {
       if (!saved || (!(typeof saved.primeConversationId === 'string' && saved.primeConversationId) &&
-        !(snapshot.version === 7 && saved.primeConversationId === null && validRequestOwner(saved.primeRequestId))) || !Array.isArray(saved.agents)) {
+        !(snapshot.version === 7 && saved.primeConversationId === null && (validRequestOwner(saved.primeRequestId) || validLocalOwner(saved.localOwnerId)))) || !Array.isArray(saved.agents)) {
         repaired = true;
         continue;
       }
@@ -4914,7 +5523,7 @@ export function restoreSwarm(snapshot: SwarmSnapshot | null): void {
         ? previousRunId : randomUUID();
       const restoredSetupProfileId = setupProfileId(saved.setupProfileId);
       if (saved.setupProfileId !== undefined && !restoredSetupProfileId) repaired = true;
-      if (dormantRuns.has(runId) || !acceptOwner(saved.primeConversationId, restored.agents, snapshot.version === 7 ? saved.primeRequestId : undefined)) {
+      if (dormantRuns.has(runId) || !acceptOwner(saved.primeConversationId, restored.agents, snapshot.version === 7 ? saved.primeRequestId : undefined, saved.localOwnerId)) {
         repaired = true;
         logWarn(`multi-agent: discarded conflicting dormant history for ${saved.primeConversationId}`);
         continue;
@@ -4929,6 +5538,7 @@ export function restoreSwarm(snapshot: SwarmSnapshot | null): void {
         ...(restoredSetupProfileId ? { setupProfileId: restoredSetupProfileId } : {}),
         primeConversationId: saved.primeConversationId,
         primeRequestId: snapshot.version === 7 ? saved.primeRequestId : undefined,
+        localOwnerId: saved.localOwnerId,
         startedAt: Number.isFinite(saved.startedAt) ? saved.startedAt : snapshot.savedAt || Date.now(),
         parkedAt: Number.isFinite(saved.parkedAt) ? saved.parkedAt : snapshot.savedAt || Date.now(),
         agents: restored.agents,
@@ -4944,7 +5554,7 @@ export function restoreSwarm(snapshot: SwarmSnapshot | null): void {
     if (!saved) { repaired = true; continue; }
     const hasActive =
       ((typeof saved.primeConversationId === 'string' && Boolean(saved.primeConversationId)) ||
-        (snapshot.version === 7 && saved.primeConversationId === null && 'primeRequestId' in saved && validRequestOwner(saved.primeRequestId))) &&
+        (snapshot.version === 7 && saved.primeConversationId === null && (('primeRequestId' in saved && validRequestOwner(saved.primeRequestId)) || validLocalOwner(saved.localOwnerId)))) &&
       typeof saved.runId === 'string' &&
       Boolean(saved.runId) &&
       Array.isArray(saved.agents);
@@ -4958,7 +5568,7 @@ export function restoreSwarm(snapshot: SwarmSnapshot | null): void {
         ? saved.primeRequestId : undefined;
       const restored = deserializeAgents(saved.agents, snapshot.savedAt);
       repaired ||= restored.repaired;
-      if (runs.has(saved.runId!) || dormantRuns.has(saved.runId!) || !acceptOwner(primeConversationId, restored.agents, primeRequestId)) {
+      if (runs.has(saved.runId!) || dormantRuns.has(saved.runId!) || !acceptOwner(primeConversationId, restored.agents, primeRequestId, saved.localOwnerId)) {
         logWarn(`multi-agent: discarded active run for ${primeConversationId} because its conversation ownership conflicted`);
         repaired = true;
       } else {
@@ -4980,6 +5590,7 @@ export function restoreSwarm(snapshot: SwarmSnapshot | null): void {
           ...(restoredSetupProfileId ? { setupProfileId: restoredSetupProfileId } : {}),
           primeConversationId,
           primeRequestId,
+          localOwnerId: saved.localOwnerId,
           startedAt: Number.isFinite(saved.startedAt) ? (saved.startedAt as number) : snapshot.savedAt || Date.now(),
           agents: restored.agents,
           transfer: null,
@@ -5031,9 +5642,18 @@ function deserializeAgents(entries: readonly SerializedAgent[], savedAt: number)
       repaired = true;
       continue;
     }
+    const rawAllocation = entry.info.workerAllocationRunId;
+      const allocation = typeof rawAllocation === 'string' &&
+      managedAllocationRunPattern.test(rawAllocation)
+      ? rawAllocation.toLowerCase() : undefined;
+    if (rawAllocation !== undefined && !allocation) repaired = true;
     const agent: Agent = {
       info: {
         ...entry.info,
+        workerAllocationRunId: allocation,
+        managedWorktree: entry.info.managedWorktree === true,
+        managedWorktreeCleaned: entry.info.managedWorktree === true && cleanupAcknowledged(entry.info),
+        jobTitle: typeof entry.info.jobTitle === 'string' && entry.info.jobTitle ? entry.info.jobTitle.slice(0, 160) : undefined,
         model: isModelSlug(entry.info.model) ? entry.info.model : null,
         reasoningEffort: isReasoningEffort(entry.info.reasoningEffort) ? entry.info.reasoningEffort : null,
         sleptAt: typeof entry.info.sleptAt === 'number' ? entry.info.sleptAt : null,
@@ -5094,6 +5714,7 @@ function deserializeAgents(entries: readonly SerializedAgent[], savedAt: number)
     }
     recount(agent);
     agents.set(entry.info.id, agent);
+    if (agent.info.role === 'worker' && agent.info.managedWorktree) managedWorktreeHistoryPossible = true;
   }
   return { agents, repaired };
 }
@@ -5105,7 +5726,12 @@ export function resetAgentsForTests(): void {
   requestOwnerRecoveryAgain = false;
   runs.clear();
   dormantRuns.clear();
+  retiredManagedWorkerConversations.clear();
+  managedWorktreeHistoryPossible = false;
+  managedWorktreeCleanupHistory.clear();
+  archivedAssignments.clear();
   consecutiveWakeFailures.clear();
+  transientWakeRetries.clear();
   pageGenerating.clear();
   unpublishedRuns.clear();
   activeSpawnStages.clear();
@@ -5123,4 +5749,6 @@ export function resetAgentsForTests(): void {
   retiredPersistNow = null;
   listeners.clear();
   endListeners.clear();
+  retireListeners.clear();
+  finishListeners.clear();
 }

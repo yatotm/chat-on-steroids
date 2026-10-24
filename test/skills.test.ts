@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   importSkillFile,
+  importSkillPackage,
   initSkillsPath,
   listSkills,
   readSkill,
@@ -74,7 +75,8 @@ describe('managed Skills store', () => {
     expect(await readSkill(summary.id)).toEqual({ summary, text });
     expect(await fs.readFile(path.join(userData, 'skills', summary.id, 'SKILL.md'), 'utf8')).toBe(text);
     const advertised = skillCatalogInstructions();
-    expect(advertised).toContain(JSON.stringify(summary));
+    expect(advertised).toContain(JSON.stringify({ id: summary.id, name: summary.name, description: summary.description }));
+    expect(advertised).not.toContain(JSON.stringify(summary.path));
     expect(advertised).not.toContain('Use the entire file');
     expect(advertised).toContain(JSON.stringify(path.join(userData, 'skills')));
   });
@@ -117,7 +119,7 @@ describe('managed Skills store', () => {
       id: 'code-review', name: 'Code Review',
       description: 'Review source code for correctness and maintainability.'
     });
-    expect(skillCatalogInstructions()).toContain(JSON.stringify(summary));
+    expect(skillCatalogInstructions()).toContain(JSON.stringify({ id: summary.id, name: summary.name, description: summary.description }));
     expect(skillCatalogInstructions()).not.toContain('BODY_ONLY_MUST_NOT_REPLACE_METADATA');
     // Rebuilding the published catalog uses the same parsed metadata. The text decoder
     // already strips a BOM; the stored source bytes still retain it and the original CRLF.
@@ -272,15 +274,14 @@ describe('managed Skills store', () => {
       expect(opened.some(file => process.platform === 'win32'
         ? file.toLowerCase() === maliciousFile.toLowerCase()
         : file === maliciousFile)).toBe(false);
-      if (retargeted) {
-        // The scan followed the link and saw it retargeted: it must refuse, not read through.
-        expect('error' in outcome ? String(outcome.error) : '').toMatch(/managed Skills folder changed/i);
+      if ('error' in outcome) {
+        expect(String(outcome.error)).toMatch(/managed Skills folder changed/i);
       } else {
-        // The Windows arm64 release runner did not list the junction-linked package at all
-        // (2.1.25 publish, twice, same image and Node as the passing 2.1.24 run). Then the race
-        // cannot happen there; the package must simply be absent, never read through the link.
-        expect('skills' in outcome ? outcome.skills.map(skill => skill.name) : []).not.toContain('race-review');
+        // 文件层已拒绝换指向的链接；同一文件系统时钟粒度内，父目录时间戳可能不变。
+        expect(outcome.skills.map(skill => skill.id)).not.toContain('race-review');
       }
+      expect(JSON.stringify(outcome)).not.toContain('SECRET_TEXT');
+      if (retargeted) await expect(readSkill('race-review')).rejects.toThrow(/not found/i);
     } finally {
       lstatSpy.mockRestore();
       openSpy.mockRestore();
@@ -288,14 +289,59 @@ describe('managed Skills store', () => {
     }
   });
 
-  it('fails closed instead of silently omitting a valid 65th skill', async () => {
+  it('loads a 114-skill managed library without the legacy 64-skill ceiling', async () => {
+    const root = path.join(userData, 'skills');
+    for (let index = 0; index < 114; index++) {
+      const id = `skill-${String(index).padStart(3, '0')}`;
+      await fs.mkdir(path.join(root, id));
+      await fs.writeFile(path.join(root, id, 'SKILL.md'), `# ${id}\n\nInstruction ${index}.`);
+    }
+    await expect(listSkills()).resolves.toHaveLength(114);
+  });
+
+  it('bounds connector Skill catalog instructions with 128 maximum-description skills', async () => {
+    const root = path.join(userData, 'skills');
+    const description = 'x'.repeat(240);
+    for (let index = 0; index < MAX_SKILLS; index++) {
+      const id = `skill-${String(index).padStart(3, '0')}`;
+      await fs.mkdir(path.join(root, id));
+      await fs.writeFile(path.join(root, id, 'SKILL.md'), `---\nname: ${id}\ndescription: ${description}\n---\n`);
+    }
+    await expect(listSkills()).resolves.toHaveLength(MAX_SKILLS);
+    const instructions = skillCatalogInstructions();
+    expect(instructions.length).toBeLessThan(8_000);
+    expect(instructions).toMatch(/more skills are installed; read \/skills to list them\./);
+  });
+
+  it('rejects file and package imports beyond 128 with the translated limit key', async () => {
+    const root = path.join(userData, 'skills');
+    for (let index = 0; index < MAX_SKILLS; index++) {
+      const id = `skill-${String(index).padStart(3, '0')}`;
+      await fs.mkdir(path.join(root, id));
+      await fs.writeFile(path.join(root, id, 'SKILL.md'), `# ${id}\n\nInstruction ${index}.`);
+    }
+    await expect(listSkills()).resolves.toHaveLength(MAX_SKILLS);
+
+    const limitError = 'The Skills library supports at most 128 skills';
+    const file = await sourceFile('overflow-file.md', '# Overflow file\n\nMust not be imported.');
+    await expect(importSkillFile(file)).rejects.toThrow(limitError);
+
+    const packageRoot = path.join(sources, 'overflow-package');
+    await fs.mkdir(packageRoot);
+    await fs.writeFile(path.join(packageRoot, 'SKILL.md'), [
+      '---', 'name: Overflow Package', 'description: Must not be imported.', '---', '', 'Body.'
+    ].join('\n'));
+    await expect(importSkillPackage(packageRoot)).rejects.toThrow(limitError);
+  });
+
+  it('fails closed instead of silently omitting a valid over-cap skill', async () => {
     const root = path.join(userData, 'skills');
     for (let index = 0; index <= MAX_SKILLS; index++) {
       const id = `skill-${String(index).padStart(2, '0')}`;
       await fs.mkdir(path.join(root, id));
       await fs.writeFile(path.join(root, id, 'SKILL.md'), `# ${id}\n\nInstruction ${index}.`);
     }
-    await expect(listSkills()).rejects.toThrow(/64 skills/i);
+    await expect(listSkills()).rejects.toThrow(/128 skills/i);
   });
 
   it('bounds unrelated directory enumeration instead of scanning an arbitrary library', async () => {

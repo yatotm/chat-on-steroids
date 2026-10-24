@@ -148,6 +148,23 @@ it('keeps an unknown non-Latin saved worker model unverified instead of matching
   expect(model.value).toBe('完全不同'); expect(model.selectedOptions[0]!.disabled).toBe(true);
 });
 
+it('shows the built-in Goal, Loop and Plan model as the one GPT-6 the picker lists (#1217)', async () => {
+  // 2.1.31 test round: the default was the lane alias gpt-6-thinking, so this select listed "GPT-6" and
+  // a selected "GPT-6 · gpt-6-thinking" with its internal id on every fresh install.
+  dom = new JSDOM(await readFile('src/renderer/index.html', 'utf8'));
+  vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document);
+  const models = [
+    { id: 'gpt-6', label: 'GPT-6', efforts: ['none', 'medium', 'high', 'xhigh'], aliases: ['gpt-6', 'gpt-6-thinking'] },
+    { id: 'gpt-5-6', label: 'GPT-5.6', efforts: ['none', 'medium', 'high', 'xhigh'] }];
+  Object.assign(dom.window, { api: { getChatModels: async () => ({ ok: true, data: { state: 'ready', models } }) } });
+  const { initChatModels, applyChatModels } = await import('../src/renderer/chat-models.js');
+  initChatModels(); applyChatModels({ multiAgent: {}, goal: {} } as Config); await Promise.resolve(); await Promise.resolve();
+  const helper = dom.window.document.getElementById('helperModel') as HTMLSelectElement;
+  expect([...helper.options].map(option => option.textContent)).toEqual(['GPT-6', 'GPT-5.6']);
+  expect(helper.value).toBe('gpt-6');
+  expect((dom.window.document.getElementById('helperReasoning') as HTMLSelectElement).value).toBe('high');
+});
+
 it.each([true, false])('a model-rejection refresh waits beyond cached availability (still available=%s)', async available => {
   dom = new JSDOM(await readFile('src/renderer/index.html', 'utf8'));
   vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document);
@@ -269,8 +286,24 @@ it('disambiguates duplicate account model labels by their observed lane', async 
   const { initChatModels, applyChatModels } = await import('../src/renderer/chat-models.js');
   initChatModels(); applyChatModels({ multiAgent: {}, goal: {} } as Config); await Promise.resolve();
   const labels = [...dom.window.document.querySelectorAll<HTMLOptionElement>('#workerModel option')].map(option => option.textContent);
-  expect(labels).toEqual(['5.6 · Instant', '5.6 · Reasoning', '5.5 · Instant', '5.5 · Reasoning']);
-  expect([...dom.window.document.querySelectorAll<HTMLOptionElement>('#workerModel option')].map(option => option.value)).toEqual(models.map(model => model.id));
+  expect(labels).toEqual(['Automatic', '5.6 · Instant', '5.6 · Reasoning', '5.5 · Instant', '5.5 · Reasoning']);
+  expect([...dom.window.document.querySelectorAll<HTMLOptionElement>('#workerModel option')].map(option => option.value)).toEqual(['', ...models.map(model => model.id)]);
+});
+
+it('shows a sub-agent default that was never chosen as Automatic, which is what workers then use', async () => {
+  dom = new JSDOM(await readFile('src/renderer/index.html', 'utf8'));
+  vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document);
+  const models = [{ id: 'gpt-6', label: 'GPT-6', efforts: ['medium', 'high'] }, { id: 'gpt-5-6', label: '5.6', efforts: ['none'] }];
+  Object.assign(dom.window, { api: { getChatModels: async () => ({ ok: true, data: { state: 'ready', requestedAt: 1, observedAt: 2, models } }) } });
+  const { initChatModels, applyChatModels } = await import('../src/renderer/chat-models.js');
+  initChatModels(); applyChatModels({ multiAgent: { defaultModel: '', defaultReasoning: '' }, goal: {} } as Config); await Promise.resolve();
+  const shown = (id: string) => { const select = dom.window.document.getElementById(id) as HTMLSelectElement; return [select.value, select.selectedOptions[0]?.textContent]; };
+  expect(shown('workerModel')).toEqual(['', 'Automatic']);
+  expect(shown('workerReasoning')).toEqual(['', 'Automatic']);
+  // A chosen default stays exactly that, with its own efforts.
+  applyChatModels({ multiAgent: { defaultModel: 'gpt-6', defaultReasoning: 'high' }, goal: {} } as Config); await Promise.resolve();
+  expect(shown('workerModel')).toEqual(['gpt-6', 'GPT-6']);
+  expect(shown('workerReasoning')).toEqual(['high', 'High']);
 });
 
 it('binds composer selection to the selected session across delayed catalog, user edits and A-B-A navigation', async () => {
@@ -413,7 +446,7 @@ it('uses observed account choices, preserves unverified defaults, and clears inc
   dom = new JSDOM('<span id="composerModelLabel"></span><p id="chatModelStatus"></p>' +
     ['composerModel', 'composerReasoning', 'workerModel', 'workerReasoning', 'helperModel', 'helperReasoning'].map(id => `<select id="${id}"><option value="">Default</option></select>`).join(''));
   const observed = { state: 'ready', requestedAt: 1, observedAt: Date.now(), models: [
-    { id: 'first', label: 'GPT-5.6 Sol', efforts: ['high'] }, { id: 'second', label: 'GPT-6', efforts: ['medium'] }
+    { id: 'first', label: 'GPT-5.6 Sol', efforts: ['high'] }, { id: 'gpt-6-thinking', label: 'GPT-6', efforts: ['medium'] }
   ] };
   Object.assign(dom.window, { api: { getChatModels: async () => ({ ok: true, data: observed }) } });
   vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document);
@@ -427,18 +460,22 @@ it('uses observed account choices, preserves unverified defaults, and clears inc
   expect(select('workerModel').selectedOptions[0]!.disabled).toBe(true);
   expect(select('workerModel').selectedOptions[0]!.textContent).toBe('unseen');
   expect(dom.window.document.getElementById('workerModelVerification')!.textContent).toBe('Unverified');
+  // The badge says what runs instead, not just that something is wrong.
+  expect(dom.window.document.getElementById('workerModelVerification')!.title)
+    .toBe("This ChatGPT account doesn't offer this model, so ChatGPT's current model is used.");
   expect(dom.window.document.getElementById('helperModelVerification')!.hasAttribute('hidden')).toBe(true);
-  expect(select('helperModel').value).toBe('first');
+  // The built-in helper default is the GPT-6 family; this account lists it as gpt-6-thinking, which it resolves to.
+  expect(select('helperModel').value).toBe('gpt-6-thinking');
   // Selects without the badge still say so in the option itself.
   applyChatModels({ multiAgent: { defaultModel: 'unseen', defaultReasoning: 'high' }, goal: { helperModel: 'first', helperReasoning: 'ultra' } } as Config);
   await Promise.resolve();
   expect(select('helperReasoning').value).toBe('ultra');
   expect(select('helperReasoning').selectedOptions[0]!.textContent).toBe('ultra · not verified');
-  expect([...select('composerModel').options].map(row => row.value)).toEqual(['first', 'second']);
+  expect([...select('composerModel').options].map(row => row.value)).toEqual(['first', 'gpt-6-thinking']);
   select('composerModel').value = 'first'; select('composerModel').dispatchEvent(new dom.window.Event('change'));
   expect([...select('composerReasoning').options].map(row => row.value)).toEqual(['high']);
   select('composerReasoning').value = 'high';
-  select('composerModel').value = 'second'; select('composerModel').dispatchEvent(new dom.window.Event('change'));
+  select('composerModel').value = 'gpt-6-thinking'; select('composerModel').dispatchEvent(new dom.window.Event('change'));
   expect(select('composerReasoning').value).toBe('medium');
   expect([...select('composerReasoning').options].map(row => row.value)).toEqual(['medium']);
 });
@@ -612,7 +649,7 @@ it('preserves an observed saved execution slug together with its Pro reasoning',
   const { initChatModels, applyChatModels } = await import('../src/renderer/chat-models.js');
   initChatModels(); applyChatModels({ multiAgent: { defaultModel: 'gpt-5-6-pro', defaultReasoning: 'pro' }, goal: {} } as Config); await Promise.resolve();
   const model = dom.window.document.getElementById('workerModel') as HTMLSelectElement;
-  expect(model.value).toBe('gpt-5-6-pro'); expect(model.options).toHaveLength(2);
+  expect(model.value).toBe('gpt-5-6-pro'); expect([...model.options].map(option => option.value)).toEqual(['', '5.6', 'gpt-5-6-pro']);
   expect((dom.window.document.getElementById('workerReasoning') as HTMLSelectElement).value).toBe('pro');
 });
 it('preserves worker execution aliases without inferring a different family effort', async () => {

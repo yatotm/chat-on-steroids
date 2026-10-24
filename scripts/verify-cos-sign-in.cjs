@@ -108,8 +108,14 @@ async function loadHost(launched) {
     plugins: [{ name: 'record-browser-launch', setup(build) {
       build.onResolve({ filter: /^\.\.\/browser\.js$/ }, args => args.importer.endsWith(path.join('cos-browser', 'host.ts'))
         ? { path: 'fixture-browser', namespace: 'fixture' } : undefined);
+      // 无桌面浏览器的 CI 使用 Electron 文件图标；浏览器启动仍由夹具记录，不实际执行。
       build.onLoad({ filter: /.*/, namespace: 'fixture' }, () => ({ resolveDir: root, loader: 'js', contents: `
-        export { EXTERNAL_BROWSER_LABELS, installedSignInBrowsers } from ${JSON.stringify(browserTs)};
+        import { installedSignInBrowsers as installed } from ${JSON.stringify(browserTs)};
+        export { EXTERNAL_BROWSER_LABELS } from ${JSON.stringify(browserTs)};
+        export const installedSignInBrowsers = () => {
+          const browsers = installed();
+          return browsers.length ? browsers : [{ browser: 'chrome', executable: process.execPath }];
+        };
         export async function openBrowserSignIn(browser) { globalThis.__cosFixtureLaunched.push(browser); return 'fixture'; }` }));
     } }]
   });

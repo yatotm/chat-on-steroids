@@ -12,7 +12,8 @@
  */
 import { isStopNoticeText, type StopNoticeText } from '../shared/stop-notice.js';
 
-let notify: ((title: string, body: string, sessionId: string) => boolean | void) | null = null;
+/** `browser` opens the chat's ChatGPT page on click instead of the chat in the app. */
+let notify: ((title: string, body: string, sessionId: string, open?: 'app' | 'browser') => boolean | void) | null = null;
 
 /** The renderer's current translations of the notice texts; English until it publishes them. */
 let translations = new Map<StopNoticeText, string>();
@@ -34,6 +35,21 @@ export function noticeChatStopped(title: StopNoticeText, body: StopNoticeText, s
     notify?.(translations.get(title) ?? title, translations.get(body) ?? body, sessionId);
   } catch {
     // A desktop that cannot show a notice still has the timeline note beside this call.
+  }
+}
+
+/**
+ * Reports one chat whose ChatGPT page waits for the user to answer a tool approval card.
+ * The caller notices once per card; the click opens the chat in the app, where the card can be
+ * answered since 2.1.38 (its row offers Deny and Allow once), or opened in the browser.
+ */
+export function noticeApprovalWaiting(sessionId: string): void {
+  const title = 'ChatGPT is waiting for your approval';
+  const body = 'A chat is paused until you allow or deny a tool call in ChatGPT. Click to answer it in the app.';
+  try {
+    notify?.(translations.get(title) ?? title, translations.get(body) ?? body, sessionId);
+  } catch {
+    // The chat's timeline row still says it.
   }
 }
 

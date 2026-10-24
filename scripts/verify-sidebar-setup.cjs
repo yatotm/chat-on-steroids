@@ -6,6 +6,7 @@ if (!process.versions.electron) {
   process.stdout.write(result.stdout || ''); process.stderr.write(result.stderr || '');
   process.exit(result.status ?? 1);
 }
+const { withoutScripts } = require('./ui-check-page.cjs');
 const { app, BrowserWindow } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -41,7 +42,12 @@ app.whenReady().then(async () => {
       estimatedTokens:0,contextTokens:0,lastHandoffId:null,lastHandoffAt:null,lastTurnOutcome:null,activeTurnId:null,agents:[],origin:null}));
     const ok=data=>Promise.resolve({ok:true,data});
     window.api = new Proxy({ getState:()=>ok(state),getLog:()=>ok([]),
-      listProjects:()=>ok(projects),listSessions:()=>ok({sessions:rows,total:22,nextCursor:null,activeId:null,pressure:[],blocked:[]}),
+      listProjects:()=>ok(projects),listSessions:options=>{
+        // ?older=1: the second project also has a chat older than the newest page, which only its own page returns (#1190).
+        const older = new URL(location.href).searchParams.has('older') && options?.projectId === 'second-project';
+        const page = older ? [{...rows[0],id:'older-task',title:'Earlier project chat',projectId:'second-project',updatedAt:1}] : options?.projectId ? [] : rows;
+        return ok({sessions:page,total:22,nextCursor:null,activeId:null,pressure:[],blocked:[]});
+      },
       setProjectColor:(id,color)=>{const value=projects.find(row=>row.id===id);if(!value)return Promise.resolve({ok:false,error:'Project not found'});if(color)value.color=color;else delete value.color;return ok({...value})},
       getSwarm:()=>ok({running:false,runId:null,agents:[],maxWorkers:2,pendingReports:0}),
       getChatModels:()=>ok({state:'unknown',models:[]}),
@@ -65,8 +71,7 @@ app.whenReady().then(async () => {
   const server = await createServer({ configFile:false, root:path.join(root,'src/renderer'),
     server:{host:'127.0.0.1',port:0,fs:{allow:[root,...iconFiles]}}, plugins:[{ name:'sidebar-fixture', configureServer(vite) {
       vite.middlewares.use('/fixture.html', async (_request,response) => {
-        const source = fs.readFileSync(path.join(root,'src/renderer/index.html'),'utf8')
-          .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi,'').replace('</body>', '<script type="module">'+fixture+'</script></body>');
+        const source = withoutScripts(fs.readFileSync(path.join(root,'src/renderer/index.html'),'utf8')).replace('</body>', '<script type="module">'+fixture+'</script></body>');
         response.setHeader('Content-Type','text/html'); response.end(await vite.transformIndexHtml('/fixture.html',source));
       });
     }}] });
@@ -85,6 +90,14 @@ app.whenReady().then(async () => {
     for(let i=0;i<100 && !(await js('!!window.fixtureReady && document.querySelectorAll(".project-group > .sess").length === 5'));i++) await new Promise(r=>setTimeout(r,25));
     assert.equal(await js(`Promise.all(['CoS Phosphor','CoS Phosphor Fill'].map(name=>document.fonts.load('16px "'+name+'"'))).then(faces=>faces.every(face=>face.length>0))`),true,
       'The actual bundled icon faces must load before visual evidence is captured');
+    // The list's scrollbar room stays reserved: rows keep their width whether or not the list
+    // needs a scrollbar (a project filter or collapsed sections made the Inbox toolbar jump).
+    const headingRight = () => js(`Math.round(document.querySelector('.project-heading').getBoundingClientRect().right)`);
+    const shortList = await headingRight();
+    await js(`(() => {const s=document.querySelector('.sidebar-sessions > .scroll');const spacer=document.createElement('div');spacer.id='overflowSpacer';spacer.style.height='4000px';s.append(spacer);return s.scrollHeight>s.clientHeight})()`);
+    const longList = await headingRight();
+    await js(`document.getElementById('overflowSpacer').remove()`);
+    assert.equal(longList, shortList, 'A scrolling chat list keeps the width of a short one');
     await js(`window.disclosureEvents=[]; for(const type of ['keydown','keypress','keyup','click']) document.addEventListener(type,e=>window.disclosureEvents.push({type,key:e.key,tag:e.target.tagName,cls:e.target.className,open:document.querySelector('.project-group')?.open}),true)`);
     // Project groups start closed. Exercise native summary activation before the
     // existing visible-row geometry, drag ordering and pagination checks.
@@ -107,32 +120,47 @@ app.whenReady().then(async () => {
     // before checking the idle baseline; hover/focus are separately intended to reveal the control.
     win.webContents.sendInputEvent({type:'mouseMove',x:1090,y:890});
     await js('document.activeElement?.blur(); new Promise(r=>requestAnimationFrame(r))');
-    assert.equal(await js(`document.querySelector('.project-color').dataset.color`),'');
-    assert.equal(await js(`getComputedStyle(document.querySelector('.project-color')).opacity`),'0');
-    await js(`document.querySelector('.project-color').click()`);
-    assert.equal(await js(`document.querySelector('.project-color').getAttribute('aria-expanded')`),'true');
-    await js(`document.querySelector('[data-project-color-choice="blue"]').focus()`);
-    win.webContents.sendInputEvent({type:'keyDown',keyCode:'Enter'});
-    // Include Enter's native character event, as for the summary activation below.
-    win.webContents.sendInputEvent({type:'char',keyCode:'\r'});
-    win.webContents.sendInputEvent({type:'keyUp',keyCode:'Enter'});
+    // Two quiet buttons on the project row: the new chat, then one "⋯" whose menu holds color and removal.
+    assert.equal(await js(`document.querySelector('.project-group').dataset.projectColor`),undefined);
+    assert.equal(await js(`getComputedStyle(document.querySelector('.project-menu')).opacity`),'0');
+    assert.equal(await js(`getComputedStyle(document.querySelector('.project-new')).opacity`),'0');
+    assert.deepEqual(await js(`[...document.querySelector('.project-heading').querySelectorAll('button')].map(b=>b.classList.contains('project-new')?'new':b.classList.contains('project-menu')?'menu':b.className)`),['new','menu']);
+    const press=keyCode=>{for (const type of ['keyDown','char','keyUp']) if (type!=='char'||keyCode==='Enter') win.webContents.sendInputEvent({type,keyCode:type==='char'?'\r':keyCode});};
+    await js(`document.querySelector('.project-menu').click()`);
+    assert.equal(await js(`document.querySelector('.project-menu').getAttribute('aria-expanded')`),'true');
+    // The menu and its submenu stay inside the window: the old color popup was cut by the sidebar.
+    await js(`document.querySelector('.row-menu [data-row-action="color"]').focus()`);
+    press('Right');
+    for(let i=0;i<100 && await js(`document.querySelectorAll('.row-menu').length!==2`);i++) await new Promise(r=>setTimeout(r,10));
+    const fits=await js(`[...document.querySelectorAll('.row-menu')].map(m=>{const r=m.getBoundingClientRect();return r.left>=0&&r.top>=0&&r.right<=innerWidth&&r.bottom<=innerHeight})`);
+    assert.deepEqual(fits,[true,true],'The menu and its Color submenu fit in the window');
+    assert.equal(await js(`document.activeElement.dataset.rowAction`),'color-none','The submenu opens on the current color');
+    await screenshot('project-menu-color.png');
+    press('Down');
+    // Input events are handled asynchronously; a slow runner read the focus before the key landed.
+    for(let i=0;i<100 && await js(`document.activeElement.dataset.rowAction==='color-none'`);i++) await new Promise(r=>setTimeout(r,10));
+    assert.equal(await js(`document.activeElement.dataset.rowAction`),'color-blue');
+    press('Enter');
     for(let i=0;i<100 && await js(`document.querySelector('.project-group').dataset.projectColor!=='blue'`);i++) await new Promise(r=>setTimeout(r,10));
     assert.equal(await js(`document.querySelector('.project-group').dataset.projectColor`),'blue');
-    assert.equal(await js(`document.querySelector('.project-color').dataset.color`),'blue');
-    assert.equal(await js(`getComputedStyle(document.querySelector('.project-color')).opacity`),'1');
+    assert.equal(await js(`getComputedStyle(document.querySelector('.project-heading > .ico')).color`),'rgb(76, 127, 193)','The folder wears the project color');
+    assert.equal(await js(`document.querySelectorAll('.row-menu').length`),0);
     await screenshot('project-color-blue.png');
-    assert.equal(await js(`document.activeElement===document.querySelector('.project-color')`),true,
-      'Saving a keyboard-selected swatch must return focus to its project color button');
+    assert.equal(await js(`document.activeElement===document.querySelector('.project-menu')`),true,
+      'Saving a keyboard-selected color must return focus to its project menu button');
     // A later completion must not take focus back from a newer composer interaction.
     await js(`window.originalColorSave=window.api.setProjectColor;
       window.api.setProjectColor=(id,value)=>new Promise(resolve=>{window.completeColorSave=()=>window.originalColorSave(id,value).then(resolve)});
-      document.querySelector('.project-color').click();
-      document.querySelector('[data-project-color-choice="green"]').focus()`);
-    for (const type of ['keyDown','char','keyUp']) win.webContents.sendInputEvent({type,keyCode:type==='char'?'\r':'Enter'});
+      document.querySelector('.project-menu').click();
+      document.querySelector('.row-menu [data-row-action="color"]').click();
+      document.querySelector('.row-menu [data-row-action="color-green"]').focus()`);
+    press('Enter');
+    for(let i=0;i<100 && await js(`typeof window.completeColorSave!=='function'`);i++) await new Promise(r=>setTimeout(r,10));
     assert.equal(await js(`typeof window.completeColorSave`),'function');
     const composerPoint = await js(`(() => {const r=document.getElementById('chatInput').getBoundingClientRect();return {x:Math.round(r.left+20),y:Math.round(r.top+r.height/2)}})()`);
     win.webContents.sendInputEvent({type:'mouseDown',button:'left',clickCount:1,...composerPoint});
     win.webContents.sendInputEvent({type:'mouseUp',button:'left',clickCount:1,...composerPoint});
+    for(let i=0;i<100 && await js(`document.activeElement!==document.getElementById('chatInput')`);i++) await new Promise(r=>setTimeout(r,10));
     assert.equal(await js(`document.activeElement===document.getElementById('chatInput')`),true);
     await js(`window.completeColorSave()`);
     for(let i=0;i<100 && await js(`document.querySelector('.project-group').dataset.projectColor!=='green'`);i++) await new Promise(r=>setTimeout(r,10));
@@ -189,7 +217,11 @@ app.whenReady().then(async () => {
     for(const [width,zoom] of [[1100,1],[800,1],[1100,1.17],[800,1.17],[1100,1.5]]) {
       win.setSize(width,900); win.webContents.setZoomFactor(zoom);
       await js('new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))');
-      await js(`document.getElementById('setupProfile').scrollIntoView({block:'center'});document.getElementById('setupProfile').click()`);
+      // Scroll, let a frame pass, then open: anchor fallbacks (flip-block) are chosen from the frame's
+      // scroll snapshot, so opening in the same task as the scroll could keep a stale "below" placement.
+      await js(`document.getElementById('setupProfile').scrollIntoView({block:'center'})`);
+      await js('new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))');
+      await js(`document.getElementById('setupProfile').click()`);
       await js('new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))');
       const profileBounds = await js(`(() => {const r=document.getElementById('setupProfileMenu').getBoundingClientRect();return {width:r.width,left:r.left,right:r.right,top:r.top,bottom:r.bottom,viewport:[innerWidth,innerHeight],open:document.getElementById('setupProfileMenu').matches(':popover-open')}})()`);
       assert.ok(profileBounds.width>0 && profileBounds.right<=profileBounds.viewport[0] && profileBounds.left>=0 && profileBounds.top>=0 && profileBounds.bottom<=profileBounds.viewport[1],JSON.stringify({width,zoom,profileBounds}));
@@ -277,6 +309,17 @@ app.whenReady().then(async () => {
     for(let i=0;i<100 && !(await js('!!window.fixtureReady && document.querySelectorAll(".project-group").length === 2'));i++) await new Promise(r=>setTimeout(r,25));
     assert.deepEqual(await js(projectOrder),['second-project','demo-project']);
     await screenshot('project-order-restored.png');
+    // A project's chats older than the newest page appear when it is expanded, and nothing gets selected.
+    await win.loadURL(server.resolvedUrls.local[0]+'fixture.html?reset=1&older=1');
+    for(let i=0;i<100 && !(await js('!!window.fixtureReady && document.querySelectorAll(".project-group").length === 2'));i++) await new Promise(r=>setTimeout(r,25));
+    assert.equal(await js(`document.querySelector('[data-id="older-task"]')===null`),true);
+    await screenshot('older-project-before.png');
+    await js(`document.querySelector('[data-project-id="second-project"] summary').click()`);
+    for(let i=0;i<100 && await js(`document.querySelector('[data-id="older-task"]')===null`);i++) await new Promise(r=>setTimeout(r,25));
+    assert.equal(await js(`document.querySelector('[data-project-id="second-project"]').open`),true);
+    assert.equal(await js(`document.querySelector('[data-project-id="second-project"] [data-id="older-task"]').textContent.includes('Earlier project chat')`),true);
+    assert.equal(await js(`document.querySelector('.sess.is-sel')===null`),true);
+    await screenshot('older-project-after.png');
     console.log(JSON.stringify({projectDisclosure:{initiallyCollapsed:true,pointer:true,space:true,enter:true},geometry,drag:moved,projectOrder:{pointer:true,keyboard:true,restored:true},showMore:13,collapse:true,profileLayout:compactProfiles,longProfile,output}));
   } finally { win?.destroy(); await server.close(); app.quit(); }
 }).catch(error=>{console.error(error);app.exit(1)});

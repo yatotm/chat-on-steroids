@@ -1,41 +1,75 @@
-import { rawPromises as fs } from '../rawfs.js';
-import { formatBytes } from '../fsops.js';
-import { exportImage, ImageExportError, type ImageExportResult } from '../image-export.js';
-import { saveImageFile } from '../image-file.js';
-import { connectorName } from '../../shared/connector-names.js';
-import { unifiedExecManager } from '../codex/manager.js';
-import { registerExecutionTools } from './tools-execution.js';
-import { processCustody, executionPrincipal } from '../codex/ownership.js';
-import { hasRemoteProjects, sessionProjectBinding } from '../projects.js';
-import { callRemoteCore } from '../remote-workspace.js';
-import { isCoreExecutionTool } from '../../shared/remote-execution.js';
 import { toolDeclaration } from './tool-declarations.js';
 import { registerPlanTool } from './plan-tool.js';
 import { goalWorkerChat, imageExportCapable } from '../bridge.js';
+import { exportImage, ImageExportError } from '../image-export.js';
+import { awaitRequestCorrelation } from '../session/correlation.js';
 import { announceSessionFinish, sessionFinishDeadline } from '../session/finish.js';
-import { effectiveCapabilities, getConfig } from '../config.js';
-/** Core 对外保持一个入口，文件执行与会话编排各有唯一宿主。 */
+import { getConfig } from '../config.js';
+import { liveConnectorName } from './surfaces.js';
+/**
+ * The Core connector: reading, changing and running code on this PC.
+ *
+ * A no-query discovery returns every exposed schema here at once. Keep the surface
+ * bounded and derive its count from the live declarations in surfaces.ts.
+ *
+ * The surface separates primitives from procedures: `exec_command` can run git, so `git`
+ * is a skill rather than a tool; `read` can open a directory, a text file or an image,
+ * because those are three shapes of one question. Anything that reads as "and also, for
+ * this special case…" belongs in a skill over these primitives, not in a schema every
+ * conversation pays for.
+ */
+
+import { rawPromises as fs } from '../rawfs.js';
 import { z } from 'zod';
+import { formatBytes } from '../fsops.js';
 import { logInfo, logWarn } from '../logger.js';
-import { currentWorkspace } from '../workspace.js';
+import { currentWorkspace, primeWorkspace } from '../workspace.js';
+import { getSessionProject } from '../projects.js';
+import { acceptAgentMutation, measureSleepingWorkers, spawnAgentWorkers } from '../agent-admission.js';
 import { REASONING_EFFORTS } from '../../shared/session.js';
-
-import { agentForCaller, agentFamiliesForCaller, reconcileAgentRequestOwners, noteAgentContextTokens, persistCriticalSwarmNow, PRIME_ID, requestWorkerBootstraps, requestWorkerRevivals, statusForCaller, stageFinishAgent, stageMessages, stagePrimeMessage, stageSpawn, swarmRunning, swarmStateForCaller, type Caller } from '../agents.js';
+import { approvalCardWaiting } from '../approval-wait.js';
+import { unifiedExecManager } from '../codex/manager.js';
+import { executionPrincipal } from '../codex/ownership.js';
+import {
+  agentForCaller,
+  agentFamiliesForCaller,
+  reconcileAgentRequestOwners,
+  PRIME_ID,
+  requestWorkerBootstraps,
+  requestWorkerRevivals,
+  statusForCaller,
+  stageFinishAgent,
+  stageMessages,
+  stagePrimeMessage,
+  managedWorkerIsolationRequired,
+  managedWorkerAllocationIdentity,
+  swarmRunning,
+  type Caller
+} from '../agents.js';
 import { repairPrimeFromResumeShadow } from '../session/continuation.js';
-import { currentCall, currentCaller, runInCallContext } from './call-context.js';
-import { awaitFreshCallOrigin, recordAgentMessage } from '../session/recorder.js';
+import { currentCall, currentCaller } from './call-context.js';
+import {
+  awaitFreshCallOrigin,
+  recordAgentMessage
+} from '../session/recorder.js';
 import { findSessionByConversation, readRecentEvents } from '../session/store.js';
-import { awaitRequestCorrelation, requestCorrelation } from '../session/correlation.js';
-import { assertRemoteCallerLive, adoptAgent, ok, fail, failIdentity, friendlyError, guard, IDENTITY_EVIDENCE_MS, PRIME_EVIDENCE_MS, SPAWN_EVIDENCE_MS, resolveCwd, resolveIn, type SurfaceRegistrar } from './kernel.js';
+import { requestCorrelation } from '../session/correlation.js';
+import { adoptAgent, fail, failIdentity, validatedWorkspace, friendlyError, guard, IDENTITY_EVIDENCE_MS, PRIME_EVIDENCE_MS, SPAWN_EVIDENCE_MS, ok, resolveCwd, resolveIn, type SurfaceRegistrar, type ToolResult } from './kernel.js';
 
+import { registerExecutionTools } from './tools-execution.js';
+import { processCustody } from '../codex/ownership.js';
+import { hasRemoteProjects, sessionProjectBinding } from '../projects.js';
+import { callRemoteCore } from '../remote-workspace.js';
+import { isCoreExecutionTool } from '../../shared/remote-execution.js';
+import { isSftpRemote } from '../../shared/projects.js';
+import { runInCallContext } from './call-context.js';
+import { assertRemoteCallerLive } from './kernel.js';
+import { saveImageFile, type ImageExportResult } from '../image-file.js';
+import { effectiveCapabilities } from '../config.js';
 /** One stable owner for the running model turn, upgraded lazily when page proof arrives. */
 function execPrincipal(): string | null {
   const caller = currentCaller();
-  return executionPrincipal(
-    caller.requestId,
-    caller.sessionId ?? null,
-    currentCall()?.allowUnattributed ?? getConfig().multiAgent.allowUnattributedCalls
-  );
+  return executionPrincipal(caller.requestId, caller.sessionId ?? null);
 }
 
 export function registerCoreTools(reg: SurfaceRegistrar): void {
@@ -43,7 +77,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
   registerExecutionTools(reg, {
     custody: processCustody, manager: unifiedExecManager, principal: execPrincipal,
     commandPolicy: () => getConfig().commandAllowlist,
-    workspace: currentWorkspace, requiresWorkspace: swarmRunning,
+    workspace: currentWorkspace, validateWorkspace: validatedWorkspace, requiresWorkspace: swarmRunning,
     guard, friendlyError, failIdentity, resolveCwd,
     resolveIn: (roots, path, options) => resolveIn(roots, path, /^\/(?:skills|user-skills)(?:\/|$)/.test(path)
       ? { ...options, base: null } : options),
@@ -52,7 +86,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
       const sessionId = context?.caller.sessionId;
       if (!sessionId || !await hasRemoteProjects()) return local();
       const project = sessionId ? await sessionProjectBinding(sessionId) : null;
-      if (!project?.remote || !sessionId || !context || !isCoreExecutionTool(name)) return local();
+      if (!project?.remote || isSftpRemote(project.remote) || !sessionId || !context || !isCoreExecutionTool(name)) return local();
       // Skills 的显式虚拟命名空间属于 Mac；混合请求必须拆开，不能靠文件是否存在猜执行位置。
       const paths = name === 'read' && Array.isArray((args as { paths?: unknown }).paths) ? (args as { paths: string[] }).paths
         : name === 'view_image' ? [(args as { path: string }).path] : [];
@@ -80,11 +114,11 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
         inputSchema: z
           .object({
             path: z.string().describe('New file path in an approved folder, for example /workspace/images/logo.png. Without an extension the image\'s own (.png, .jpg or .webp) is added.'),
-            image: z.string().optional().describe('Which image: the message id or file id ChatGPT gave it. Omit for the latest image generated in this chat.')
+            nth: z.number().int().min(1).max(100).optional().describe('Which image, counting back from the newest generated in this chat: 1 is the latest.')
           })
           .strict()
       })),
-      async ({ path, image }) =>
+      async ({ path, nth }) =>
         guard('save_image', async () => {
           if (!caps.create) {
             return fail('TOOL_DISABLED: save_image is disabled by the current Chat On Steroids permissions. Ask the user to enable creating files in the app.');
@@ -96,7 +130,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           if (!conversationId) {
             // Name the Core that answered: with one ChatGPT account on several computers, ChatGPT
             // may send a chat's call to another computer's Core, which never sees that chat (#1097).
-            return fail(`${connectorName('core', getConfig().connectorSuffix)} could not tell which chat this save_image call came from, ` +
+            return fail(`${liveConnectorName('core')} could not tell which chat this save_image call came from, ` +
               'so it does not know which image to save. If the chat belongs to another computer, call save_image of that ' +
               'computer\'s Chat On Steroids Core instead. Otherwise call save_image directly as its own tool call, not from ' +
               'inside a JavaScript or exec step, and try again.');
@@ -108,18 +142,15 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           const recorded = session ? await readRecentEvents(session.id, 400, { kinds: ['native_image'] }) : [];
           const images = recorded.filter((event): event is Extract<typeof event, { kind: 'native_image' }> =>
             event.kind === 'native_image' && event.providerStatus !== 'in_progress');
-          const wanted = image?.trim();
-          const chosen = wanted
-            ? images.filter(event => event.messageId === wanted || event.providerAssetId === wanted).at(-1)
-            : images.at(-1);
+          const chosen = images.at(-(nth ?? 1));
           if (!chosen) {
-            return fail(wanted
-              ? `save_image found no generated image "${wanted}" in this chat. Omit image to save the latest one.`
+            return fail(images.length
+              ? `save_image found only ${images.length} generated image${images.length === 1 ? '' : 's'} in this chat. Use nth ${images.length} or lower, or omit nth for the latest.`
               : 'save_image found no image generated in this chat yet.');
           }
           const context = currentCall();
           const project = caller.sessionId ? await sessionProjectBinding(caller.sessionId) : null;
-          const target = project?.remote ? null : await resolveIn(ctx.roots, path, { allowMissing: true });
+          const target = project?.remote && !isSftpRemote(project.remote) ? null : await resolveIn(ctx.roots, path, { allowMissing: true });
           if (target) {
             try {
               await fs.lstat(target.real);
@@ -130,7 +161,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             const saved = await exportImage({ conversationId, messageId: chosen.messageId, assetId: chosen.providerAssetId }, async bytes => {
               const write = async (): Promise<ImageExportResult> => {
                 if (!effectiveCapabilities(getConfig()).create) throw new ImageExportError('Creating files was disabled before the image arrived.');
-                if (project?.remote) {
+                if (project?.remote && !isSftpRemote(project.remote)) {
                   if (!context || !caller.sessionId) throw new ImageExportError('The remote image needs an exact session identity.');
                   const result = await callRemoteCore(project, caller.sessionId, 'cos_save_image', { path, data: bytes.toString('base64') },
                     () => assertRemoteCallerLive(context));
@@ -177,10 +208,28 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
     });
   }
 
+
+  // ----------------------------------------------------------------- usage
+
+  // #482: read-only, so the person can ask for their usage from the chat. Each figure names its
+  // source and age; Codex and Claude Code are read only while Settings › Usage allows it. Like
+  // `read`, offered only while a reading permission is on.
+  if (exposedCaps.read || exposedCaps.browse || exposedCaps.metadata) reg.register('usage', toolDeclaration('usage', () => ({
+    title: 'Usage and limits',
+    description: 'Only when the user asks about their usage, limits or quota. Read-only: ChatGPT\'s and Codex\'s reported limits, and tokens counted from Codex\'s and Claude Code\'s local logs, each with source and age. Report missing figures as not reported; never estimate.',
+    inputSchema: z.object({}),
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+  })), async () => guard('usage', async () => {
+    const report = usageReport(reportedUsageLimits(), await readProviderUsage(), Date.now());
+    return { content: [{ type: 'text', text: report.text }], structuredContent: report.structured };
+  }));
+
+
   // ----------------------------------------------------------------- agents
 
   if (reg.agentToolsExposed) registerAgentsTool(reg);
 }
+
 
 // ---------------------------------------------------------------------------
 // agents
@@ -199,70 +248,15 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
  * act on and is kept to a sentence or two; ids, states and counts are machine state and belong
  * in a shape the caller can read without parsing English.
  */
-/**
- * Re-measures how full each sleeping worker's chat is, before the prime may wake one.
- *
- * The context ceiling is what makes a stop final, and it is measured from the app's own
- * durable session for that conversation rather than from anything a model reported. The
- * broker keeps the figure in memory and in its snapshot, but a chat that grew while this app
- * was not running — or one whose snapshot predates the measurement entirely — would otherwise
- * be woken into a conversation with no room left in it. Reading it here, on the one call that
- * can wake a worker, is what makes the ceiling survive a crash rather than a restart quietly
- * handing back a worker the prime was already told was finished.
- */
-async function measureSleepingWorkers(caller: Caller): Promise<void> {
-  const state = swarmStateForCaller(caller);
-  if (state.agents.length === 0) return;
-  for (const info of state.agents) {
-    if (info.role !== 'worker' || info.state !== 'sleeping' || !info.conversationId) continue;
-    const summary = await findSessionByConversation(info.conversationId, { requireUnique: true }).catch(() => null);
-    if (summary) noteAgentContextTokens(info.conversationId, summary.contextTokens);
-  }
-  // Measurement is usually telemetry, but crossing the worker ceiling revokes durable revival
-  // authority and can terminalize a parked worker. `status` also calls this helper, so there is
-  // no later message/spawn acceptance barrier we can rely on: make every critical revision seen
-  // through the end of measurement durable before publishing the resulting state to the model.
-  try {
-    if (!(await persistCriticalSwarmNow())) {
-      throw new Error('the broker has no immediate durable persistence sink');
-    }
-  } catch (error) {
-    throw new Error(
-      `Worker context/revival state could not cross its durable barrier. Retry the agents call. (${error instanceof Error ? error.message : String(error)})`
-    );
-  }
-}
-
-/** Publish a staged broker mutation only after its exact revision is durable. */
-async function acceptAgentMutation(
-  staged: { commit(): void | boolean; rollback(): void },
-  failure: string,
-  commitFailure: string = failure
-): Promise<void> {
-  try {
-    let durable: boolean;
-    try {
-      durable = await persistCriticalSwarmNow();
-    } catch (error) {
-      throw new Error(`${failure} (${error instanceof Error ? error.message : String(error)})`);
-    }
-    if (!durable) throw new Error(failure);
-    if (staged.commit() === false) throw new Error(commitFailure);
-  } catch (error) {
-    staged.rollback();
-    throw error;
-  }
-}
-
 function registerAgentsTool(reg: SurfaceRegistrar): void {
   reg.register(
     'agents',
     toolDeclaration('agents', () => ({
       title: 'Multi-agent run',
       description:
-        'Run ChatGPT workers. Omit model and reasoning_effort unless the user explicitly requests an override; saved app defaults apply. Do not ask the user to choose them. Reuse a suitable sleeping worker with message before spawn. ' +
-        'message: prime↔worker. Reports ride tool results, never restart primes. Use status once to collect pending reports before finalizing; otherwise state that review is pending. Never poll repeatedly. ' +
-        'status: your active, sleeping/revivable and terminal workers, including parked families. finish: record the report, then normally sleep.',
+        'Runs ChatGPT workers. Without model/reasoning_effort, saved app defaults apply; they are set only for a user’s explicit request. A suitable sleeping worker is reused with message, not respawned. ' +
+        'message: prime↔worker. Reports arrive with tool results, not by restarting an idle prime. ' +
+        'status: your active, sleeping/revivable and terminal workers, incl. parked families, and pending reports; one call before a final answer collects them. Repeated polling adds nothing. finish: records the report, then normally sleeps.',
       inputSchema: z.object({
         action: z.enum(['spawn', 'message', 'status', 'finish']).describe('What to do.'),
         run_id: z.string().uuid().optional().describe('Select your returned worker family when status lists several; never grants another caller’s workers.'),
@@ -276,7 +270,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
         workers: z
           .array(
             z.object({
-              label: z.string().max(60).optional().describe('Short name shown to the user, e.g. "Security".'),
+              label: z.string().max(60).optional().describe('Name its job in 1-3 words, e.g. "Tests"; shown to the user.'),
               task: z
                 .string()
                 .min(1)
@@ -289,13 +283,13 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
                 .max(80)
                 .optional()
                 .describe(
-                  'Omit unless explicitly requested by the user; app settings supply defaults. Use an exact account-observed model id or provider alias. Invalid overrides return observed ids before opening; the browser confirms availability before Send.'
+                  'Only for a model the user asked for; app settings supply the default. An exact account-observed model id or provider alias. Invalid overrides return observed ids before opening; the browser checks availability before Send.'
                 ),
               reasoning_effort: z
                 .enum(REASONING_EFFORTS)
                 .optional()
                 .describe(
-                  'Omit unless explicitly requested by the user; app settings supply defaults. Do not ask just to spawn a worker. This selects reasoning only, never a model.'
+                  'Only for an effort the user asked for; app settings supply the default. Selects reasoning only, never a model.'
                 )
             }).strict()
           )
@@ -303,20 +297,21 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
           .max(8)
           .optional()
           .describe(
-            'spawn: fresh workers to create only after checking status for a suitable sleeping worker; revive one explicitly with message.'
+            'spawn: fresh workers; status lists sleeping workers that message can revive instead.'
           ),
         messages: z
           .array(
             z.object({
               to: z.string().min(1).max(40).describe('Recipient.'),
-              text: z.string().min(1).max(4000).describe('What to say.')
+              text: z.string().min(1).max(4000).describe('What to say.'),
+              label: z.string().trim().min(1).max(60).optional().describe('New job name when waking.')
             }).strict()
           )
           .min(1)
           .max(16)
           .optional()
           .describe(
-            'message: atomic batch; prefer this to one call per recipient.'
+            'message: atomic batch for several recipients in one call.'
           ),
         to: z
           .string()
@@ -374,14 +369,22 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
           // Reserve under exact chat proof or the permitted transport request, atomically.
           // The request remains the reachable prime before browser attachment; later proof
           // changes its frontend projection without recreating workers or replaying spawn.
-          const staged = stageSpawn({
+          const spawnCaller = await callerNow(startedAt, { exact: true, runId: input.run_id });
+          // A stale managed worker whose family and ordinary retired-worker TTL have expired
+          // must not bootstrap a new prime family to regain local mutation authority. Session
+          // origin and durable managed tombstones are denial-only, not adoption credentials.
+          if (await managedWorkerIsolationRequired(spawnCaller) && !managedWorkerAllocationIdentity(spawnCaller)) {
+            return fail('WORKTREE_OWNER_UNAVAILABLE: a retired worker cannot create a prime run after its isolated checkout owner was lost.');
+          }
+          const { created, becamePrime, runId, defaultNotes, isolationNotes } = await spawnAgentWorkers({
             workers: input.workers,
             context: input.context ?? null,
-            caller: await callerNow(startedAt, { exact: true, runId: input.run_id })
-          });
-          await acceptAgentMutation(staged,
-            'The worker run could not cross its durable acceptance barrier. The spawn was rolled back; retry this same request.');
-          const { created, becamePrime, runId, defaultNotes } = staged;
+            caller: spawnCaller
+          }, async () => {
+            const sessionId = currentCall()?.caller.sessionId;
+            return (sessionId ? await getSessionProject(sessionId) : null) ??
+              primeWorkspace(currentCaller().conversationId) ?? currentWorkspace();
+          }, () => !reg.ctx.readOnly && reg.caps.command && reg.caps.create && reg.caps.edit);
           if (currentCall()) currentCall()!.caller.runId = runId;
           // Browser tabs are a publication side effect, never part of planning. They become
           // visible only after the exact broker revision above is durable.
@@ -398,6 +401,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
                   `${created.length} worker(s) matched: ${created.map((info) => `${info.id} (${info.label}, ${info.state}${info.model ? `, model ${info.model}` : ''}${info.reasoningEffort ? `, reasoning ${info.reasoningEffort}` : ''})`).join(', ')}. ` +
                   (invited.length > 0 ? 'New worker chats are opening with their briefs already in them. ' : '') +
                   (defaultNotes?.length ? `${defaultNotes.join(' ')} ` : '') +
+                  (isolationNotes.length ? `${isolationNotes.join(' ')} ` : '') +
                   (sleeping.length > 0
                     ? `${sleeping.map((worker) => worker.id).join(', ')} already finished that earlier piece and is sleeping in its existing chat; wake it with action=message instead of spawning a duplicate. `
                     : '') +
@@ -569,6 +573,12 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
               : info.state;
         const asleep = state.agents.filter((info) => info.state === 'sleeping' && info.revivable);
         const slots = status.freeWorkerSlots;
+        // ChatGPT's own "allow this app?" card stops a worker until the person answers it. Read
+        // as just "active", the prime decided the runtime was stuck instead of telling the person
+        // a click was needed (VM, 2026-10-17).
+        const needsApproval = (info: { role: string; conversationId: string | null }): boolean =>
+          info.role !== 'prime' && !!info.conversationId && approvalCardWaiting(info.conversationId);
+        const awaitingUser = state.agents.filter(needsApproval);
         return {
           content: [
             {
@@ -578,7 +588,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
                 state.agents
                   .map(
                     (info) =>
-                      `${info.id}  ${info.role}  ${shown(info)}  waiting ${info.pending}  ${info.label}` +
+                      `${info.id}  ${info.role}  ${shown(info)}${needsApproval(info) ? ', needs the user to answer a tool approval in its chat' : ''}  waiting ${info.pending}  ${info.label}` +
                       (info.model ? `  model ${info.model}` : '') +
                       (info.reasoningEffort ? `  reasoning ${info.reasoningEffort}` : '') +
                       (info.result
@@ -601,6 +611,10 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
                   ? `\n\n${failed.map((info) => info.id).join(', ')} will not report. Do that work yourself or wake ` +
                     'another worker; do not wait for them.'
                   : '') +
+                (awaitingUser.length > 0
+                  ? `\n\n${awaitingUser.map((info) => info.id).join(', ')} ${awaitingUser.length === 1 ? 'waits' : 'wait'} for the user to allow or deny a tool call in ${awaitingUser.length === 1 ? 'its own chat' : 'their own chats'} ` +
+                    'and continue only after the user answers, in the app or in the browser. If you are waiting for them, tell the user.'
+                  : '') +
                 // A status check is a glance, not a stopping point. Without this the table reads
                 // like an answer to hand back to the user, and a prime that has just looked at its
                 // workers stops mid-run to report what it saw.
@@ -622,6 +636,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
               state: info.state,
               revivable: info.revivable,
               waiting: info.pending,
+              needs_user_approval: needsApproval(info),
               result: info.result ?? null
             }))
           }
@@ -700,3 +715,9 @@ async function callerNow(startedAt: number, options: { exact?: boolean; runId?: 
 // ---------------------------------------------------------------------------
 // apply_patch adapter helpers
 // ---------------------------------------------------------------------------
+
+export type { ToolResult };
+
+import { reportedUsageLimits } from '../session/usage.js';
+import { readProviderUsage } from '../provider-usage.js';
+import { usageReport } from '../usage-tool.js';

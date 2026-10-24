@@ -56,7 +56,7 @@ app.whenReady().then(async () => {
     await server.listen();fs.mkdirSync(output,{recursive:true});
     win=new BrowserWindow({show:false,width:1100,height:900,webPreferences:{sandbox:true,backgroundThrottling:false}});
     const js=code=>win.webContents.executeJavaScript(code);
-    const wait=async code=>{for(let i=0;i<200;i++){if(await js(code))return;await new Promise(resolve=>setTimeout(resolve,25));}throw new Error('Fixture did not reach '+code);};
+    const wait=async code=>{for(let i=0;i<200;i++){if(await js(code))return;await new Promise(resolve=>setTimeout(resolve,25));}throw new Error('Fixture did not reach '+code+'; renderer errors: '+JSON.stringify(await js('window.errors || []')));};
     const screenshot=async name=>{
       await win.webContents.capturePage(undefined,{stayHidden:true,stayAwake:true});
       await js('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');
@@ -65,7 +65,8 @@ app.whenReady().then(async () => {
     for(const locale of ['en','zh-CN']) {
       await win.loadURL(server.resolvedUrls.local[0]+'fixture.html?language='+locale);
       await wait('!!window.fixtureReady && document.querySelector("[data-panel=setup]").classList.contains("is-active")');
-      assert.equal(await js('document.getElementById("setupProgress").getAttribute("aria-valuenow")'),'0');
+      const initialProgress=Number(await js('document.getElementById("setupProgress").getAttribute("aria-valuenow")'));
+      assert(!(await js('document.querySelector("[data-step=folder]").classList.contains("is-done")')));
       await js('document.querySelector("[data-rail-step=folder]").click();true');
       assert(await js('document.getElementById("wizAddRemoteProject").checkVisibility()'));
       assert(!(await js('document.getElementById("addRemoteProject").checkVisibility()')));
@@ -81,7 +82,7 @@ app.whenReady().then(async () => {
       await wait('!!document.querySelector(".remote-project-dialog[open]")');
       await js('document.querySelector(".remote-project-actions button[type=button]").click();true');
       await wait('!document.getElementById("wizAddRemoteProject").disabled');
-      assert.equal(await js('document.getElementById("setupProgress").getAttribute("aria-valuenow")'),'0');
+      assert.equal(Number(await js('document.getElementById("setupProgress").getAttribute("aria-valuenow")')),initialProgress);
       await js('document.getElementById("wizAddRemoteProject").click();true');
       await wait('!!document.querySelector(".remote-project-dialog[open]")');
       await js(`(()=>{const choice=document.querySelector('.remote-project-dialog select');choice.value='ssh:dev-example';choice.dispatchEvent(new Event('change'));})();document.querySelector('.remote-root-row input').value='/srv';
@@ -96,7 +97,7 @@ app.whenReady().then(async () => {
       assert(await js('document.querySelector("[data-panel=setup]").classList.contains("is-active")'));
       assert(await js('document.querySelector("[data-step=folder]").classList.contains("is-done")'));
       assert.equal(await js('document.getElementById("wizFolders").textContent'),locale==='zh-CN'?'已添加远程项目':'Remote project added');
-      assert.equal(await js('document.getElementById("setupProgress").getAttribute("aria-valuenow")'),'1');
+      assert.equal(Number(await js('document.getElementById("setupProgress").getAttribute("aria-valuenow")')),initialProgress+1);
       assert.deepEqual(await js('window.calls'),{local:0,install:0,remote:[
         {hostId:'fixture-host',directory:'/srv/project'},{hostId:'fixture-host',directory:'/srv/project'}]});
       await screenshot(locale+'-remote-added.png');
