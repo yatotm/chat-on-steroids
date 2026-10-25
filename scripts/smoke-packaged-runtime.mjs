@@ -39,7 +39,7 @@ if (!packageRoot) throw new Error(`Could not find unpacked ${targetPlatform}-${t
 const sourcePackage = JSON.parse(readFileSync(path.join(repository, 'package.json'), 'utf8'));
 const expectedVersion = sourcePackage.version;
 const expectedElectronVersion = sourcePackage.devDependencies?.electron;
-if (!/^\d+\.\d+\.\d+$/.test(expectedElectronVersion ?? '')) {
+if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(expectedElectronVersion ?? '')) {
   throw new Error(`Electron must be pinned to an exact release version, got ${JSON.stringify(expectedElectronVersion)}`);
 }
 const suffix = PLATFORM_INFO[targetPlatform].executableSuffix;
