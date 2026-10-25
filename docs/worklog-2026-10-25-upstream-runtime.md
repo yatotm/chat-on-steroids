@@ -12,13 +12,25 @@
 - 修复原生登录面板先于所属页面销毁时的清理异常，保留退出时撤销凭据交接的语义。
 - 开发与执行服务的 Node 安全基线为 22.23.4；Electron 更新到当前 44 分支稳定版 44.9.3。
 
-## 安全边界
+## 安全边界（已更正）
 
-Electron 44.9.3 实测内嵌 Node 24.22.0、Brotli 1.2.0。其 Chromium 152.0.7977.167 的 Brotli 解码源码与 2026 年 3 月提交 `cfa184a` 相同，未包含本次 Brotli 修复。
+此前依据 Chromium 所用 Brotli revision 的日期及文件哈希，判断它未包含本次修复，这个结论不正确，现已撤回。
 
-仅作核验的 Electron 46.0.0-alpha.1 虽内嵌 Node 24.22.1，其 Chromium 158.0.8114.0 仍使用同一未修复的解码源码。因此未采用预发行版本，不能把桌面端标记为本次漏洞已完整修复。临时核验运行时已清理。
+Chromium 152.0.7977.167、156.0.8078.48 和 158.0.8114.0 使用的 `cfa184a` 是修复提交 `0ed4268` 之后的版本。源码已包含 `BROTLI_DECODER_ERROR_FORMAT_BLOCK_SWITCH` 检查及错误传播；Electron 的 GN 补丁把 Node 的 Brotli 依赖替换为 Chromium 的 `//third_party/brotli:dec`、`:enc`。因此这些 Electron 版本的 Brotli 修复已覆盖，不能仅因 Node 版本、Brotli 版本串、`node_shared_brotli` 或 JS 常量是否导出而判断未修。
 
-核对依据：[Node 22.23.4 安全发布](https://nodejs.org/en/blog/release/v22.23.4)、[Brotli 修复提交](https://github.com/google/brotli/commit/0ed4268a4401abcb4472096340477cf4af7d1a2b)、[稳定 Chromium 的 Brotli 版本记录](https://chromium.googlesource.com/chromium/src/+/refs/tags/152.0.7977.167/third_party/brotli/README.chromium)。
+2026-10-25 01:23 UTC 复核官方发布记录及官方 Linux 二进制，并按发布的 SHA-256 校验。无网络的内置 API 回归结果如下：
+
+| Electron | 内嵌 Node | Brotli 源码修复 | DNS NUL 参数 | TLS 非规范 IP 与 DNS SAN |
+| --- | --- | --- | --- | --- |
+| 44.9.3 | 24.22.0 | 已覆盖 | 仍接受 | 仍接受 |
+| 45.0.0 | 24.22.0 | 已覆盖 | 仍接受 | 仍接受 |
+| 46.0.0-alpha.1 | 24.22.1 | 已覆盖 | 正确拒绝 | 正确拒绝 |
+
+DNS 检查使用独立 `Resolver.setLocalAddress()`，没有发起查询；TLS 检查使用 `checkServerIdentity()` 与合成证书对象，没有建立连接。稳定版对应内置 JS 也缺少这两处官方校验。因此仍有至少 DNS/TLS 的 Node 补丁缺口，不能将整个 Node 安全合集标记为完成；这不等于已经证明应用中存在可利用路径。
+
+当前仍保留已验收的稳定版 44.9.3。45.0.0 没有消除上述缺口，因此没有为版本号升级它。46.0.0-alpha.1 已通过安全 API 探针，尚需另行完成关键 UI 兼容评估及预发布版本取舍，未写入当前依赖、未公开发布。此次检查未在可访问主机的安装登记、标准程序目录及运行进程中发现已有 CoS 桌面客户端；实际部署的是已修复的独立执行服务。
+
+可核实依据：[Brotli 修复及后续版本关系](https://github.com/google/brotli/compare/0ed4268a4401abcb4472096340477cf4af7d1a2b...cfa184a997ac19454d5a3ae97f6d600aac2445a6)、[Chromium 解码源码](https://chromium.googlesource.com/chromium/src/+/refs/tags/152.0.7977.167/third_party/brotli/dec/decode.c)、[Electron 的 GN 依赖替换](https://github.com/electron/electron/blob/v44.9.3/patches/node/build_add_gn_build_files.patch)、[Node DNS 修复](https://github.com/nodejs/node/commit/843a1627dc)、[Node TLS 修复](https://github.com/nodejs/node/commit/935918e342)。
 
 ## 验证
 
@@ -28,4 +40,4 @@ Electron 44.9.3 实测内嵌 Node 24.22.0、Brotli 1.2.0。其 Chromium 152.0.79
 - 真实 Electron 界面共覆盖 61 个脚本：完整运行首次 56 项通过，5 项失败在修复夹具或指定现有 Chromium 后定向复测全部通过；宠物性能另行完整复测通过。
 - 登录交接使用隔离站点，不联系真实 Google 或 ChatGPT。真实 PTY 通过键盘输入、工作目录和环境保持、隐藏面板继续执行、Ctrl+C、退出码和关闭回收；830px 窗口下上下终端均位于视口内。
 - 夹具修正包括无浏览器服务器的可控入口、fork 发布说明链接，以及每次清空终端验收状态并显示真实窗口，避免隐藏窗口暂停动画造成错误的布局判断。
-- 临时候选运行时、旧执行器目录及验收目录已删除；桌面 Brotli 风险仍按上文单独记录。
+- 临时候选运行时、旧执行器目录及验收目录已删除；桌面剩余 DNS/TLS 补丁缺口按上文单独记录，Brotli 误判已纠正。
