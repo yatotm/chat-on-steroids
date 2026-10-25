@@ -126,14 +126,14 @@ describe('cross-platform packaging targets', () => {
     ]) expect(pkg.scripts[script]).toBeTypeOf('string');
   });
 
-  it('pins Electron 44.9.3 exactly and proves packaged runners use those runtime bytes', () => {
+  it('pins Electron 46.0.0-alpha.1 exactly and proves packaged runners use those runtime bytes', () => {
     const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
     const lock = JSON.parse(readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
     const smoke = readFileSync(path.join(root, 'scripts', 'smoke-packaged-runtime.mjs'), 'utf8');
 
-    expect(pkg.devDependencies.electron).toBe('44.9.3');
-    expect(lock.packages?.['']?.devDependencies?.electron).toBe('44.9.3');
-    expect(lock.packages?.['node_modules/electron']?.version).toBe('44.9.3');
+    expect(pkg.devDependencies.electron).toBe('46.0.0-alpha.1');
+    expect(lock.packages?.['']?.devDependencies?.electron).toBe('46.0.0-alpha.1');
+    expect(lock.packages?.['node_modules/electron']?.version).toBe('46.0.0-alpha.1');
     expect(smoke).toContain('const expectedElectronVersion = sourcePackage.devDependencies?.electron;');
     expect(smoke).toContain('electron: process.versions.electron');
     expect(smoke).toContain('runtime.electron !== expectedElectronVersion');
